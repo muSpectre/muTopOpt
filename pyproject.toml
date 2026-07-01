@@ -1,0 +1,27 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "muTopOpt"
+authors = [
+    { name = "Lars Pastewka", email = "lars.pastewka@imtek.uni-freiburg.de" },
+]
+description = "FFT-accelerated FE topology optimization of mechanical metamaterials, built on muGrid"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = [
+    "numpy",
+    "muGrid>=0.110.0",
+    "NuMPI",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+scipy = ["scipy"]  # for the alternative serial optimize_lbfgs
+mpi = ["mpi4py"]
+
+[tool.flit.module]
+name = "muTopOpt"
