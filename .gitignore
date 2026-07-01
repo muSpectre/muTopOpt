@@ -1,0 +1,35 @@
+# Python
+*~
+*.pyc
+*.cpython*.so
+__pycache__/
+/build/
+dist/
+*egg-info/
+.pytest_cache/
+
+# Environments
+/venv
+/.venv*/
+
+# Code coverage
+.coverage
+.coverage.*
+/coverage.xml
+/coverage-python.xml
+/coverage_html/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+.fleet
+.junie/
+*.iml
+
+# Optimization outputs / artifacts
+*.nc
+*.npy
+*.npz
+*.png
+*.pdf
