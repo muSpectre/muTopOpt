@@ -31,6 +31,7 @@ __version__ = "0.0.1"
 from .homogenization import Homogenization
 from .material import SimpMaterial, lame_from_E_nu
 from .problem import LoadCase, StressTargetProblem
+from .properties import effective_stiffness, isotropic_moduli_2d
 from .regularization import (
     NodalPhaseFieldRegularization,
     PhaseFieldRegularization,
@@ -46,4 +47,6 @@ __all__ = [
     "PhaseFieldRegularization",
     "NodalPhaseFieldRegularization",
     "fe_laplacian_stencil",
+    "effective_stiffness",
+    "isotropic_moduli_2d",
 ]
