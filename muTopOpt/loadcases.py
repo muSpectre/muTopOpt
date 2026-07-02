@@ -17,6 +17,7 @@ for a target bulk/shear modulus or Poisson's ratio.
 
 import numpy as np
 
+from .material import lame_from_E_nu
 from .problem import LoadCase
 
 
@@ -49,6 +50,24 @@ def isotropic_stiffness_tensor(dim, K, G):
         tr = np.trace(E)
         dev = E - tr / dim * np.eye(dim)
         return 2.0 * G * dev + K * tr * np.eye(dim)
+
+    return sigma
+
+
+def isotropic_stiffness_from_E_nu(dim, E, nu):
+    """Isotropic stiffness from Young's modulus ``E`` and Poisson's ratio
+    ``nu``, in the plane-strain / 3D Hooke's-law convention of the mechanics
+    operator (the same convention as :class:`~muTopOpt.material.SimpMaterial`):
+    ``σ = λ tr(ε) I + 2 μ ε``. Returned as a callable ``sigma(E_macro)``,
+    interchangeable with :func:`isotropic_stiffness_tensor`.
+
+    In particular, a target built from the *solid* ``(E, nu)`` is exactly the
+    response of a fully dense (``rho = 1``) cell."""
+    lam, mu = lame_from_E_nu(E, nu)
+
+    def sigma(E_macro):
+        E_macro = np.asarray(E_macro)
+        return lam * np.trace(E_macro) * np.eye(dim) + 2.0 * mu * E_macro
 
     return sigma
 

@@ -165,14 +165,24 @@ class NodalPhaseFieldRegularization:
     ``rhoᵀ L rho = ∫|∇rho|^2`` directly. The regularization is consistent with
     the mechanics discretization: it uses the *same* element as the stiffness
     operator (``homogenization.element``).
+
+    The double-well term is, by default, the **fully consistent Galerkin**
+    integral of the interpolant (exact closed form on P1 simplices, exact
+    3-point tensor Gauss quadrature on Q1 elements; see
+    :class:`muTopOpt.nodal.ConsistentDoubleWell`). Pass ``dwell='lumped'``
+    for the previous pointwise (lumped nodal) quadrature.
     """
 
-    def __init__(self, homogenization, eta=None, weight=1.0):
+    def __init__(self, homogenization, eta=None, weight=1.0,
+                 dwell="consistent"):
         self.h = homogenization
         # eta IS the interface width (Modica-Mortola normalization); it
         # defaults to one grid spacing.
         self.eta = (self.h.grid_spacing[0] if eta is None else float(eta))
         self.weight = float(weight)
+        if dwell not in ("consistent", "lumped"):
+            raise ValueError(f"unknown double-well quadrature '{dwell}'")
+        self.dwell_kind = dwell
 
         offset, stencil = fe_laplacian_stencil(
             self.h.dim, self.h.grid_spacing, self.h.element
@@ -184,6 +194,13 @@ class NodalPhaseFieldRegularization:
         self._rho = self.h.scalar_field("to_nodal_reg_rho")
         self._Lrho = self.h.scalar_field("to_nodal_reg_Lrho")
 
+        if dwell == "consistent":
+            from .nodal import ConsistentDoubleWell, NodalElementMap
+
+            self._dwell = ConsistentDoubleWell(NodalElementMap(self.h))
+        else:
+            self._dwell = None
+
     def value_and_gradient(self, rho):
         """Return (f_reg, df_reg/drho) for a nodal density array."""
         rho = np.asarray(rho)
@@ -194,16 +211,21 @@ class NodalPhaseFieldRegularization:
 
         # eta * rhoᵀ L rho  (L already includes the physical volume weighting).
         grad_pen = self.h.comm.sum(float(np.sum(rho * Lrho)))
-        dwell = self.h.comm.sum(
-            float(np.sum(rho**2 * (1.0 - rho) ** 2))
-        ) * self.vol_pixel
+
+        if self._dwell is not None:
+            # Fully consistent Galerkin: exact ∫ W(rho(x)) dx of the nodal
+            # interpolant, with its exact nodal gradient.
+            dwell, dwell_grad = self._dwell.value_and_gradient(rho)
+        else:
+            # Lumped nodal quadrature (pointwise).
+            dwell = self.h.comm.sum(
+                float(np.sum(rho**2 * (1.0 - rho) ** 2))
+            ) * self.vol_pixel
+            dwell_grad = (
+                2.0 * rho * (1.0 - rho) * (1.0 - 2.0 * rho) * self.vol_pixel
+            )
 
         # Modica-Mortola: f_reg = weight * [ eta * ∫|∇rho|^2 + (1/eta) * ∫ W ]
         f = self.eta * grad_pen + dwell / self.eta
-
-        dwell_drho = 2.0 * rho * (1.0 - rho) * (1.0 - 2.0 * rho)
-        g = (
-            self.eta * 2.0 * Lrho
-            + dwell_drho * self.vol_pixel / self.eta
-        )
+        g = self.eta * 2.0 * Lrho + dwell_grad / self.eta
         return self.weight * f, self.weight * g

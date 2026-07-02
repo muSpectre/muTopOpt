@@ -5,13 +5,19 @@
 # MIT License (see LICENSE)
 #
 """
-Command-line driver for muTopOpt: optimize an element-wise density unit cell for
-a target isotropic effective stiffness (bulk modulus K, shear modulus G), in 2D
-or 3D.
+Command-line driver for muTopOpt: optimize a density unit cell for a target
+isotropic effective stiffness, in 2D or 3D. The target is given either as bulk
+and shear moduli (``--K``/``--G``) or as Young's modulus and Poisson's ratio
+(``--target-E``/``--target-nu``).
+
+By default the density is a *nodal* finite-element field with the fully
+consistent Galerkin phase-field regularization, started from a filtered random
+field -- the combination least prone to locking in the initial topology.
 
 Examples
 --------
     python simulate.py -n 64 64            --K 0.1 --G 0.05
+    python simulate.py -n 64 64            --target-E 0.2 --target-nu -0.3
     python simulate.py -n 96 96 96 --iters 300 --eta 0.02
     mpirun -np 4 python simulate.py -n 128 128 128     # (serial optimizer; see notes)
 
@@ -28,7 +34,8 @@ import muGrid
 from muTopOpt import (Homogenization, NodalPhaseFieldRegularization,
                       PhaseFieldRegularization, SimpMaterial,
                       StressTargetProblem)
-from muTopOpt.loadcases import isotropic_stiffness_tensor, target_load_cases
+from muTopOpt.loadcases import (isotropic_stiffness_from_E_nu,
+                                isotropic_stiffness_tensor, target_load_cases)
 from muTopOpt.optimize import initial_density, optimize_bounded_lbfgs
 
 
@@ -49,14 +56,20 @@ def main():
                    help="void/solid stiffness ratio")
     p.add_argument("--K", type=float, default=0.1, help="target bulk modulus")
     p.add_argument("--G", type=float, default=0.05, help="target shear modulus")
+    p.add_argument("--target-E", type=float, default=None,
+                   help="target Young's modulus (alternative to --K/--G; "
+                        "requires --target-nu)")
+    p.add_argument("--target-nu", type=float, default=None,
+                   help="target Poisson's ratio (alternative to --K/--G; "
+                        "requires --target-E)")
     p.add_argument("--eta", type=float, default=None,
                    help="phase-field interface width, in physical length units "
-                        "(default: one grid spacing)")
+                        "(default: two grid spacings)")
     p.add_argument("--reg-weight", type=float, default=1.0,
                    help="overall strength of the phase-field regularization")
     p.add_argument("--volume-fraction", type=float, default=0.5)
     p.add_argument("--init", choices=["uniform", "random", "filtered_random"],
-                   default="random")
+                   default="filtered_random")
     p.add_argument("--init-length", type=float, default=None,
                    help="correlation length for --init filtered_random "
                         "(default: 3*eta)")
@@ -73,10 +86,11 @@ def main():
                    help="run the forward/adjoint solves and sensitivity on the "
                    "host (cpu) or on the accelerator (gpu); the L-BFGS "
                    "optimizer always runs on the host")
-    p.add_argument("--density", choices=["element", "nodal"], default="element",
-                   help="density discretization: 'element' (per-pixel, FD "
-                   "Laplacian penalty) or 'nodal' (nodal FE field with the "
-                   "element-consistent, fused FE-Laplacian penalty)")
+    p.add_argument("--density", choices=["element", "nodal"], default="nodal",
+                   help="density discretization: 'nodal' (nodal FE field, "
+                   "SIMP on the element average of the interpolant, fully "
+                   "consistent Galerkin phase-field regularization) or "
+                   "'element' (per-pixel density, FD Laplacian penalty)")
     p.add_argument("--output", type=str, default=None,
                    help="NetCDF file to write the optimized density to")
     args = p.parse_args()
@@ -101,13 +115,23 @@ def main():
         preconditioner=args.preconditioner, cg_tol=args.cg_tol,
         device=args.device,
     )
-    cases = target_load_cases(
-        dim, isotropic_stiffness_tensor(dim, args.K, args.G), magnitude=0.01
-    )
+    if (args.target_E is None) != (args.target_nu is None):
+        p.error("--target-E and --target-nu must be given together")
+    if args.target_E is not None:
+        target = isotropic_stiffness_from_E_nu(dim, args.target_E,
+                                               args.target_nu)
+    else:
+        target = isotropic_stiffness_tensor(dim, args.K, args.G)
+    cases = target_load_cases(dim, target, magnitude=0.01)
+    # The interface width defaults to two grid spacings: wide enough that the
+    # regularization can move interfaces (merge/remove features) instead of
+    # freezing the initial topology, narrow enough for crisp designs.
+    eta = 2.0 * min(homog.grid_spacing) if args.eta is None else args.eta
     Reg = (NodalPhaseFieldRegularization if args.density == "nodal"
            else PhaseFieldRegularization)
-    reg = Reg(homog, eta=args.eta, weight=args.reg_weight)
-    problem = StressTargetProblem(homog, cases, regularization=reg)
+    reg = Reg(homog, eta=eta, weight=args.reg_weight)
+    problem = StressTargetProblem(homog, cases, regularization=reg,
+                                  design=args.density)
 
     length = args.init_length
     if args.init == "filtered_random" and length is None:

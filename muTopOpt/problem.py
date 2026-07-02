@@ -38,11 +38,27 @@ class LoadCase:
 
 
 class StressTargetProblem:
-    def __init__(self, homogenization, load_cases, regularization=None):
+    def __init__(self, homogenization, load_cases, regularization=None,
+                 design="element"):
+        """``design='element'`` optimizes a per-pixel density (the material of
+        each element is ``SIMP(rho_e)`` directly). ``design='nodal'`` optimizes
+        a *nodal* FE density: each element's material is ``SIMP(rho_e)`` with
+        ``rho_e`` the exact element average of the nodal interpolant (see
+        :class:`muTopOpt.nodal.NodalElementMap`), so every nodal degree of
+        freedom couples its ``2^dim`` adjacent elements -- an implicit
+        sensitivity filter. Pair the nodal design with
+        :class:`~muTopOpt.regularization.NodalPhaseFieldRegularization`."""
         self.h = homogenization
         self.dim = homogenization.dim
         self.load_cases = [self._as_case(lc) for lc in load_cases]
         self.regularization = regularization
+        if design not in ("element", "nodal"):
+            raise ValueError(f"unknown design space '{design}'")
+        self.design = design
+        if design == "nodal":
+            from .nodal import NodalElementMap
+
+            self._nodal_map = NodalElementMap(homogenization)
 
         # Per-load-case solver fields, reused across iterations.
         self._u = self.h.vector_field("to_prob_u")
@@ -60,17 +76,25 @@ class StressTargetProblem:
         return LoadCase(E, S, float(lc.weight))
 
     def objective_and_gradient(self, rho):
-        """Return (f, df/drho) for an element-wise density array of shape
-        :attr:`Homogenization.nb_pixels`."""
+        """Return (f, df/drho) for a density array of shape
+        :attr:`Homogenization.nb_pixels` (element-wise or nodal, per the
+        ``design`` chosen at construction)."""
         rho = np.asarray(rho, dtype=float)
         h = self.h
         V = h.domain_volume
-        h.set_density(rho)
+        if self.design == "nodal":
+            # Element material from the exact element average of the nodal
+            # interpolant; sensitivities are scattered back through the
+            # transpose of this map after the load-case loop.
+            rho_e = self._nodal_map.gather_mean(rho)
+        else:
+            rho_e = rho
+        h.set_density(rho_e)
 
-        dlam, dmu = h.material.dlame(rho)  # SIMP derivatives, per pixel
+        dlam, dmu = h.material.dlame(rho_e)  # SIMP derivatives, per element
 
         f = 0.0
-        grad = np.zeros_like(rho)
+        grad = np.zeros_like(rho_e)
         stresses = []
         cg_iters = []  # CG iteration count of each (forward, adjoint) solve
         for lc in self.load_cases:
@@ -102,7 +126,15 @@ class StressTargetProblem:
             g_vol = h.to_host(self._g_vol.p)
             grad += 2.0 * dmu * g_shear + dlam * g_vol
 
+        if self.design == "nodal":
+            # Chain rule through the element average: the per-element
+            # sensitivity is distributed onto the element's corner nodes with
+            # the averaging weights (exact transpose of gather_mean).
+            grad = self._nodal_map.scatter_mean(grad)
+
         if self.regularization is not None:
+            # The regularization acts on the design variables themselves
+            # (nodal for the nodal design).
             f_reg, g_reg = self.regularization.value_and_gradient(rho)
             f += f_reg
             grad += g_reg

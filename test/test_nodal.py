@@ -121,3 +121,207 @@ def test_gradient_nodal(dim, element, comm):
             f"{ELEMENT_NAMES[element]} {dim}D pixel {idx}: "
             f"analytic {g[idx]:.6e} vs FD {fd:.6e}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Nodal DESIGN space (design="nodal"): SIMP on the element average of the
+# nodal interpolant, with the fully consistent Galerkin double-well.
+# ---------------------------------------------------------------------------
+
+from muTopOpt.loadcases import isotropic_stiffness_from_E_nu, unit_strains  # noqa: E402
+from muTopOpt.nodal import ConsistentDoubleWell, NodalElementMap  # noqa: E402
+
+
+def _homog(dim, n, element, comm):
+    material = SimpMaterial(E_solid=1.0, nu=0.3, penalty=3.0, void_ratio=1e-2)
+    return Homogenization(
+        (n,) * dim, material, comm=comm, element=ELEMENT_NAMES[element],
+        cg_tol=1e-12, cg_maxiter=5000,
+    )
+
+
+@pytest.mark.parametrize("element", ELEMENTS, ids=ELEMENT_NAMES.get)
+@pytest.mark.parametrize("dim", [2, 3])
+def test_gather_scatter_adjoint(comm, dim, element):
+    """<scatter_mean(s), r> must equal <s, gather_mean(r)> -- the scatter is
+    the exact transpose of the gather (also across the periodic boundary)."""
+    n = 6 if dim == 2 else 4
+    h = _homog(dim, n, element, comm)
+    m = NodalElementMap(h)
+    rng = np.random.default_rng(0)
+    r = rng.standard_normal(h.nb_pixels)
+    s = rng.standard_normal(h.nb_pixels)
+    lhs = comm.sum(float(np.sum(m.scatter_mean(s) * r)))
+    rhs = comm.sum(float(np.sum(s * m.gather_mean(r))))
+    assert np.isclose(lhs, rhs, rtol=1e-12)
+
+
+@pytest.mark.parametrize("element", ELEMENTS, ids=ELEMENT_NAMES.get)
+@pytest.mark.parametrize("dim", [2, 3])
+def test_gather_mean_of_constant(comm, dim, element):
+    """The element average of a constant nodal field is that constant (the
+    averaging weights sum to one)."""
+    n = 6 if dim == 2 else 4
+    h = _homog(dim, n, element, comm)
+    m = NodalElementMap(h)
+    np.testing.assert_allclose(m.gather_mean(np.full(h.nb_pixels, 0.37)),
+                               0.37, rtol=1e-14)
+
+
+def _dwell_reference(rho, element_name, dim, vol_pixel, nsub=48):
+    """Brute-force reference: sample the FE interpolant of the (periodic)
+    nodal field on an nsub^dim subgrid of every element and integrate W by the
+    midpoint rule. Serial only."""
+    from muTopOpt.nodal import _P1_SIMPLICES, _node_offset
+
+    n = rho.shape
+    total = 0.0
+    pts = (np.arange(nsub) + 0.5) / nsub
+    grids = np.meshgrid(*([pts] * dim), indexing="ij")
+    xi = np.stack([g.ravel() for g in grids], axis=1)  # (nsub^dim, dim)
+
+    if element_name == "q1":
+        N = np.ones((xi.shape[0], 2 ** dim))
+        for c in range(2 ** dim):
+            for d in range(dim):
+                N[:, c] *= xi[:, d] if _node_offset(c, d) else 1.0 - xi[:, d]
+    else:
+        corners = np.array([[_node_offset(c, d) for d in range(dim)]
+                            for c in range(2 ** dim)], dtype=float)
+        N = np.zeros((xi.shape[0], 2 ** dim))
+        assigned = np.zeros(xi.shape[0], dtype=bool)
+        for nodes, _frac in _P1_SIMPLICES[dim]:
+            verts = corners[list(nodes)]  # (dim+1, dim)
+            T = (verts[1:] - verts[0]).T  # (dim, dim)
+            lam_rest = np.linalg.solve(T, (xi - verts[0]).T).T
+            lam = np.concatenate(
+                [1.0 - lam_rest.sum(axis=1, keepdims=True), lam_rest], axis=1)
+            inside = np.all(lam >= -1e-12, axis=1) & ~assigned
+            for j, node in enumerate(nodes):
+                N[inside, node] += lam[inside, j]
+            assigned |= inside
+        assert assigned.all()
+
+    for idx in np.ndindex(*n):
+        vals = np.array([
+            rho[tuple((idx[d] + _node_offset(c, d)) % n[d]
+                      for d in range(dim))]
+            for c in range(2 ** dim)
+        ])
+        rho_pts = N @ vals
+        W = rho_pts**2 * (1.0 - rho_pts) ** 2
+        total += W.mean() * vol_pixel
+    return total
+
+
+@pytest.mark.parametrize("element", ELEMENTS, ids=ELEMENT_NAMES.get)
+@pytest.mark.parametrize("dim", [2, 3])
+def test_consistent_dwell_value(comm, dim, element):
+    """The consistent double-well matches a brute-force integration of the
+    interpolant (the Galerkin quadrature is exact; the midpoint reference
+    carries an O(nsub^-2) error)."""
+    if comm.size > 1:
+        pytest.skip("brute-force reference is serial")
+    n = 4
+    h = _homog(dim, n, element, comm)
+    m = NodalElementMap(h)
+    dw = ConsistentDoubleWell(m)
+    rng = np.random.default_rng(3)
+    rho = rng.uniform(0.0, 1.0, h.nb_pixels)
+    f, _ = dw.value_and_gradient(rho)
+    nsub = 48 if dim == 2 else 16
+    ref = _dwell_reference(rho, ELEMENT_NAMES[element], dim, m.vol_pixel,
+                           nsub=nsub)
+    assert np.isclose(f, ref, rtol=5e-3), f"{f} vs reference {ref}"
+
+
+@pytest.mark.parametrize("element", ELEMENTS, ids=ELEMENT_NAMES.get)
+@pytest.mark.parametrize("dim", [2, 3])
+def test_consistent_dwell_gradient(comm, dim, element):
+    """FD check of the consistent double-well gradient."""
+    n = 4
+    h = _homog(dim, n, element, comm)
+    dw = ConsistentDoubleWell(NodalElementMap(h))
+    rng = np.random.default_rng(4)
+    rho = rng.uniform(0.2, 0.8, h.nb_pixels)
+    _, g = dw.value_and_gradient(rho)
+    d = 1e-6
+    for idx in [(0,) * dim, (1,) * dim, tuple(range(1, dim + 1))]:
+        rp = rho.copy()
+        rp[idx] += d
+        fp, _ = dw.value_and_gradient(rp)
+        rm = rho.copy()
+        rm[idx] -= d
+        fm, _ = dw.value_and_gradient(rm)
+        fd = (fp - fm) / (2 * d)
+        assert np.isclose(g[idx], fd, rtol=1e-5, atol=1e-10), (
+            f"node {idx}: analytic {g[idx]:.6e} vs FD {fd:.6e}")
+
+
+def _nodal_design_problem(dim, n, element, comm):
+    h = _homog(dim, n, element, comm)
+    cases = target_load_cases(
+        dim, isotropic_stiffness_tensor(dim, K=0.15, G=0.08), magnitude=0.01
+    )
+    reg = NodalPhaseFieldRegularization(h)
+    return StressTargetProblem(h, cases, regularization=reg, design="nodal")
+
+
+@pytest.mark.parametrize("element", ELEMENTS, ids=ELEMENT_NAMES.get)
+def test_nodal_design_gradient_2d(comm, element):
+    """FD check of the FULL nodal-design objective gradient (forward + adjoint
+    + SIMP chain rule through the element average + consistent Galerkin
+    regularization)."""
+    n = 6
+    problem = _nodal_design_problem(2, n, element, comm)
+    rng = np.random.default_rng(0)
+    rho = rng.uniform(0.2, 0.8, (n, n))
+    _, g = problem.objective_and_gradient(rho)
+    d = 1e-6
+    for idx in [(0, 0), (0, 3), (3, 0), (2, 2), (n - 1, n - 1)]:
+        rp = rho.copy()
+        rp[idx] += d
+        fp, _ = problem.objective_and_gradient(rp)
+        rm = rho.copy()
+        rm[idx] -= d
+        fm, _ = problem.objective_and_gradient(rm)
+        fd = (fp - fm) / (2 * d)
+        assert np.isclose(g[idx], fd, rtol=2e-4, atol=1e-7), (
+            f"node {idx}: analytic {g[idx]:.6e} vs FD {fd:.6e}")
+
+
+def test_nodal_design_gradient_3d(comm):
+    n = 4
+    problem = _nodal_design_problem(3, n, ELEMENTS[0], comm)  # p1
+    rng = np.random.default_rng(1)
+    rho = rng.uniform(0.2, 0.8, (n, n, n))
+    _, g = problem.objective_and_gradient(rho)
+    d = 1e-6
+    for idx in [(0, 0, 0), (1, 2, 3), (n - 1, n - 1, n - 1)]:
+        rp = rho.copy()
+        rp[idx] += d
+        fp, _ = problem.objective_and_gradient(rp)
+        rm = rho.copy()
+        rm[idx] -= d
+        fm, _ = problem.objective_and_gradient(rm)
+        fd = (fp - fm) / (2 * d)
+        assert np.isclose(g[idx], fd, rtol=2e-4, atol=1e-7), (
+            f"node {idx}: analytic {g[idx]:.6e} vs FD {fd:.6e}")
+
+
+@pytest.mark.parametrize("dim", [2, 3])
+def test_target_from_E_nu_matches_solid(comm, dim):
+    """A target built from the solid's own (E, nu) must equal the homogenized
+    response of the fully dense cell."""
+    n = 4
+    E_s, nu_s = 1.3, 0.28
+    material = SimpMaterial(E_solid=E_s, nu=nu_s, penalty=2.0, void_ratio=1e-3)
+    h = Homogenization((n,) * dim, material, comm=comm, cg_tol=1e-12)
+    target = isotropic_stiffness_from_E_nu(dim, E_s, nu_s)
+    u = h.vector_field("test_u")
+    h.set_density(np.ones(h.nb_pixels))
+    for E_macro in unit_strains(dim, magnitude=0.01):
+        h.solve_macro(E_macro, u)
+        sigma = h.homogenized_stress(u, E_macro)
+        np.testing.assert_allclose(sigma, target(E_macro),
+                                   rtol=1e-8, atol=1e-12)
