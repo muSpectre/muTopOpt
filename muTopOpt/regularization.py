@@ -73,10 +73,10 @@ class PhaseFieldRegularization:
     def value_and_gradient(self, rho):
         """Return (f_reg, df_reg/drho) for an element-wise density array."""
         rho = np.asarray(rho)
-        self._rho.p[...] = rho
+        self._rho.p[...] = self.h.to_device(rho)
         self.h.engine.communicate_ghosts(self._rho)
         self.laplace.apply(self._rho, self._lap)  # (-Δ rho)
-        lap = np.asarray(self._lap.p)
+        lap = self.h.to_host(self._lap.p)
 
         grad_pen = self.h.comm.sum(float(np.sum(rho * lap))) * self.vol_pixel
         dwell = self.h.comm.sum(
@@ -187,10 +187,10 @@ class NodalPhaseFieldRegularization:
     def value_and_gradient(self, rho):
         """Return (f_reg, df_reg/drho) for a nodal density array."""
         rho = np.asarray(rho)
-        self._rho.p[...] = rho
+        self._rho.p[...] = self.h.to_device(rho)
         self.h.engine.communicate_ghosts(self._rho)
         self.laplace.apply(self._rho, self._Lrho)  # L rho
-        Lrho = np.asarray(self._Lrho.p)
+        Lrho = self.h.to_host(self._Lrho.p)
 
         # eta * rhoᵀ L rho  (L already includes the physical volume weighting).
         grad_pen = self.h.comm.sum(float(np.sum(rho * Lrho)))

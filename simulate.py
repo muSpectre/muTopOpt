@@ -69,6 +69,10 @@ def main():
                    default="green-jacobi")
     p.add_argument("--element", choices=["p1", "q1"], default="q1",
                    help="finite element (P1 simplices or Q1 hex/quad)")
+    p.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
+                   help="run the forward/adjoint solves and sensitivity on the "
+                   "host (cpu) or on the accelerator (gpu); the L-BFGS "
+                   "optimizer always runs on the host")
     p.add_argument("--density", choices=["element", "nodal"], default="element",
                    help="density discretization: 'element' (per-pixel, FD "
                    "Laplacian penalty) or 'nodal' (nodal FE field with the "
@@ -95,6 +99,7 @@ def main():
     homog = Homogenization(
         tuple(args.nb_grid_pts), material, comm=comm, element=args.element,
         preconditioner=args.preconditioner, cg_tol=args.cg_tol,
+        device=args.device,
     )
     cases = target_load_cases(
         dim, isotropic_stiffness_tensor(dim, args.K, args.G), magnitude=0.01
@@ -115,7 +120,8 @@ def main():
 
     if rank0:
         print(f"muTopOpt: {dim}D  grid={tuple(args.nb_grid_pts)}  "
-              f"load cases={len(cases)}  preconditioner={args.preconditioner}")
+              f"load cases={len(cases)}  preconditioner={args.preconditioner}  "
+              f"device={args.device}")
 
     def cb(it, rho, last):
         if rank0:
@@ -133,7 +139,7 @@ def main():
 
     if args.output is not None:
         field = homog.scalar_field("density")
-        field.p[...] = rho
+        field.p[...] = homog.to_device(rho)
         fio = muGrid.FileIONetCDF(
             args.output, muGrid.FileIONetCDF.OpenMode.Overwrite, comm
         )

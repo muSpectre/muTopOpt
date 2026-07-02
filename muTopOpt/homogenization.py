@@ -23,6 +23,8 @@ the operators all share one ghosted, MPI-decomposed, (optionally) device-residen
 layout.
 """
 
+import os
+
 import numpy as np
 
 import muGrid
@@ -33,6 +35,57 @@ from muGrid.Preconditioners import (
 from muGrid.Solvers import conjugate_gradients
 
 from .material import SimpMaterial
+
+
+def _local_rank(comm):
+    """Node-local rank of this process, used to pick a per-rank GPU.
+
+    Prefers the launcher-provided local-rank env var (OpenMPI, MPICH/Hydra,
+    MVAPICH, Slurm); falls back to the global communicator rank (correct on a
+    single node, and the best available guess otherwise).
+    """
+    for var in ("OMPI_COMM_WORLD_LOCAL_RANK", "MPI_LOCALRANKID",
+                "MV2_COMM_WORLD_LOCAL_RANK", "SLURM_LOCALID"):
+        val = os.environ.get(var)
+        if val is not None:
+            return int(val)
+    return comm.rank if comm is not None else 0
+
+
+def _gpu_device_count():
+    """Number of visible GPUs, or 1 if it cannot be determined."""
+    try:
+        import cupy
+
+        return max(1, cupy.cuda.runtime.getDeviceCount())
+    except Exception:
+        return 1
+
+
+def _resolve_device(device, comm=None):
+    """Map a user-facing device spec to a ``muGrid.Device`` (or ``None`` = CPU).
+
+    Accepts ``None``/``"cpu"`` (host), ``"gpu"``/``"rocm"``/``"cuda"`` (an
+    accelerator), or a ready-made ``muGrid.Device``. For the generic strings,
+    each rank binds to GPU ``local_rank % n_gpus`` so an MPI run spreads across
+    the node's accelerators instead of oversubscribing device 0. Pass an
+    explicit ``muGrid.Device`` (e.g. ``muGrid.Device.rocm(2)``) to override.
+    """
+    if device is None or device == "cpu":
+        return None
+    if isinstance(device, str):
+        key = device.lower()
+        if key in ("gpu", "rocm", "cuda"):
+            dev_id = _local_rank(comm) % _gpu_device_count()
+            if key == "rocm":
+                return muGrid.Device.rocm(dev_id)
+            if key == "cuda":
+                return muGrid.Device.cuda(dev_id)
+            # "gpu" is the platform accelerator (ROCm or CUDA), chosen by the
+            # build; pass the id so each rank binds its own device, not just 0.
+            return muGrid.Device.gpu(dev_id)
+        raise ValueError(f"unknown device '{device}'")
+    return device  # assume a muGrid.Device instance
 
 
 class Homogenization:
@@ -46,6 +99,7 @@ class Homogenization:
         preconditioner="green-jacobi",
         cg_tol=1e-8,
         cg_maxiter=2000,
+        device=None,
     ):
         self.dim = len(nb_grid_pts)
         if self.dim not in (2, 3):
@@ -62,10 +116,12 @@ class Homogenization:
         ]
         self.domain_volume = float(np.prod(self.domain_lengths))
 
+        self.device = _resolve_device(device, self.comm)
         ghosts = (1,) * self.dim
         self.engine = muGrid.FFTEngine(
             self.nb_grid_pts, self.comm,
             nb_ghosts_left=ghosts, nb_ghosts_right=ghosts,
+            device=self.device,
         )
         self.fc = self.engine.real_space_collection
 
@@ -87,6 +143,17 @@ class Homogenization:
         self._rhs = self.fc.real_field("to_rhs", (self.dim,))
         self._Ku = self.fc.real_field("to_Ku", (self.dim,))
 
+        # Array module of the (possibly device-resident) fields: cupy on a GPU
+        # device, numpy on host. `on_device` gates the host<->device copies at
+        # the optimizer boundary.
+        self.on_device = "cupy" in type(self.lam.p).__module__
+        if self.on_device:
+            import cupy as _cp
+
+            self._xp = _cp
+        else:
+            self._xp = np
+
         self.preconditioner_kind = preconditioner
         self.cg_tol = cg_tol
         self.cg_maxiter = cg_maxiter
@@ -100,6 +167,16 @@ class Homogenization:
         density array on this rank."""
         return self._nb_pixels
 
+    def to_host(self, a):
+        """Return ``a`` (a field ``.p`` view or array) as a host NumPy array,
+        copying off the device if necessary."""
+        return a.get() if hasattr(a, "get") else np.asarray(a)
+
+    def to_device(self, a):
+        """Return ``a`` as an array in the fields' module (cupy on device, numpy
+        on host) so it can be assigned into a field's ``.p``/``.s`` view."""
+        return self._xp.asarray(a)
+
     def scalar_field(self, name):
         return self.fc.real_field(name)
 
@@ -111,8 +188,8 @@ class Homogenization:
         """Interpolate rho -> (lambda, mu), fill ghosts, and (re)build/refresh
         the preconditioner. ``rho`` has shape :attr:`nb_pixels`."""
         lam, mu = self.material.lame(np.asarray(rho))
-        self.lam.p[...] = lam
-        self.mu.p[...] = mu
+        self.lam.p[...] = self.to_device(lam)
+        self.mu.p[...] = self.to_device(mu)
         self.engine.communicate_ghosts(self.lam)
         self.engine.communicate_ghosts(self.mu)
         # Stiffness scale (max |λ|, |2μ|), reduced across ranks, used to detect a
@@ -124,8 +201,8 @@ class Homogenization:
     def _reference_lame(self):
         # Global (MPI-reduced) means -> a rank-consistent reference material.
         n = self.comm.sum(int(self.lam.p.size))
-        lam_ref = self.comm.sum(float(np.asarray(self.lam.p).sum())) / n
-        mu_ref = self.comm.sum(float(np.asarray(self.mu.p).sum())) / n
+        lam_ref = self.comm.sum(float(self._xp.sum(self.lam.p))) / n
+        mu_ref = self.comm.sum(float(self._xp.sum(self.mu.p))) / n
         return lam_ref, mu_ref
 
     def _update_preconditioner(self):
@@ -172,9 +249,8 @@ class Homogenization:
         below which the rhs counts as zero; when omitted the material scale is
         used."""
         x.set_zero()
-        b_norm = np.sqrt(self.comm.sum(
-            float(np.dot(np.asarray(b.p).ravel(), np.asarray(b.p).ravel()))
-        ))
+        bp = b.p.ravel()
+        b_norm = np.sqrt(self.comm.sum(float(self._xp.dot(bp, bp))))
         scale = rhs_scale if rhs_scale is not None else getattr(
             self, "_mat_scale", 1.0)
         if b_norm <= 1e-9 * scale:

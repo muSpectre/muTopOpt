@@ -95,8 +95,8 @@ class StressTargetProblem:
                 adj, list((S / V).ravel()),
                 self._g_shear, self._g_vol,
             )
-            g_shear = np.asarray(self._g_shear.p)
-            g_vol = np.asarray(self._g_vol.p)
+            g_shear = h.to_host(self._g_shear.p)
+            g_vol = h.to_host(self._g_vol.p)
             grad += 2.0 * dmu * g_shear + dlam * g_vol
 
         if self.regularization is not None:
