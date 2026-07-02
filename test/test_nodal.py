@@ -93,7 +93,7 @@ def _make_nodal_problem(dim, n, element, comm):
     cases = target_load_cases(
         dim, isotropic_stiffness_tensor(dim, K=0.15, G=0.08), magnitude=0.01
     )
-    reg = NodalPhaseFieldRegularization(homog, eta=1.0, well_weight=1e-2)
+    reg = NodalPhaseFieldRegularization(homog)
     return StressTargetProblem(homog, cases, regularization=reg)
 
 

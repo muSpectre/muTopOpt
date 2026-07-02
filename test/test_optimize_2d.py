@@ -28,7 +28,7 @@ def test_lbfgs_reduces_objective_2d(comm):
     cases = target_load_cases(
         2, isotropic_stiffness_tensor(2, K=0.08, G=0.03), magnitude=0.01
     )
-    reg = PhaseFieldRegularization(homog, eta=1.0, well_weight=1e-3)
+    reg = PhaseFieldRegularization(homog)
     problem = StressTargetProblem(homog, cases, regularization=reg)
 
     rho0 = initial_density(homog.nb_pixels, kind="uniform", volume_fraction=0.5)

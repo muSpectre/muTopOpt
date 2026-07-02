@@ -44,7 +44,7 @@ class SimpMaterial:
     nu : float
         Poisson's ratio (shared by both phases).
     penalty : float, optional
-        SIMP exponent ``p`` (default 3). ``p > 1`` penalizes intermediate
+        SIMP exponent ``p`` (default 2). ``p > 1`` penalizes intermediate
         densities.
     void_ratio : float, optional
         Stiffness ratio of the void phase, ``E_void / E_solid`` (default 1e-3).
@@ -52,7 +52,7 @@ class SimpMaterial:
         well-behaved; set smaller to approach a true void.
     """
 
-    def __init__(self, E_solid, nu, penalty=3.0, void_ratio=1e-3):
+    def __init__(self, E_solid, nu, penalty=2.0, void_ratio=1e-3):
         self.penalty = float(penalty)
         self.lam_solid, self.mu_solid = lame_from_E_nu(E_solid, nu)
         self.lam_void = self.lam_solid * void_ratio

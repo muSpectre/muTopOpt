@@ -18,10 +18,10 @@ Typical use::
     from muTopOpt.loadcases import isotropic_stiffness_tensor, target_load_cases
     from muTopOpt.optimize import initial_density, optimize_bounded_lbfgs
 
-    material = SimpMaterial(E_solid=1.0, nu=0.3, penalty=3.0)
+    material = SimpMaterial(E_solid=1.0, nu=0.3)
     homog = Homogenization((64, 64), material)
     cases = target_load_cases(2, isotropic_stiffness_tensor(2, K=0.1, G=0.05))
-    reg = PhaseFieldRegularization(homog, eta=1.0, well_weight=1e-3)
+    reg = PhaseFieldRegularization(homog)  # eta defaults to one grid spacing
     problem = StressTargetProblem(homog, cases, regularization=reg)
     rho, info = optimize_bounded_lbfgs(problem, initial_density(homog.nb_pixels))
 """

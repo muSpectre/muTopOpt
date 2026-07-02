@@ -7,13 +7,19 @@
 Phase-field regularization of the density.
 
 Following Bourdin/phase-field topology optimization, the density is regularized
-by penalizing interfacial area,
+by penalizing interfacial area with a Modica-Mortola functional,
 
-    f_reg(rho) = eta * ∫ |∇rho|^2 dx  +  (well/eta) * ∫ rho^2 (1 - rho)^2 dx.
+    f_reg(rho) = weight * [ eta * ∫ |∇rho|^2 dx  +  (1/eta) * ∫ rho^2 (1-rho)^2 dx ].
 
 The gradient penalty smooths the design and removes mesh dependence; the
-double-well drives rho toward {0, 1}. Together they yield sharp interfaces
-without an explicit volume constraint.
+double-well ``W(rho) = rho^2 (1 - rho)^2`` (prefactor ``1/eta``) drives rho
+toward {0, 1}. In the Modica-Mortola normalization this functional
+Gamma-converges to (a constant times) the interfacial perimeter as ``eta -> 0``,
+and ``eta`` **is** the interface width, in the *physical length units of the
+unit cell*. It defaults to one grid spacing; choosing it much larger than a few
+grid spacings makes the gradient penalty dominate and the design collapses to a
+constant density. ``weight`` is the overall strength of the regularization
+relative to the (normalized) stress objective.
 
 Two variants of the gradient penalty are provided:
 
@@ -37,12 +43,16 @@ import muGrid
 
 
 class PhaseFieldRegularization:
-    def __init__(self, homogenization, eta=1.0, well_weight=1.0):
+    def __init__(self, homogenization, eta=None, weight=1.0):
         self.h = homogenization
-        self.eta = float(eta)
-        self.well = float(well_weight)
-
         h0 = self.h.grid_spacing[0]
+        # eta IS the interface width (Modica-Mortola normalization); it
+        # defaults to one grid spacing.
+        self.eta = h0 if eta is None else float(eta)
+        # Overall strength of the regularization relative to the (normalized)
+        # stress objective.
+        self.weight = float(weight)
+
         if not np.allclose(self.h.grid_spacing, h0):
             # The isotropic FD Laplacian assumes equal spacing; warn rather than
             # silently mis-scale the gradient penalty.
@@ -73,15 +83,16 @@ class PhaseFieldRegularization:
             float(np.sum(rho**2 * (1.0 - rho) ** 2))
         ) * self.vol_pixel
 
-        f = self.eta * grad_pen + (self.well / self.eta) * dwell
+        # Modica-Mortola: f_reg = weight * [ eta * ∫|∇rho|^2 + (1/eta) * ∫ W ]
+        f = self.eta * grad_pen + dwell / self.eta
 
         # d/drho [rho^2 (1-rho)^2] = 2 rho (1 - rho)(1 - 2 rho)
         dwell_drho = 2.0 * rho * (1.0 - rho) * (1.0 - 2.0 * rho)
         g = (
             self.eta * 2.0 * lap * self.vol_pixel
-            + (self.well / self.eta) * dwell_drho * self.vol_pixel
+            + dwell_drho * self.vol_pixel / self.eta
         )
-        return f, g
+        return self.weight * f, self.weight * g
 
 
 def fe_laplacian_stencil(dim, grid_spacing, element):
@@ -138,7 +149,7 @@ class NodalPhaseFieldRegularization:
 
     Same functional as :class:`PhaseFieldRegularization`,
 
-        f_reg = eta * ∫|∇rho|^2 + (well/eta) * ∫ rho^2 (1 - rho)^2,
+        f_reg = weight * [ eta * ∫|∇rho|^2 + (1/eta) * ∫ rho^2 (1 - rho)^2 ],
 
     but the density is a *nodal* finite-element field and the gradient penalty
     is the element-consistent H¹ seminorm ``eta * rhoᵀ L rho`` with the fused
@@ -156,10 +167,12 @@ class NodalPhaseFieldRegularization:
     operator (``homogenization.element``).
     """
 
-    def __init__(self, homogenization, eta=1.0, well_weight=1.0):
+    def __init__(self, homogenization, eta=None, weight=1.0):
         self.h = homogenization
-        self.eta = float(eta)
-        self.well = float(well_weight)
+        # eta IS the interface width (Modica-Mortola normalization); it
+        # defaults to one grid spacing.
+        self.eta = (self.h.grid_spacing[0] if eta is None else float(eta))
+        self.weight = float(weight)
 
         offset, stencil = fe_laplacian_stencil(
             self.h.dim, self.h.grid_spacing, self.h.element
@@ -185,11 +198,12 @@ class NodalPhaseFieldRegularization:
             float(np.sum(rho**2 * (1.0 - rho) ** 2))
         ) * self.vol_pixel
 
-        f = self.eta * grad_pen + (self.well / self.eta) * dwell
+        # Modica-Mortola: f_reg = weight * [ eta * ∫|∇rho|^2 + (1/eta) * ∫ W ]
+        f = self.eta * grad_pen + dwell / self.eta
 
         dwell_drho = 2.0 * rho * (1.0 - rho) * (1.0 - 2.0 * rho)
         g = (
             self.eta * 2.0 * Lrho
-            + (self.well / self.eta) * dwell_drho * self.vol_pixel
+            + dwell_drho * self.vol_pixel / self.eta
         )
-        return f, g
+        return self.weight * f, self.weight * g

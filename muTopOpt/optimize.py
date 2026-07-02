@@ -25,12 +25,29 @@ import numpy as np
 
 
 def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
-                    smoothing=2):
+                    smoothing=2, length=None, grid_spacing=None, contrast=0.5):
     """Build an initial element-wise density.
 
-    ``kind='uniform'`` fills with ``volume_fraction``; ``kind='random'`` draws a
-    smoothed random field (a low-pass-filtered noise), the usual robust start for
-    phase-field topology optimization.
+    ``kind='uniform'`` fills with ``volume_fraction``.
+
+    ``kind='random'`` draws a box-smoothed random field (``smoothing`` sweeps),
+    a cheap low-pass start with no controlled length scale.
+
+    ``kind='filtered_random'`` draws white noise and applies a **periodic
+    Gaussian filter** of correlation length ``length`` (in the *physical* units
+    of the unit cell -- the cell has length 1 by default, converted to pixels
+    via ``grid_spacing``, which defaults to ``1/n`` per axis). The field is then
+    standardized and mapped to ``clip(volume_fraction + contrast * z, 0, 1)`` so
+    it has the requested mean volume fraction with smooth blobs of the chosen
+    size -- and no sharp interfaces, which the phase-field regularization then
+    sharpens on its own during the optimization (no filter is applied there).
+
+    Choosing ``length`` -- the initial blob size must be **larger** than the
+    phase-field interface width the regularization will impose. In the
+    Modica-Mortola normalization that width is simply ``eta`` itself (which
+    defaults to one grid spacing, ``eta = h``), so pick ``length ~= 2..4 *
+    eta`` -- the regularization then *sharpens the blob boundaries* rather
+    than dissolving the blobs.
     """
     if kind == "uniform":
         return np.full(shape, float(volume_fraction))
@@ -51,6 +68,34 @@ def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
             rho /= std
         rho = np.clip(0.5 + 0.5 * rho, 0.0, 1.0)
         return rho
+    if kind == "filtered_random":
+        if length is None:
+            raise ValueError("filtered_random needs a correlation `length`")
+        shape = tuple(int(n) for n in shape)
+        ndim = len(shape)
+        if grid_spacing is None:
+            grid_spacing = [1.0 / n for n in shape]
+        grid_spacing = [float(h) for h in grid_spacing]
+
+        rng = np.random.default_rng(seed)
+        noise = rng.standard_normal(shape)
+
+        # Periodic Gaussian low-pass in Fourier space. Per axis the Gaussian has
+        # std sigma_px = length / h pixels; its DFT multiplier is
+        # exp(-2 pi^2 sigma_px^2 f^2) with f = fftfreq (cycles/pixel).
+        spec = np.fft.fftn(noise)
+        for ax in range(ndim):
+            sigma_px = float(length) / grid_spacing[ax]
+            f = np.fft.fftfreq(shape[ax])
+            g = np.exp(-2.0 * np.pi**2 * sigma_px**2 * f**2)
+            spec *= g.reshape([-1 if d == ax else 1 for d in range(ndim)])
+        rho = np.fft.ifftn(spec).real
+
+        rho -= rho.mean()
+        std = rho.std()
+        if std > 0:
+            rho /= std
+        return np.clip(float(volume_fraction) + float(contrast) * rho, 0.0, 1.0)
     raise ValueError(f"unknown initial-density kind '{kind}'")
 
 

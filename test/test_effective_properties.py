@@ -100,7 +100,7 @@ def test_optimizer_recovers_reachable_effective_stiffness(comm):
     targets = [h.homogenized_stress(h.solve_macro(E, u), E) for E in strains]
     cases = [LoadCase(E, t, 1.0) for E, t in zip(strains, targets)]
 
-    reg = PhaseFieldRegularization(h, eta=0.2, well_weight=1e-3)
+    reg = PhaseFieldRegularization(h, weight=1e-2)
     problem = StressTargetProblem(h, cases, regularization=reg)
     rho0 = initial_density(h.nb_pixels, kind="random", seed=99,
                            volume_fraction=0.5)
