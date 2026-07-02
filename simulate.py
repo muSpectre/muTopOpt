@@ -123,10 +123,25 @@ def main():
               f"load cases={len(cases)}  preconditioner={args.preconditioner}  "
               f"device={args.device}")
 
+    # Per-iteration L-BFGS history, collected across ranks with global
+    # reductions so every rank holds the same series (safe to write below).
+    n_global = comm.sum(float(rho0.size))
+    hist = {"objective": [], "volume_fraction": [], "cg_iters": []}
+
     def cb(it, rho, last):
+        vf = comm.sum(float(np.sum(rho))) / n_global
+        cg = last.get("cg_iters", [])
+        cg_total = int(sum(cg))
+        hist["objective"].append(float(last["objective"]))
+        hist["volume_fraction"].append(vf)
+        hist["cg_iters"].append(cg_total)
         if rank0:
-            vf = float(np.mean(rho))
-            print(f"  iter {it:4d}  f={last['objective']:.6e}  vol_frac={vf:.3f}")
+            cg_str = ""
+            if cg:
+                cg_str = (f"  cg_iters=[{','.join(str(n) for n in cg)}]"
+                          f" (total {cg_total})")
+            print(f"  iter {it:4d}  f={last['objective']:.6e}  "
+                  f"vol_frac={vf:.3f}{cg_str}")
 
     rho, info = optimize_bounded_lbfgs(
         problem, rho0, comm=mpi_comm, maxiter=args.iters, gtol=args.gtol,
@@ -144,6 +159,17 @@ def main():
             args.output, muGrid.FileIONetCDF.OpenMode.Overwrite, comm
         )
         fio.register_field_collection(homog.fc)
+        # The L-BFGS history goes in as NetCDF global attributes (one value per
+        # outer iteration) for later plotting of the convergence. These MUST be
+        # written before any field data -- muGrid forbids growing the header
+        # once a frame has been written.
+        if hist["objective"]:
+            fio.write_global_attribute("lbfgs_objective_history",
+                                       hist["objective"])
+            fio.write_global_attribute("lbfgs_volume_fraction_history",
+                                       hist["volume_fraction"])
+            fio.write_global_attribute("lbfgs_cg_iters_history",
+                                       hist["cg_iters"])
         fio.append_frame().write(["density"])
         if rank0:
             print(f"wrote {args.output}")

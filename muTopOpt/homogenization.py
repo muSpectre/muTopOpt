@@ -254,13 +254,23 @@ class Homogenization:
         scale = rhs_scale if rhs_scale is not None else getattr(
             self, "_mat_scale", 1.0)
         if b_norm <= 1e-9 * scale:
+            # Exact solution x = 0; no CG iterations performed.
+            self.last_cg_iters = 0
             return x
+        # Count CG iterations via the solver callback (fires once per iteration).
+        counter = {"n": 0}
+
+        def _count(iteration, state):
+            counter["n"] += 1
+
         conjugate_gradients(
             self.comm, self.fc, b, x,
             hessp=self._hessp, prec=self._prec,
             rtol=self.cg_tol if rtol is None else rtol,
             maxiter=self.cg_maxiter if maxiter is None else maxiter,
+            callback=_count,
         )
+        self.last_cg_iters = counter["n"]
         return x
 
     def solve_macro(self, E_macro, x, rtol=None, maxiter=None):

@@ -72,10 +72,12 @@ class StressTargetProblem:
         f = 0.0
         grad = np.zeros_like(rho)
         stresses = []
+        cg_iters = []  # CG iteration count of each (forward, adjoint) solve
         for lc in self.load_cases:
             norm = float(np.sum(lc.target_stress**2))
             # Forward equilibrium.
             u = h.solve_macro(lc.macro_strain, self._u)
+            cg_iters.append(h.last_cg_iters)
             sigma = h.homogenized_stress(u, lc.macro_strain)
             stresses.append(sigma)
             diff = sigma - lc.target_stress
@@ -86,6 +88,7 @@ class StressTargetProblem:
             h.macro_rhs_tensor(S, self._adj_rhs, scale=-1.0 / V)
             adj_scale = h.mat_scale * max(float(np.abs(S / V).max()), 1e-300)
             adj = h.solve_rhs(self._adj_rhs, self._adj, rhs_scale=adj_scale)
+            cg_iters.append(h.last_cg_iters)
 
             # Sensitivity: geometry contractions with total forward strain
             # (macro Ē) and total costate strain (fluctuation adj + macro S/V);
@@ -104,5 +107,6 @@ class StressTargetProblem:
             f += f_reg
             grad += g_reg
 
-        self.last = {"objective": f, "stresses": stresses}
+        self.last = {"objective": f, "stresses": stresses,
+                     "cg_iters": cg_iters}
         return f, grad
