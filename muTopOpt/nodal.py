@@ -31,7 +31,7 @@ Two ingredients live here:
   on Q1 elements.
 """
 
-from itertools import combinations_with_replacement, product
+from itertools import product
 from math import factorial
 
 import numpy as np
@@ -166,18 +166,13 @@ class ConsistentDoubleWell:
         self.m = nodal_map
         dim = self.m.dim
         if self.m.element_name == "p1":
-            m_nodes = dim + 1
-            self._msets = {
-                k: list(combinations_with_replacement(range(m_nodes), k))
-                for k in (2, 3, 4)
-            }
             self._Ck = {
                 k: factorial(dim) * factorial(k) / factorial(k + dim)
                 for k in (2, 3, 4)
             }
         else:  # q1
             pts1d = _gauss_points_unit_interval()
-            self._gauss = []
+            gauss = []
             for combo in product(pts1d, repeat=dim):
                 xi = [c[0] for c in combo]
                 w = float(np.prod([c[1] for c in combo]))
@@ -189,59 +184,58 @@ class ConsistentDoubleWell:
                     ]))
                     for c in range(self.m.nb_nodes)
                 ]
-                self._gauss.append((w, N))
+                gauss.append((w, N))
+            self._gw = np.array([g[0] for g in gauss])   # (gauss,)
+            self._gN = np.array([g[1] for g in gauss])   # (gauss, corners)
 
     # -- P1: closed form via h_k ---------------------------------------------
     def _p1_value_and_corner_grad(self, views):
+        # h_k from the power sums p_j = sum_i a_i^j (Newton's identity for the
+        # complete homogeneous symmetric polynomials, k h_k = sum_j p_j
+        # h_{k-j}) and the gradient from dh_k/da_i = sum_{j<k} a_i^j
+        # h_{k-1-j}, evaluated by Horner. This needs O(nodes) full-grid array
+        # operations instead of the O(35 * nodes) of a naive multiset
+        # enumeration -- about an order of magnitude faster in 3D.
         m = self.m
-        f = None
-        grads = [None] * m.nb_nodes
+        f = 0.0
+        grads = [0.0] * m.nb_nodes
+        C2, C3, C4 = self._Ck[2], self._Ck[3], self._Ck[4]
         for nodes, frac in _P1_SIMPLICES[m.dim]:
             V = frac * m.vol_pixel
             a = [views[i] for i in nodes]
-            # h_k and dh_k/da_j, accumulated into the W combination
-            # W = C2 h2 - 2 C3 h3 + C4 h4 (times V).
-            for k, coeff in ((2, self._Ck[2]), (3, -2.0 * self._Ck[3]),
-                             (4, self._Ck[4])):
-                for t in self._msets[k]:
-                    prod = a[t[0]]
-                    for i in t[1:]:
-                        prod = prod * a[i]
-                    f = V * coeff * prod if f is None else f + V * coeff * prod
-                    # gradient: for each distinct entry j of t with
-                    # multiplicity mult, d(prod)/da_j = mult * prod(t \ one j)
-                    for j in set(t):
-                        rem = None
-                        removed = False
-                        for i in t:
-                            if i == j and not removed:
-                                removed = True
-                                continue
-                            rem = a[i] if rem is None else rem * a[i]
-                        if rem is None:
-                            rem = 1.0
-                        term = V * coeff * t.count(j) * rem
-                        g = grads[nodes[j]]
-                        grads[nodes[j]] = term if g is None else g + term
+            a2 = [x * x for x in a]
+            p1 = sum(a)
+            p2 = sum(a2)
+            p3 = sum(x2 * x for x2, x in zip(a2, a))
+            p4 = sum(x2 * x2 for x2 in a2)
+            h1 = p1
+            h2 = (p1 * h1 + p2) / 2.0
+            h3 = (p1 * h2 + p2 * h1 + p3) / 3.0
+            h4 = (p1 * h3 + p2 * h2 + p3 * h1 + p4) / 4.0
+            f = f + V * (C2 * h2 - 2.0 * C3 * h3 + C4 * h4)
+            for j, ai in enumerate(a):
+                dh2 = h1 + ai
+                dh3 = h2 + ai * dh2
+                dh4 = h3 + ai * dh3
+                grads[nodes[j]] = grads[nodes[j]] + V * (
+                    C2 * dh2 - 2.0 * C3 * dh3 + C4 * dh4)
         return f, grads
 
     # -- Q1: exact Gauss quadrature --------------------------------------------
     def _q1_value_and_corner_grad(self, views):
+        # All Gauss points evaluated along one stacked leading axis (a single
+        # tensordot instead of a Python loop over 3^dim points).
         m = self.m
-        f = None
-        grads = [None] * m.nb_nodes
-        for w, N in self._gauss:
-            rho_g = N[0] * views[0]
-            for c in range(1, m.nb_nodes):
-                rho_g = rho_g + N[c] * views[c]
-            Wg = rho_g ** 2 * (1.0 - rho_g) ** 2
-            dWg = 2.0 * rho_g * (1.0 - rho_g) * (1.0 - 2.0 * rho_g)
-            fac = w * m.vol_pixel
-            f = fac * Wg if f is None else f + fac * Wg
-            for c in range(m.nb_nodes):
-                term = fac * N[c] * dWg
-                grads[c] = term if grads[c] is None else grads[c] + term
-        return f, grads
+        xp = m.h._xp
+        A = xp.stack([xp.asarray(v) for v in views])   # (corners, *grid)
+        rho_g = xp.tensordot(self._gN, A, axes=(1, 0))  # (gauss, *grid)
+        Wg = rho_g**2 * (1.0 - rho_g) ** 2
+        dWg = 2.0 * rho_g * (1.0 - rho_g) * (1.0 - 2.0 * rho_g)
+        wv = self._gw * m.vol_pixel                     # (gauss,)
+        f = xp.tensordot(xp.asarray(wv), Wg, axes=(0, 0))
+        gc = xp.tensordot(xp.asarray((self._gN * wv[:, None]).T), dWg,
+                          axes=(1, 0))                  # (corners, *grid)
+        return f, [gc[c] for c in range(m.nb_nodes)]
 
     def value_and_gradient(self, rho):
         """Return ``(\\int W dx, d/drho)`` for a nodal density array; the value
