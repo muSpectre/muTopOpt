@@ -176,9 +176,14 @@ def main():
         callback=cb
     )
 
+    converged = bool(info["success"])
     if rank0:
         print(f"done: {info['message']}  f={info['objective']:.6e}  "
               f"iters={info['nit']}")
+        if not converged:
+            print("WARNING: L-BFGS did NOT converge; the written density is "
+                  "the last (non-converged) iterate (converged=0 in the "
+                  "output file).")
 
     if args.output is not None:
         field = homog.scalar_field("density")
@@ -187,10 +192,22 @@ def main():
             args.output, muGrid.FileIONetCDF.OpenMode.Overwrite, comm
         )
         fio.register_field_collection(homog.fc)
-        # The L-BFGS history goes in as NetCDF global attributes (one value per
-        # outer iteration) for later plotting of the convergence. These MUST be
-        # written before any field data -- muGrid forbids growing the header
-        # once a frame has been written.
+        # Global attributes (incl. the L-BFGS history, one value per outer
+        # iteration, for later plotting). These MUST be written before any
+        # field data -- muGrid forbids growing the header once a frame has
+        # been written. All quantities are globally consistent across ranks
+        # (NuMPI's l_bfgs_bounded returns the same result on every rank), so
+        # writing them from all ranks is safe.
+        # Convergence status: `converged` is the machine-readable flag (1 =
+        # the optimizer met its tolerances, 0 = it stopped early, e.g. at
+        # maxiter); the remaining attributes give the reason and the final
+        # optimizer state.
+        fio.write_global_attribute("converged", [int(converged)])
+        fio.write_global_attribute("optimizer_message", str(info["message"]))
+        fio.write_global_attribute("nb_iterations", [int(info["nit"])])
+        fio.write_global_attribute("final_objective", [float(info["objective"])])
+        fio.write_global_attribute("final_max_gradient",
+                                   [float(info["max_grad"])])
         if hist["objective"]:
             fio.write_global_attribute("lbfgs_objective_history",
                                        hist["objective"])
@@ -200,7 +217,7 @@ def main():
                                        hist["cg_iters"])
         fio.append_frame().write(["density"])
         if rank0:
-            print(f"wrote {args.output}")
+            print(f"wrote {args.output} (converged={int(converged)})")
 
 
 if __name__ == "__main__":
