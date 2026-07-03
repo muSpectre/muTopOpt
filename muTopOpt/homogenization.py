@@ -36,6 +36,15 @@ from muGrid.Solvers import conjugate_gradients
 
 from .material import SimpMaterial
 
+# muGrid's ``conjugate_gradients`` gained an optional ``residual`` out-field
+# (the final r = b - Kx, needed for the adjoint-corrected objective) after
+# 0.110. Detect it once so we work against released muGrid too, falling back
+# to one extra operator apply when the argument is unavailable.
+import inspect as _inspect
+
+_CG_HAS_RESIDUAL = "residual" in _inspect.signature(
+    conjugate_gradients).parameters
+
 
 def _local_rank(comm):
     """Node-local rank of this process, used to pick a per-rank GPU.
@@ -270,14 +279,22 @@ class Homogenization:
         def _count(iteration, state):
             counter["n"] += 1
 
+        cg_kwargs = {}
+        if residual is not None and _CG_HAS_RESIDUAL:
+            cg_kwargs["residual"] = residual
         conjugate_gradients(
             self.comm, self.fc, b, x,
             hessp=self._hessp, prec=self._prec,
             rtol=self.cg_tol if rtol is None else rtol,
             maxiter=self.cg_maxiter if maxiter is None else maxiter,
             callback=_count,
-            residual=residual,
+            **cg_kwargs,
         )
+        if residual is not None and not _CG_HAS_RESIDUAL:
+            # Released muGrid without the residual out-field: recover
+            # r = b - K x with one extra operator apply.
+            self._hessp(x, self._Ku)
+            residual.s[...] = b.s - self._Ku.s
         self.last_cg_iters = counter["n"]
         return x
 
