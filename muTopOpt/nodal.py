@@ -228,7 +228,7 @@ class ConsistentDoubleWell:
         m = self.m
         xp = m.h._xp
         A = xp.stack([xp.asarray(v) for v in views])   # (corners, *grid)
-        rho_g = xp.tensordot(self._gN, A, axes=(1, 0))  # (gauss, *grid)
+        rho_g = xp.tensordot(xp.asarray(self._gN), A, axes=(1, 0))  # (gauss, *grid)
         Wg = rho_g**2 * (1.0 - rho_g) ** 2
         dWg = 2.0 * rho_g * (1.0 - rho_g) * (1.0 - 2.0 * rho_g)
         wv = self._gw * m.vol_pixel                     # (gauss,)
