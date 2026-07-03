@@ -39,7 +39,7 @@ class LoadCase:
 
 class StressTargetProblem:
     def __init__(self, homogenization, load_cases, regularization=None,
-                 design="element"):
+                 design="element", consistent_objective=True):
         """``design='element'`` optimizes a per-pixel density (the material of
         each element is ``SIMP(rho_e)`` directly). ``design='nodal'`` optimizes
         a *nodal* FE density: each element's material is ``SIMP(rho_e)`` with
@@ -47,7 +47,16 @@ class StressTargetProblem:
         :class:`muTopOpt.nodal.NodalElementMap`), so every nodal degree of
         freedom couples its ``2^dim`` adjacent elements -- an implicit
         sensitivity filter. Pair the nodal design with
-        :class:`~muTopOpt.regularization.NodalPhaseFieldRegularization`."""
+        :class:`~muTopOpt.regularization.NodalPhaseFieldRegularization`.
+
+        ``consistent_objective=True`` (default) reports the *Lagrangian*
+        ``L = f + Σ_Γ λ_Γᵀ (K u_Γ - b_Γ)`` instead of the raw objective: the
+        adjoint-weighted residual of each (possibly truncated) forward solve
+        cancels the first-order effect of the solve error, making the reported
+        value second-order accurate in the CG tolerance and *consistent* with
+        the adjoint gradient (which is exactly ``∂L/∂ρ``). At converged solves
+        the correction vanishes; with it, loose inner tolerances (e.g.
+        ``cg_tol ~ 1e-3``) suffice for clean L-BFGS line searches."""
         self.h = homogenization
         self.dim = homogenization.dim
         self.load_cases = [self._as_case(lc) for lc in load_cases]
@@ -59,6 +68,7 @@ class StressTargetProblem:
             from .nodal import NodalElementMap
 
             self._nodal_map = NodalElementMap(homogenization)
+        self.consistent_objective = bool(consistent_objective)
 
         # Per-load-case solver fields, reused across iterations.
         self._u = self.h.vector_field("to_prob_u")
@@ -66,6 +76,10 @@ class StressTargetProblem:
         self._adj_rhs = self.h.vector_field("to_prob_adjoint_rhs")
         self._g_shear = self.h.scalar_field("to_prob_g_shear")
         self._g_vol = self.h.scalar_field("to_prob_g_vol")
+        if self.consistent_objective:
+            # Final residual of the forward solve, kept until the adjoint of
+            # the same load case is available.
+            self._res_u = self.h.vector_field("to_prob_forward_residual")
 
         self.last = {}  # diagnostics from the most recent evaluation
 
@@ -96,11 +110,14 @@ class StressTargetProblem:
         f = 0.0
         grad = np.zeros_like(rho_e)
         stresses = []
+        corrections = []  # adjoint-weighted forward residuals (one per case)
         cg_iters = []  # CG iteration count of each (forward, adjoint) solve
         for lc in self.load_cases:
             norm = float(np.sum(lc.target_stress**2))
             # Forward equilibrium.
-            u = h.solve_macro(lc.macro_strain, self._u)
+            u = h.solve_macro(
+                lc.macro_strain, self._u,
+                residual=self._res_u if self.consistent_objective else None)
             cg_iters.append(h.last_cg_iters)
             sigma = h.homogenized_stress(u, lc.macro_strain)
             stresses.append(sigma)
@@ -113,6 +130,19 @@ class StressTargetProblem:
             adj_scale = h.mat_scale * max(float(np.abs(S / V).max()), 1e-300)
             adj = h.solve_rhs(self._adj_rhs, self._adj, rhs_scale=adj_scale)
             cg_iters.append(h.last_cg_iters)
+
+            if self.consistent_objective:
+                # Lagrangian correction λᵀ(K u - b) = -λᵀ r with the CG
+                # residual r = b - K u: cancels the first-order effect of the
+                # truncated forward solve on the objective (the adjoint
+                # equation K λ = -∂f/∂u makes ∂f/∂u δu + λᵀ K δu vanish), so
+                # the reported value is second-order accurate in the solve
+                # error and exactly the function whose ρ-derivative the
+                # gradient below is.
+                corr = -h.comm.sum(float(
+                    h._xp.sum(adj.p * self._res_u.p)))
+                f += corr
+                corrections.append(corr)
 
             # Sensitivity: geometry contractions with total forward strain
             # (macro Ē) and total costate strain (fluctuation adj + macro S/V);
@@ -140,5 +170,5 @@ class StressTargetProblem:
             grad += g_reg
 
         self.last = {"objective": f, "stresses": stresses,
-                     "cg_iters": cg_iters}
+                     "cg_iters": cg_iters, "corrections": corrections}
         return f, grad

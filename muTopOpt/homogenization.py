@@ -239,7 +239,8 @@ class Homogenization:
         self.engine.communicate_ghosts(u)
         self.op.apply(u, self.lam, self.mu, Au)
 
-    def solve_rhs(self, b, x, rtol=None, maxiter=None, rhs_scale=None):
+    def solve_rhs(self, b, x, rtol=None, maxiter=None, rhs_scale=None,
+                  residual=None):
         """Solve ``K x = b`` in place; returns ``x``.
 
         A negligible right-hand side (e.g. a spatially uniform material, whose
@@ -247,14 +248,20 @@ class Homogenization:
         the exact solution ``x = 0``; return it directly, since CG would divide
         by zero on the first step. ``rhs_scale`` sets the (absolute) force scale
         below which the rhs counts as zero; when omitted the material scale is
-        used."""
+        used.
+
+        If ``residual`` is a field, the final CG residual ``r = b - K x`` is
+        copied into it (used for the adjoint-corrected objective)."""
         x.set_zero()
         bp = b.p.ravel()
         b_norm = np.sqrt(self.comm.sum(float(self._xp.dot(bp, bp))))
         scale = rhs_scale if rhs_scale is not None else getattr(
             self, "_mat_scale", 1.0)
         if b_norm <= 1e-9 * scale:
-            # Exact solution x = 0; no CG iterations performed.
+            # Exact solution x = 0; no CG iterations performed. The residual
+            # of x = 0 is b itself (round-off-level by construction).
+            if residual is not None:
+                residual.s[...] = b.s
             self.last_cg_iters = 0
             return x
         # Count CG iterations via the solver callback (fires once per iteration).
@@ -269,11 +276,12 @@ class Homogenization:
             rtol=self.cg_tol if rtol is None else rtol,
             maxiter=self.cg_maxiter if maxiter is None else maxiter,
             callback=_count,
+            residual=residual,
         )
         self.last_cg_iters = counter["n"]
         return x
 
-    def solve_macro(self, E_macro, x, rtol=None, maxiter=None):
+    def solve_macro(self, E_macro, x, rtol=None, maxiter=None, residual=None):
         """Solve the periodic homogenization problem ``K u = -Bᵀ C:Ē`` for the
         fluctuation displacement ``u`` under macro strain ``Ē``."""
         E_arr = np.asarray(E_macro, dtype=float)
@@ -283,7 +291,8 @@ class Homogenization:
         scale = getattr(self, "_mat_scale", 1.0) * max(
             float(np.abs(E_arr).max()), 1e-300)
         return self.solve_rhs(
-            self._rhs, x, rtol=rtol, maxiter=maxiter, rhs_scale=scale)
+            self._rhs, x, rtol=rtol, maxiter=maxiter, rhs_scale=scale,
+            residual=residual)
 
     @property
     def mat_scale(self):

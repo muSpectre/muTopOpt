@@ -77,7 +77,11 @@ def main():
     p.add_argument("--iters", type=int, default=200)
     p.add_argument("--gtol", type=float, default=1e-5,
                    help="L-BFGS convergence tolerance on the projected gradient")
-    p.add_argument("--cg-tol", type=float, default=1e-8)
+    p.add_argument("--cg-tol", type=float, default=1e-4,
+               help="inner CG relative tolerance; loose values are safe "
+                    "because the objective is adjoint-corrected "
+                    "(Lagrangian) and thus second-order accurate in the "
+                    "solve error")
     p.add_argument("--preconditioner", choices=["green-jacobi", "green"],
                    default="green-jacobi")
     p.add_argument("--element", choices=["p1", "q1"], default="q1",
