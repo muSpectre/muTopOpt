@@ -5,6 +5,7 @@ build-backend = "flit_core.buildapi"
 [project]
 name = "muTopOpt"
 authors = [
+    { name = "Martin Ladecky", email = "martin.ladecky@imtek.uni-freiburg.de" },
     { name = "Lars Pastewka", email = "lars.pastewka@imtek.uni-freiburg.de" },
 ]
 description = "FFT-accelerated FE topology optimization of mechanical metamaterials, built on muGrid"
