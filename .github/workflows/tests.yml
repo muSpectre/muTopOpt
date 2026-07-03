@@ -1,0 +1,68 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+  pull_request:
+    branches:
+      - '**'
+  schedule:
+    - cron: "0 2 * * 5"
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # muTopOpt is pure Python; muGrid/NuMPI come from PyPI wheels. Test the
+        # oldest and newest supported Pythons, with and without MPI.
+        python-version: [ '3.10', '3.14' ]
+        mpi: [ 'no', 'yes' ]
+
+    name: py${{ matrix.python-version }} mpi=${{ matrix.mpi }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install MPI (matrix mpi=yes)
+        if: matrix.mpi == 'yes'
+        run: |
+          sudo apt-get update -qy
+          sudo apt-get install -y openmpi-bin libopenmpi-dev
+
+      - name: Install muTopOpt and dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          # muGrid (with FFT/FE operators + the CG solver) and NuMPI (the
+          # bound-constrained L-BFGS optimizer) install from PyPI wheels.
+          EXTRAS="test,scipy"
+          if [ "${{ matrix.mpi }}" == "yes" ]; then
+            python3 -m pip install "mpi4py"
+            EXTRAS="$EXTRAS,mpi"
+          fi
+          python3 -m pip install ".[${EXTRAS}]"
+          python3 -m pip list
+
+      - name: Run tests (serial)
+        run: |
+          python3 -m pytest test/ -v --durations=15
+
+      - name: Run tests (MPI, 2 ranks)
+        if: matrix.mpi == 'yes'
+        run: |
+          # Oversubscribe so 2 ranks run on the GitHub runner's core budget.
+          export OMPI_MCA_rmaps_base_oversubscribe=1
+          mpirun -n 2 python3 -m pytest test/ -v --durations=15
