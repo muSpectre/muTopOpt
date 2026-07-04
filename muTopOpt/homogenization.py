@@ -118,13 +118,17 @@ class Homogenization:
         self.dim = len(nb_grid_pts)
         if self.dim not in (2, 3):
             raise ValueError("nb_grid_pts must be 2- or 3-dimensional")
-        self.nb_grid_pts = tuple(int(n) for n in nb_grid_pts)
-        self.material = material
-        self.comm = comm if comm is not None else muGrid.Communicator()
+        # Scalar precision of the on-grid fields. muGrid's FFTEngine and fused
+        # operators dispatch on the field dtype, so allocating every field at
+        # this dtype runs the whole forward/adjoint/sensitivity path in single
+        # or double precision. The host-side optimizer stays in float64.
         self.dtype = np.dtype(dtype)
         if self.dtype not in (np.dtype(np.float64), np.dtype(np.float32)):
             raise ValueError(
                 f"dtype must be float64 or float32, got {self.dtype}")
+        self.nb_grid_pts = tuple(int(n) for n in nb_grid_pts)
+        self.material = material
+        self.comm = comm if comm is not None else muGrid.Communicator()
 
         if domain_lengths is None:
             domain_lengths = [1.0] * self.dim
@@ -192,8 +196,9 @@ class Homogenization:
 
     def to_device(self, a):
         """Return ``a`` as an array in the fields' module (cupy on device, numpy
-        on host) so it can be assigned into a field's ``.p``/``.s`` view."""
-        return self._xp.asarray(a)
+        on host) at the grid precision, so it can be assigned into a field's
+        ``.p``/``.s`` view."""
+        return self._xp.asarray(a, dtype=self.dtype)
 
     def scalar_field(self, name):
         return self.fc.real_field(name, dtype=self.dtype)

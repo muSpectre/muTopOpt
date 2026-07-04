@@ -109,61 +109,32 @@ def main():
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--iters", type=int, default=200)
-    p.add_argument(
-        "--gtol",
-        type=float,
-        default=1e-5,
-        help="L-BFGS convergence tolerance on the projected gradient",
-    )
-    p.add_argument(
-        "--cg-tol",
-        type=float,
-        default=1e-4,
-        help="inner CG relative tolerance; loose values are safe "
-        "because the objective is adjoint-corrected "
-        "(Lagrangian) and thus second-order accurate in the "
-        "solve error",
-    )
-    p.add_argument(
-        "--preconditioner", choices=["green-jacobi", "green"], default="green-jacobi"
-    )
-    p.add_argument(
-        "--element",
-        choices=["p1", "q1"],
-        default="q1",
-        help="finite element (P1 simplices or Q1 hex/quad)",
-    )
-    p.add_argument(
-        "--device",
-        choices=["cpu", "gpu"],
-        default="cpu",
-        help="run the forward/adjoint solves and sensitivity on the "
-        "host (cpu) or on the accelerator (gpu); the L-BFGS "
-        "optimizer always runs on the host",
-    )
-    p.add_argument(
-        "--dtype",
-        choices=["float64", "float32"],
-        default="float64",
-        help="precision of the grid fields (forward/adjoint solves, "
-        "preconditioner FFTs, sensitivity kernels); the L-BFGS "
-        "optimizer and host-side reductions stay in double",
-    )
-    p.add_argument(
-        "--density",
-        choices=["element", "nodal"],
-        default="nodal",
-        help="density discretization: 'nodal' (nodal FE field, "
-        "SIMP on the element average of the interpolant, fully "
-        "consistent Galerkin phase-field regularization) or "
-        "'element' (per-pixel density, FD Laplacian penalty)",
-    )
-    p.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="NetCDF file to write the optimized density to",
-    )
+    p.add_argument("--gtol", type=float, default=1e-5,
+                   help="L-BFGS convergence tolerance on the projected gradient")
+    p.add_argument("--cg-tol", type=float, default=1e-4,
+               help="inner CG relative tolerance; loose values are safe "
+                    "because the objective is adjoint-corrected "
+                    "(Lagrangian) and thus second-order accurate in the "
+                    "solve error")
+    p.add_argument("--preconditioner", choices=["green-jacobi", "green"],
+                   default="green-jacobi")
+    p.add_argument("--element", choices=["p1", "q1"], default="q1",
+                   help="finite element (P1 simplices or Q1 hex/quad)")
+    p.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
+                   help="run the forward/adjoint solves and sensitivity on the "
+                   "host (cpu) or on the accelerator (gpu); the L-BFGS "
+                   "optimizer always runs on the host")
+    p.add_argument("--precision", choices=["single", "double"], default="double",
+                   help="scalar precision of the on-grid fields and the "
+                   "FFT-accelerated solves (the FFT engine dispatches on the "
+                   "field dtype); the host L-BFGS optimizer stays double")
+    p.add_argument("--density", choices=["element", "nodal"], default="nodal",
+                   help="density discretization: 'nodal' (nodal FE field, "
+                   "SIMP on the element average of the interpolant, fully "
+                   "consistent Galerkin phase-field regularization) or "
+                   "'element' (per-pixel density, FD Laplacian penalty)")
+    p.add_argument("--output", type=str, default=None,
+                   help="NetCDF file to write the optimized density to")
     args = p.parse_args()
 
     dim = len(args.nb_grid_pts)
@@ -181,15 +152,12 @@ def main():
     rank0 = comm.rank == 0
 
     material = SimpMaterial(args.E, args.nu, args.penalty, args.void_ratio)
+    # CLI exposes "single"/"double"; muTopOpt works in NumPy dtypes internally.
+    dtype = {"single": np.float32, "double": np.float64}[args.precision]
     homog = Homogenization(
-        tuple(args.nb_grid_pts),
-        material,
-        comm=comm,
-        element=args.element,
-        preconditioner=args.preconditioner,
-        cg_tol=args.cg_tol,
-        device=args.device,
-        dtype=np.dtype(args.dtype),
+        tuple(args.nb_grid_pts), material, comm=comm, element=args.element,
+        preconditioner=args.preconditioner, cg_tol=args.cg_tol,
+        device=args.device, dtype=dtype,
     )
     if (args.target_E is None) != (args.target_nu is None):
         p.error("--target-E and --target-nu must be given together")
@@ -223,11 +191,9 @@ def main():
     )
 
     if rank0:
-        print(
-            f"muTopOpt: {dim}D  grid={tuple(args.nb_grid_pts)}  "
-            f"load cases={len(cases)}  preconditioner={args.preconditioner}  "
-            f"device={args.device}"
-        )
+        print(f"muTopOpt: {dim}D  grid={tuple(args.nb_grid_pts)}  "
+              f"load cases={len(cases)}  preconditioner={args.preconditioner}  "
+              f"device={args.device}  precision={args.precision}")
 
     # Per-iteration L-BFGS history, collected across ranks with global
     # reductions so every rank holds the same series (safe to write below).
@@ -244,12 +210,13 @@ def main():
         if rank0:
             cg_str = ""
             if cg:
-                cg_str = (
-                    f"  cg_iters=[{','.join(str(n) for n in cg)}] (total {cg_total})"
-                )
-            print(
-                f"  iter {it:4d}  f={last['objective']:.6e}  vol_frac={vf:.3f}{cg_str}"
-            )
+                # cg is [fwd1, adj1, fwd2, adj2, ...]: one (forward, adjoint)
+                # solve pair per load case. Cluster into (fwd, adj) tuples.
+                pairs = ",".join(f"({f},{a})"
+                                 for f, a in zip(cg[0::2], cg[1::2]))
+                cg_str = f"  cg_iters=[{pairs}] (total {cg_total})"
+            print(f"  iter {it:4d}  f={last['objective']:.6e}  "
+                  f"vol_frac={vf:.3f}{cg_str}")
 
     rho, info = optimize_bounded_lbfgs(
         problem, rho0, comm=mpi_comm, maxiter=args.iters, gtol=args.gtol, callback=cb
