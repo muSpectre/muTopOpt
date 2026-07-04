@@ -109,13 +109,22 @@ class Homogenization:
         cg_tol=1e-8,
         cg_maxiter=2000,
         device=None,
+        dtype=np.float64,
     ):
+        """``dtype`` (``np.float64`` default, or ``np.float32``) is the
+        precision of all grid fields and hence of the forward/adjoint solves,
+        the preconditioner FFTs and the sensitivity kernels. The outer
+        optimizer and the host-side reductions stay in double precision."""
         self.dim = len(nb_grid_pts)
         if self.dim not in (2, 3):
             raise ValueError("nb_grid_pts must be 2- or 3-dimensional")
         self.nb_grid_pts = tuple(int(n) for n in nb_grid_pts)
         self.material = material
         self.comm = comm if comm is not None else muGrid.Communicator()
+        self.dtype = np.dtype(dtype)
+        if self.dtype not in (np.dtype(np.float64), np.dtype(np.float32)):
+            raise ValueError(
+                f"dtype must be float64 or float32, got {self.dtype}")
 
         if domain_lengths is None:
             domain_lengths = [1.0] * self.dim
@@ -147,10 +156,10 @@ class Homogenization:
         self.op = OpCls(self.grid_spacing, elem)
 
         # Per-pixel material (scalar fields) and solver scratch.
-        self.lam = self.fc.real_field("to_lambda")
-        self.mu = self.fc.real_field("to_mu")
-        self._rhs = self.fc.real_field("to_rhs", (self.dim,))
-        self._Ku = self.fc.real_field("to_Ku", (self.dim,))
+        self.lam = self.fc.real_field("to_lambda", dtype=self.dtype)
+        self.mu = self.fc.real_field("to_mu", dtype=self.dtype)
+        self._rhs = self.fc.real_field("to_rhs", (self.dim,), dtype=self.dtype)
+        self._Ku = self.fc.real_field("to_Ku", (self.dim,), dtype=self.dtype)
 
         # Array module of the (possibly device-resident) fields: cupy on a GPU
         # device, numpy on host. `on_device` gates the host<->device copies at
@@ -187,10 +196,10 @@ class Homogenization:
         return self._xp.asarray(a)
 
     def scalar_field(self, name):
-        return self.fc.real_field(name)
+        return self.fc.real_field(name, dtype=self.dtype)
 
     def vector_field(self, name):
-        return self.fc.real_field(name, (self.dim,))
+        return self.fc.real_field(name, (self.dim,), dtype=self.dtype)
 
     # -- material update ----------------------------------------------------
     def set_density(self, rho):
@@ -224,6 +233,7 @@ class Homogenization:
                 self._prec = make_green_jacobi_preconditioner(
                     self.engine, self.op, self.lam, self.mu, self.dim,
                     reference_lambda=lam_ref, reference_mu=mu_ref,
+                    dtype=self.dtype,
                 )
             elif self.preconditioner_kind == "green":
 
@@ -232,7 +242,7 @@ class Homogenization:
                     self.op.apply_uniform(u, lam_ref, mu_ref, f)
 
                 self._prec = make_reference_stiffness_preconditioner(
-                    self.engine, apply_ref, self.dim
+                    self.engine, apply_ref, self.dim, dtype=self.dtype
                 )
             else:
                 raise ValueError(
