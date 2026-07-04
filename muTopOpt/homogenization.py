@@ -97,6 +97,43 @@ def _resolve_device(device, comm=None):
     return device  # assume a muGrid.Device instance
 
 
+# Process-global guard: the managed allocator, and muGrid's routing to it, must
+# be installed exactly once per process. Re-registering muGrid's allocator while
+# device fields are alive would drop the keepalive of their buffers and free
+# them out from under muGrid.
+_MANAGED_ALLOCATOR_INSTALLED = False
+
+
+def _enable_managed_device_allocator():
+    """Route muGrid's device allocations (and cupy's) through a *managed*
+    memory pool, returning ``True`` on success.
+
+    On a unified-memory accelerator the default device allocator
+    (raw ``hipMalloc``/``cudaMalloc``) is capped at the coarse-grained
+    device-local window -- on an AMD MI300A APU that is ~half the 128 GB
+    package (~62.8 GiB), even though the HBM is physically shared with the
+    host. Managed allocations (``hipMallocManaged``/``cudaMallocManaged``) draw
+    from the whole unified pool instead, so device fields can span the full
+    HBM. Routing cupy's default pool through managed memory and then pointing
+    muGrid at that pool (``use_cupy_allocator``) puts *all* device memory --
+    fields, CG scratch, the preconditioner -- on the managed path.
+
+    Installed once per process (idempotent); a no-op returning ``False`` when
+    cupy is unavailable."""
+    global _MANAGED_ALLOCATOR_INSTALLED
+    if _MANAGED_ALLOCATOR_INSTALLED:
+        return True
+    try:
+        import cupy
+    except Exception:
+        return False
+    cupy.cuda.set_allocator(
+        cupy.cuda.MemoryPool(cupy.cuda.malloc_managed).malloc)
+    muGrid.use_cupy_allocator()
+    _MANAGED_ALLOCATOR_INSTALLED = True
+    return True
+
+
 class Homogenization:
     def __init__(
         self,
@@ -110,11 +147,22 @@ class Homogenization:
         cg_maxiter=2000,
         device=None,
         dtype=np.float64,
+        managed_memory=None,
     ):
         """``dtype`` (``np.float64`` default, or ``np.float32``) is the
         precision of all grid fields and hence of the forward/adjoint solves,
         the preconditioner FFTs and the sensitivity kernels. The outer
-        optimizer and the host-side reductions stay in double precision."""
+        optimizer and the host-side reductions stay in double precision.
+
+        ``managed_memory`` controls whether GPU device memory is drawn from a
+        *managed* (unified) pool rather than the default coarse-grained
+        ``hipMalloc``/``cudaMalloc`` window. On a unified-memory APU (e.g. AMD
+        MI300A) the default window is only part of the physical HBM (~62.8 GiB
+        of 128 GB on MI300A), so managed memory is what lets large grids (e.g.
+        512^3 in double precision) use the full package. ``None`` (default)
+        enables it automatically whenever a GPU device is selected; pass
+        ``False`` (or set ``MUTOPOPT_MANAGED=0``) to force the default
+        allocator. Ignored on CPU."""
         self.dim = len(nb_grid_pts)
         if self.dim not in (2, 3):
             raise ValueError("nb_grid_pts must be 2- or 3-dimensional")
@@ -139,6 +187,16 @@ class Homogenization:
         self.domain_volume = float(np.prod(self.domain_lengths))
 
         self.device = _resolve_device(device, self.comm)
+        # On a GPU, default to the managed (unified) allocator so device fields
+        # can use the full HBM of a unified-memory APU rather than the smaller
+        # coarse-grained window (see _enable_managed_device_allocator). Must be
+        # installed before the engine allocates any device field. Opt out with
+        # managed_memory=False or MUTOPOPT_MANAGED=0.
+        if managed_memory is None:
+            managed_memory = os.environ.get("MUTOPOPT_MANAGED", "1") != "0"
+        self.managed_memory = False
+        if self.device is not None and managed_memory:
+            self.managed_memory = _enable_managed_device_allocator()
         ghosts = (1,) * self.dim
         self.engine = muGrid.FFTEngine(
             self.nb_grid_pts, self.comm,
