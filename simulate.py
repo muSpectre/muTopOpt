@@ -18,7 +18,7 @@ Examples
 --------
     python simulate.py -n 64 64            --target-K 0.1 --target-G 0.05
     python simulate.py -n 64 64            --target-E 0.2 --target-nu -0.3
-    python simulate.py -n 96 96 96 --bfgs-iters 300 --eta 0.02
+    python simulate.py -n 96 96 96 --bfgs-maxiter 300 --eta 0.02
     mpirun -np 4 python simulate.py -n 128 128 128     # (serial optimizer; see notes)
 
 The solve/sensitivity are FFT-accelerated, J-FFT-preconditioned and (with a GPU
@@ -128,7 +128,7 @@ def main():
     p.add_argument("--seed", type=int, default=0,
                    help="random seed for the --init random/filtered_random "
                         "density field")
-    p.add_argument("--bfgs-iters", type=int, default=200,
+    p.add_argument("--bfgs-maxiter", type=int, default=200,
                    help="maximum number of outer L-BFGS iterations")
     p.add_argument("--output-cg-iters", action="store_true",
                    help="print one line per inner CG iteration (residual and "
@@ -216,6 +216,23 @@ def main():
     applied_deformation_gradient = np.stack(
         [np.eye(dim) + lc.macro_strain for lc in cases]
     )
+
+    # Isotropic-equivalent effective bulk (K) and shear (G) moduli from the
+    # per-load-case homogenized stress response to the unit strains, in the same
+    # (K, G) parameterization as the target (sigma = 2 G dev(E) + K tr(E) I).
+    # Used to report the current elastic properties against the target.
+    def effective_moduli(stresses):
+        sigma_vol = sum(stresses[i] for i in range(dim))  # response to E = m*I
+        K = float(np.trace(sigma_vol)) / (dim * dim * strain_magnitude)
+        shear = []
+        for k in range(dim, len(cases)):  # shear load cases follow the diagonal
+            ij = np.unravel_index(
+                int(np.argmax(np.abs(np.triu(cases[k].macro_strain, 1)))),
+                (dim, dim))
+            shear.append(float(stresses[k][ij]) / strain_magnitude)
+        return K, float(np.mean(shear))
+
+    target_K, target_G = effective_moduli([lc.target_stress for lc in cases])
     # The interface width defaults to two grid spacings: wide enough that the
     # regularization can move interfaces (merge/remove features) instead of
     # freezing the initial topology, narrow enough for crisp designs.
@@ -291,9 +308,9 @@ def main():
         fio.write_global_attribute("domain_lengths",
                                    [float(x) for x in homog.domain_lengths])
         # Placeholders, sized to the maximum they can reach (the optimizer runs
-        # at most args.bfgs_iters iterations, hence at most that many history
+        # at most args.bfgs_maxiter iterations, hence at most that many history
         # entries and dumped frames). Real values are written after the run.
-        maxlen = int(args.bfgs_iters) + 1
+        maxlen = int(args.bfgs_maxiter) + 1
         max_frames = (maxlen // dump_every + 3) if dump_intermediate else 1
         fio.write_global_attribute("dump_every", [int(dump_every)])
         fio.write_global_attribute("converged", [0])
@@ -329,20 +346,26 @@ def main():
         if rank0:
             # Per-CG-iteration residuals are reported live during the solves
             # themselves (--output-cg-iters); here we always summarize the
-            # outer step and the total inner CG iterations it took (the same
-            # total also goes to the NetCDF history above).
+            # outer step, the current effective moduli against their targets,
+            # and the total inner CG iterations it took (the same total also
+            # goes to the NetCDF history above).
+            K, G = effective_moduli(last["stresses"])
             print(f"  bfgs-iter {it:4d}  f={last['objective']:.6e}  "
-                  f"vol_frac={vf:.3f}  cg-iters={cg_total}")
+                  f"vol_frac={vf:.3f}  K={K:.4g} (target {target_K:.4g})  "
+                  f"G={G:.4g} (target {target_G:.4g})  cg-iters={cg_total}")
 
     rho, info = optimize_bounded_lbfgs(
-        problem, rho0, comm=mpi_comm, maxiter=args.bfgs_iters, gtol=args.bfgs_gtol,
+        problem, rho0, comm=mpi_comm, maxiter=args.bfgs_maxiter, gtol=args.bfgs_gtol,
         callback=cb
     )
 
     converged = bool(info["success"])
     if rank0:
+        K, G = effective_moduli(problem.last["stresses"])
         print(
-            f"done: {info['message']}  f={info['objective']:.6e}  iters={info['nit']}"
+            f"done: {info['message']}  f={info['objective']:.6e}  "
+            f"iters={info['nit']}  K={K:.4g} (target {target_K:.4g})  "
+            f"G={G:.4g} (target {target_G:.4g})"
         )
         if not converged:
             print(

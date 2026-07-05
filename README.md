@@ -48,7 +48,7 @@ rho, info = optimize_lbfgs(problem, rho0, maxiter=200)
 ### Command line
 
 ```bash
-python simulate.py -n 64 64        --target-K 0.1  --target-G 0.05 --bfgs-iters 200
+python simulate.py -n 64 64        --target-K 0.1  --target-G 0.05 --bfgs-maxiter 200
 python simulate.py -n 96 96 96     --target-K 0.1  --target-G 0.05 --eta 2.0 --output cell.nc
 ```
 
