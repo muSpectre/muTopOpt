@@ -359,10 +359,10 @@ class Homogenization:
                 print(f"    cg {tag}skipped (negligible rhs, x=0)", flush=True)
             return x
         # Count CG iterations via the solver callback (fires once per
-        # iteration). When verbose, the same callback prints a live,
-        # carriage-return-updated residual so convergence can be watched as CG
-        # runs, not just tallied afterwards. ``rr`` is the globally reduced
-        # squared residual ||r||^2; CG converges at ||r|| <= rtol*||b||.
+        # iteration). When verbose, the same callback prints one line per CG
+        # iteration so the convergence of the inner solve can be watched step
+        # by step. ``rr`` is the globally reduced squared residual ||r||^2; CG
+        # converges at ||r|| <= rtol*||b||.
         counter = {"n": 0}
         rtol_eff = self.cg_tol if rtol is None else rtol
 
@@ -371,9 +371,8 @@ class Homogenization:
             if verbose:
                 res = np.sqrt(float(state["rr"]))
                 rel = res / b_norm if b_norm > 0 else 0.0
-                print(f"\r    cg {tag}iter {iteration:4d}  |r|={res:.3e}  "
-                      f"|r|/|b|={rel:.2e}  (rtol={rtol_eff:.1e})",
-                      end="", flush=True)
+                print(f"    cg {tag}iter {iteration:4d}  |r|={res:.3e}  "
+                      f"|r|/|b|={rel:.2e}  (rtol={rtol_eff:.1e})", flush=True)
 
         cg_kwargs = {}
         if residual is not None and _CG_HAS_RESIDUAL:
@@ -386,9 +385,6 @@ class Homogenization:
             callback=_count,
             **cg_kwargs,
         )
-        if verbose:
-            # Terminate the carriage-return-updated line.
-            print(flush=True)
         if residual is not None and not _CG_HAS_RESIDUAL:
             # Released muGrid without the residual out-field: recover
             # r = b - K x with one extra operator apply.
