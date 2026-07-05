@@ -85,7 +85,8 @@ def main():
         "--target-nu",
         type=float,
         default=None,
-        help="target Poisson's ratio (alternative to --K/--G; requires --target-E)",
+        help="target Poisson's ratio (alternative to --target-K/--target-G; "
+        "requires --target-E)",
     )
     p.add_argument(
         "--eta",
@@ -106,6 +107,9 @@ def main():
         "--init",
         choices=["uniform", "random", "filtered_random"],
         default="filtered_random",
+        help="initial density field: 'uniform' (constant), 'random' "
+        "(white noise) or 'filtered_random' (noise smoothed to a correlation "
+        "length; least prone to locking the initial topology)",
     )
     p.add_argument(
         "--init-length",
@@ -113,12 +117,15 @@ def main():
         default=None,
         help="correlation length for --init filtered_random (default: 3*eta)",
     )
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=0,
+                   help="random seed for the --init random/filtered_random "
+                        "density field")
     p.add_argument("--bfgs-iters", type=int, default=200,
                    help="maximum number of outer L-BFGS iterations")
     p.add_argument("--output-cg-iters", action="store_true",
-                   help="print the inner CG iteration counts per outer "
-                        "iteration (one (forward, adjoint) pair per load case)")
+                   help="print one line per inner CG iteration (residual and "
+                        "relative residual) for every forward/adjoint solve, "
+                        "so the CG convergence can be watched live")
     p.add_argument("--bfgs-gtol", type=float, default=1e-5,
                    help="L-BFGS convergence tolerance on the projected gradient")
     p.add_argument("--cg-tol", type=float, default=1e-4,
@@ -126,8 +133,14 @@ def main():
                     "because the objective is adjoint-corrected "
                     "(Lagrangian) and thus second-order accurate in the "
                     "solve error")
+    p.add_argument("--cg-maxiter", type=int, default=2000,
+                   help="maximum number of inner CG iterations per solve "
+                        "(the solve stops here even if --cg-tol is not met)")
     p.add_argument("--preconditioner", choices=["green-jacobi", "green"],
-                   default="green-jacobi")
+                   default="green-jacobi",
+                   help="inner-solve preconditioner: 'green-jacobi' (J-FFT, "
+                        "reference stiffness times a per-pixel Jacobi scaling) "
+                        "or 'green' (plain reference-stiffness Green operator)")
     p.add_argument("--element", choices=["p1", "q1"], default="q1",
                    help="finite element (P1 simplices or Q1 hex/quad)")
     p.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
@@ -167,7 +180,8 @@ def main():
     homog = Homogenization(
         tuple(args.nb_grid_pts), material, comm=comm, element=args.element,
         preconditioner=args.preconditioner, cg_tol=args.cg_tol,
-        cg_verbose=args.output_cg_iters, device=args.device, dtype=dtype,
+        cg_maxiter=args.cg_maxiter, cg_verbose=args.output_cg_iters,
+        device=args.device, dtype=dtype,
     )
     if (args.target_E is None) != (args.target_nu is None):
         p.error("--target-E and --target-nu must be given together")
