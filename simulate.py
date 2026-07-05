@@ -63,6 +63,14 @@ def main():
         help="grid points per axis (2 or 3 values)",
     )
     p.add_argument(
+        "--domain-lengths",
+        type=float,
+        nargs="+",
+        default=None,
+        help="physical edge length of the unit cell per axis (2 or 3 values, "
+        "matching -n); default: unit length on every axis",
+    )
+    p.add_argument(
         "--solid-E", type=float, default=1.0, help="solid Young's modulus"
     )
     p.add_argument(
@@ -158,11 +166,20 @@ def main():
                    "'element' (per-pixel density, FD Laplacian penalty)")
     p.add_argument("--output", type=str, default=None,
                    help="NetCDF file to write the optimized density to")
+    p.add_argument("--dump-every", type=int, default=-1,
+                   help="dump intermediate L-BFGS iterates to the NetCDF output "
+                        "as successive frames: with N>0 the initial "
+                        "configuration and every N-th iterate (N, 2N, ...) are "
+                        "written, and the final iterate is always included; -1 "
+                        "(default) writes only the final density as a single "
+                        "frame")
     args = p.parse_args()
 
     dim = len(args.nb_grid_pts)
     if dim not in (2, 3):
         p.error("-n takes 2 or 3 values")
+    if args.domain_lengths is not None and len(args.domain_lengths) != dim:
+        p.error(f"--domain-lengths must have {dim} values (one per axis)")
 
     if muGrid.has_mpi:
         from mpi4py import MPI
@@ -179,6 +196,7 @@ def main():
     dtype = {"single": np.float32, "double": np.float64}[args.precision]
     homog = Homogenization(
         tuple(args.nb_grid_pts), material, comm=comm, element=args.element,
+        domain_lengths=args.domain_lengths,
         preconditioner=args.preconditioner, cg_tol=args.cg_tol,
         cg_maxiter=args.cg_maxiter, cg_verbose=args.output_cg_iters,
         device=args.device, dtype=dtype,
@@ -189,7 +207,15 @@ def main():
         target = isotropic_stiffness_from_E_nu(dim, args.target_E, args.target_nu)
     else:
         target = isotropic_stiffness_tensor(dim, args.target_K, args.target_G)
-    cases = target_load_cases(dim, target, magnitude=0.01)
+    strain_magnitude = 0.01
+    cases = target_load_cases(dim, target, magnitude=strain_magnitude)
+    # Applied deformation gradient of each load case, F = I + macro_strain (the
+    # macro strain is the applied displacement gradient). Written per frame so a
+    # deformation-path simulation could vary it; for topology optimization it is
+    # constant across frames.
+    applied_deformation_gradient = np.stack(
+        [np.eye(dim) + lc.macro_strain for lc in cases]
+    )
     # The interface width defaults to two grid spacings: wide enough that the
     # regularization can move interfaces (merge/remove features) instead of
     # freezing the initial topology, narrow enough for crisp designs.
@@ -224,6 +250,73 @@ def main():
     n_global = comm.sum(float(rho0.size))
     hist = {"objective": [], "volume_fraction": [], "cg_iters": []}
 
+    # `--dump-every N` (N>0) streams the initial density (iteration 0) and every
+    # N-th iterate to the output file as successive frames; the final iterate is
+    # always added. Frames are written *directly* as they are produced (never
+    # buffered in memory, which would overflow for large 3D grids), so the
+    # NetCDF file is opened before the optimizer runs. muGrid freezes the header
+    # on the first frame, so all global attributes must be declared now; the
+    # ones only known at the end (final state, per-iteration histories,
+    # frame_iterations) are declared at their maximum size with placeholders and
+    # overwritten in place afterwards -- update_global_attribute() may shrink an
+    # attribute but never grow it.
+    dump_every = args.dump_every
+    dump_intermediate = args.output is not None and dump_every is not None \
+        and dump_every > 0
+    fio = None
+    field = None
+    fdg_view = None   # numpy view of the per-frame applied-deformation-gradient
+    frame_fields = ["density"]  # fields/variables written on every frame
+    frame_iters = []  # L-BFGS iteration index of each frame actually written
+    _MSG_LEN = 256    # fixed reservation for the optimizer message string
+    if args.output is not None:
+        field = homog.scalar_field("density")
+        fio = muGrid.FileIONetCDF(
+            args.output, muGrid.FileIONetCDF.OpenMode.Overwrite, comm
+        )
+        # Only the density is written; the solver scratch fields (`to_prob_*`)
+        # in the same collection are deliberately excluded.
+        fio.register_field_collection(homog.fc, field_names=["density"])
+        # The applied deformation gradient is a per-frame, grid-less quantity
+        # (one tensor per load case for the whole cell), so it is stored as a
+        # frame variable rather than a field. It is constant here, so its buffer
+        # is filled once and written on every frame.
+        fdg_view = fio.register_frame_variable(
+            "applied_deformation_gradient",
+            list(applied_deformation_gradient.shape), np.float64,
+        )
+        fdg_view[...] = applied_deformation_gradient
+        frame_fields.append("applied_deformation_gradient")
+        # Physical cell size (per-file constant): a global attribute is correct.
+        fio.write_global_attribute("domain_lengths",
+                                   [float(x) for x in homog.domain_lengths])
+        # Placeholders, sized to the maximum they can reach (the optimizer runs
+        # at most args.bfgs_iters iterations, hence at most that many history
+        # entries and dumped frames). Real values are written after the run.
+        maxlen = int(args.bfgs_iters) + 1
+        max_frames = (maxlen // dump_every + 3) if dump_intermediate else 1
+        fio.write_global_attribute("dump_every", [int(dump_every)])
+        fio.write_global_attribute("converged", [0])
+        fio.write_global_attribute("optimizer_message", " " * _MSG_LEN)
+        fio.write_global_attribute("nb_iterations", [0])
+        fio.write_global_attribute("final_objective", [0.0])
+        fio.write_global_attribute("final_max_gradient", [0.0])
+        fio.write_global_attribute("lbfgs_objective_history", [0.0] * maxlen)
+        fio.write_global_attribute("lbfgs_volume_fraction_history", [0.0] * maxlen)
+        fio.write_global_attribute("lbfgs_cg_iters_history", [0] * maxlen)
+        fio.write_global_attribute("frame_iterations", [-1] * max_frames)
+
+    def write_frame(it, rho):
+        """Stream one density iterate (and the applied deformation gradient) to
+        the output as a new frame."""
+        field.p[...] = homog.to_device(rho)
+        fio.append_frame().write(frame_fields)
+        frame_iters.append(int(it))
+
+    # Initial configuration as frame 0 (only when dumping intermediate steps).
+    if dump_intermediate:
+        write_frame(0, rho0)
+
     def cb(it, rho, last):
         vf = comm.sum(float(np.sum(rho))) / n_global
         cg = last.get("cg_iters", [])
@@ -231,6 +324,8 @@ def main():
         hist["objective"].append(float(last["objective"]))
         hist["volume_fraction"].append(vf)
         hist["cg_iters"].append(cg_total)
+        if dump_intermediate and it % dump_every == 0:
+            write_frame(it, rho)
         if rank0:
             # Per-CG-iteration residuals are reported live during the solves
             # themselves (--output-cg-iters); here we always summarize the
@@ -257,36 +352,44 @@ def main():
             )
 
     if args.output is not None:
-        field = homog.scalar_field("density")
-        field.p[...] = homog.to_device(rho)
-        fio = muGrid.FileIONetCDF(
-            args.output, muGrid.FileIONetCDF.OpenMode.Overwrite, comm
-        )
-        fio.register_field_collection(homog.fc)
-        # Global attributes (incl. the L-BFGS history, one value per outer
-        # iteration, for later plotting). These MUST be written before any
-        # field data -- muGrid forbids growing the header once a frame has
-        # been written. All quantities are globally consistent across ranks
-        # (NuMPI's l_bfgs_bounded returns the same result on every rank), so
-        # writing them from all ranks is safe.
-        # Convergence status: `converged` is the machine-readable flag (1 =
-        # the optimizer met its tolerances, 0 = it stopped early, e.g. at
-        # maxiter); the remaining attributes give the reason and the final
-        # optimizer state.
-        fio.write_global_attribute("converged", [int(converged)])
-        fio.write_global_attribute("optimizer_message", str(info["message"]))
-        fio.write_global_attribute("nb_iterations", [int(info["nit"])])
-        fio.write_global_attribute("final_objective", [float(info["objective"])])
-        fio.write_global_attribute("final_max_gradient", [float(info["max_grad"])])
+        # Always include the final iterate as the last frame (unless it was
+        # already the most recent one dumped, i.e. its iteration is a multiple
+        # of --dump-every).
+        final_it = int(info["nit"])
+        if not frame_iters or frame_iters[-1] != final_it:
+            write_frame(final_it, rho)
+
+        # Overwrite the placeholders declared before the frames with the real
+        # values now that the run has finished. Every value is globally
+        # consistent across ranks (NuMPI's l_bfgs_bounded returns the same
+        # result on every rank), so updating from all ranks is safe. Each update
+        # is same-or-smaller than its placeholder, which muGrid permits (the
+        # frozen header cannot grow).
+        #
+        # `converged` is the machine-readable flag (1 = the optimizer met its
+        # tolerances, 0 = it stopped early, e.g. at maxiter); the remaining
+        # attributes give the reason, the final optimizer state, and the
+        # per-iteration L-BFGS histories (one value per outer iteration, for
+        # later plotting). `frame_iterations` records the L-BFGS iteration each
+        # frame holds (0 = initial configuration), so a reader can map frames to
+        # iterates.
+        def upd(name, value):
+            fio.update_global_attribute(name, name, value)
+
+        upd("converged", [int(converged)])
+        upd("optimizer_message", str(info["message"])[:_MSG_LEN])
+        upd("nb_iterations", [int(info["nit"])])
+        upd("final_objective", [float(info["objective"])])
+        upd("final_max_gradient", [float(info["max_grad"])])
         if hist["objective"]:
-            fio.write_global_attribute("lbfgs_objective_history", hist["objective"])
-            fio.write_global_attribute(
-                "lbfgs_volume_fraction_history", hist["volume_fraction"]
-            )
-            fio.write_global_attribute("lbfgs_cg_iters_history", hist["cg_iters"])
-        fio.append_frame().write(["density"])
+            upd("lbfgs_objective_history", hist["objective"])
+            upd("lbfgs_volume_fraction_history", hist["volume_fraction"])
+            upd("lbfgs_cg_iters_history", hist["cg_iters"])
+        upd("frame_iterations", frame_iters)
+        fio.close()
         if rank0:
-            print(f"wrote {args.output} (converged={int(converged)})")
+            print(f"wrote {args.output} ({len(frame_iters)} frame(s), "
+                  f"converged={int(converged)})")
 
 
 if __name__ == "__main__":
