@@ -232,11 +232,12 @@ def main():
         hist["volume_fraction"].append(vf)
         hist["cg_iters"].append(cg_total)
         if rank0:
-            # Per-iteration inner CG counts are reported live during the solves
-            # themselves (--output-cg-iters); the running total goes to the
-            # NetCDF history above. Here we only summarize the outer step.
-            print(f"  iter {it:4d}  f={last['objective']:.6e}  "
-                  f"vol_frac={vf:.3f}")
+            # Per-CG-iteration residuals are reported live during the solves
+            # themselves (--output-cg-iters); here we always summarize the
+            # outer step and the total inner CG iterations it took (the same
+            # total also goes to the NetCDF history above).
+            print(f"  bfgs-iter {it:4d}  f={last['objective']:.6e}  "
+                  f"vol_frac={vf:.3f}  cg-iters={cg_total}")
 
     rho, info = optimize_bounded_lbfgs(
         problem, rho0, comm=mpi_comm, maxiter=args.bfgs_iters, gtol=args.bfgs_gtol,

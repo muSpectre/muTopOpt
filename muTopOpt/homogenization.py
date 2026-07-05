@@ -348,7 +348,7 @@ class Homogenization:
         scale = rhs_scale if rhs_scale is not None else getattr(
             self, "_mat_scale", 1.0)
         verbose = self.cg_verbose and self.comm.rank == 0
-        tag = f"{label} " if label else ""
+        tag = f"{label}  " if label else ""
         if b_norm <= 1e-9 * scale:
             # Exact solution x = 0; no CG iterations performed. The residual
             # of x = 0 is b itself (round-off-level by construction).
@@ -356,7 +356,8 @@ class Homogenization:
                 residual.s[...] = b.s
             self.last_cg_iters = 0
             if verbose:
-                print(f"    cg {tag}skipped (negligible rhs, x=0)", flush=True)
+                print(f"    cg-iter    0  {tag}skipped (negligible rhs, x=0)",
+                      flush=True)
             return x
         # Count CG iterations via the solver callback (fires once per
         # iteration). When verbose, the same callback prints one line per CG
@@ -371,7 +372,7 @@ class Homogenization:
             if verbose:
                 res = np.sqrt(float(state["rr"]))
                 rel = res / b_norm if b_norm > 0 else 0.0
-                print(f"    cg {tag}iter {iteration:4d}  |r|={res:.3e}  "
+                print(f"    cg-iter {iteration:4d}  {tag}|r|={res:.3e}  "
                       f"|r|/|b|={rel:.2e}  (rtol={rtol_eff:.1e})", flush=True)
 
         cg_kwargs = {}
