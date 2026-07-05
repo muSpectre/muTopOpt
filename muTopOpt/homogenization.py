@@ -145,6 +145,7 @@ class Homogenization:
         preconditioner="green-jacobi",
         cg_tol=1e-8,
         cg_maxiter=2000,
+        cg_verbose=False,
         device=None,
         dtype=np.float64,
         managed_memory=None,
@@ -237,6 +238,10 @@ class Homogenization:
         self.preconditioner_kind = preconditioner
         self.cg_tol = cg_tol
         self.cg_maxiter = cg_maxiter
+        # When True, print a live per-CG-iteration residual on rank 0 during
+        # every solve, so convergence can be watched as it happens (opt-in;
+        # verbose over a full optimization). See ``solve_rhs``.
+        self.cg_verbose = cg_verbose
         self._prec = None
         self._nb_pixels = tuple(self.engine.nb_subdomain_grid_pts)
 
@@ -322,7 +327,7 @@ class Homogenization:
         self.op.apply(u, self.lam, self.mu, Au)
 
     def solve_rhs(self, b, x, rtol=None, maxiter=None, rhs_scale=None,
-                  residual=None):
+                  residual=None, label=None):
         """Solve ``K x = b`` in place; returns ``x``.
 
         A negligible right-hand side (e.g. a spatially uniform material, whose
@@ -333,24 +338,42 @@ class Homogenization:
         used.
 
         If ``residual`` is a field, the final CG residual ``r = b - K x`` is
-        copied into it (used for the adjoint-corrected objective)."""
+        copied into it (used for the adjoint-corrected objective).
+
+        ``label`` tags this solve in the live convergence trace emitted when
+        ``self.cg_verbose`` is set (e.g. ``"case 1 fwd"``)."""
         x.set_zero()
         bp = b.p.ravel()
         b_norm = np.sqrt(self.comm.sum(float(self._xp.dot(bp, bp))))
         scale = rhs_scale if rhs_scale is not None else getattr(
             self, "_mat_scale", 1.0)
+        verbose = self.cg_verbose and self.comm.rank == 0
+        tag = f"{label} " if label else ""
         if b_norm <= 1e-9 * scale:
             # Exact solution x = 0; no CG iterations performed. The residual
             # of x = 0 is b itself (round-off-level by construction).
             if residual is not None:
                 residual.s[...] = b.s
             self.last_cg_iters = 0
+            if verbose:
+                print(f"    cg {tag}skipped (negligible rhs, x=0)", flush=True)
             return x
-        # Count CG iterations via the solver callback (fires once per iteration).
+        # Count CG iterations via the solver callback (fires once per
+        # iteration). When verbose, the same callback prints a live,
+        # carriage-return-updated residual so convergence can be watched as CG
+        # runs, not just tallied afterwards. ``rr`` is the globally reduced
+        # squared residual ||r||^2; CG converges at ||r|| <= rtol*||b||.
         counter = {"n": 0}
+        rtol_eff = self.cg_tol if rtol is None else rtol
 
         def _count(iteration, state):
             counter["n"] += 1
+            if verbose:
+                res = np.sqrt(float(state["rr"]))
+                rel = res / b_norm if b_norm > 0 else 0.0
+                print(f"\r    cg {tag}iter {iteration:4d}  |r|={res:.3e}  "
+                      f"|r|/|b|={rel:.2e}  (rtol={rtol_eff:.1e})",
+                      end="", flush=True)
 
         cg_kwargs = {}
         if residual is not None and _CG_HAS_RESIDUAL:
@@ -358,11 +381,14 @@ class Homogenization:
         conjugate_gradients(
             self.comm, self.fc, b, x,
             hessp=self._hessp, prec=self._prec,
-            rtol=self.cg_tol if rtol is None else rtol,
+            rtol=rtol_eff,
             maxiter=self.cg_maxiter if maxiter is None else maxiter,
             callback=_count,
             **cg_kwargs,
         )
+        if verbose:
+            # Terminate the carriage-return-updated line.
+            print(flush=True)
         if residual is not None and not _CG_HAS_RESIDUAL:
             # Released muGrid without the residual out-field: recover
             # r = b - K x with one extra operator apply.
@@ -371,7 +397,8 @@ class Homogenization:
         self.last_cg_iters = counter["n"]
         return x
 
-    def solve_macro(self, E_macro, x, rtol=None, maxiter=None, residual=None):
+    def solve_macro(self, E_macro, x, rtol=None, maxiter=None, residual=None,
+                    label=None):
         """Solve the periodic homogenization problem ``K u = -Bᵀ C:Ē`` for the
         fluctuation displacement ``u`` under macro strain ``Ē``."""
         E_arr = np.asarray(E_macro, dtype=float)
@@ -382,7 +409,7 @@ class Homogenization:
             float(np.abs(E_arr).max()), 1e-300)
         return self.solve_rhs(
             self._rhs, x, rtol=rtol, maxiter=maxiter, rhs_scale=scale,
-            residual=residual)
+            residual=residual, label=label)
 
     @property
     def mat_scale(self):

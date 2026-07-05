@@ -112,12 +112,13 @@ class StressTargetProblem:
         stresses = []
         corrections = []  # adjoint-weighted forward residuals (one per case)
         cg_iters = []  # CG iteration count of each (forward, adjoint) solve
-        for lc in self.load_cases:
+        for i, lc in enumerate(self.load_cases):
             norm = float(np.sum(lc.target_stress**2))
             # Forward equilibrium.
             u = h.solve_macro(
                 lc.macro_strain, self._u,
-                residual=self._res_u if self.consistent_objective else None)
+                residual=self._res_u if self.consistent_objective else None,
+                label=f"case {i + 1} fwd")
             cg_iters.append(h.last_cg_iters)
             sigma = h.homogenized_stress(u, lc.macro_strain)
             stresses.append(sigma)
@@ -128,7 +129,8 @@ class StressTargetProblem:
             S = 2.0 * lc.weight * diff / norm
             h.macro_rhs_tensor(S, self._adj_rhs, scale=-1.0 / V)
             adj_scale = h.mat_scale * max(float(np.abs(S / V).max()), 1e-300)
-            adj = h.solve_rhs(self._adj_rhs, self._adj, rhs_scale=adj_scale)
+            adj = h.solve_rhs(self._adj_rhs, self._adj, rhs_scale=adj_scale,
+                              label=f"case {i + 1} adj")
             cg_iters.append(h.last_cg_iters)
 
             if self.consistent_objective:
