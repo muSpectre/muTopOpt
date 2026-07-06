@@ -70,12 +70,8 @@ def main():
         help="physical edge length of the unit cell per axis (2 or 3 values, "
         "matching -n); default: unit length on every axis",
     )
-    p.add_argument(
-        "--solid-E", type=float, default=1.0, help="solid Young's modulus"
-    )
-    p.add_argument(
-        "--solid-nu", type=float, default=0.3, help="solid Poisson's ratio"
-    )
+    p.add_argument("--solid-E", type=float, default=1.0, help="solid Young's modulus")
+    p.add_argument("--solid-nu", type=float, default=0.3, help="solid Poisson's ratio")
     p.add_argument("--penalty", type=float, default=2.0, help="SIMP exponent p")
     p.add_argument(
         "--void-ratio", type=float, default=0.0, help="void/solid stiffness ratio"
@@ -109,8 +105,12 @@ def main():
         default=1.0,
         help="overall strength of the phase-field regularization",
     )
-    p.add_argument("--init-volume-fraction", type=float, default=0.5,
-                   help="volume fraction of the initial density field")
+    p.add_argument(
+        "--init-volume-fraction",
+        type=float,
+        default=0.5,
+        help="volume fraction of the initial density field",
+    )
     p.add_argument(
         "--init",
         choices=["uniform", "random", "filtered_random"],
@@ -125,54 +125,103 @@ def main():
         default=None,
         help="correlation length for --init filtered_random (default: 3*eta)",
     )
-    p.add_argument("--seed", type=int, default=0,
-                   help="random seed for the --init random/filtered_random "
-                        "density field")
-    p.add_argument("--bfgs-maxiter", type=int, default=200,
-                   help="maximum number of outer L-BFGS iterations")
-    p.add_argument("--output-cg-iters", action="store_true",
-                   help="print one line per inner CG iteration (residual and "
-                        "relative residual) for every forward/adjoint solve, "
-                        "so the CG convergence can be watched live")
-    p.add_argument("--bfgs-gtol", type=float, default=1e-5,
-                   help="L-BFGS convergence tolerance on the projected gradient")
-    p.add_argument("--cg-tol", type=float, default=1e-4,
-               help="inner CG relative tolerance; loose values are safe "
-                    "because the objective is adjoint-corrected "
-                    "(Lagrangian) and thus second-order accurate in the "
-                    "solve error")
-    p.add_argument("--cg-maxiter", type=int, default=2000,
-                   help="maximum number of inner CG iterations per solve "
-                        "(the solve stops here even if --cg-tol is not met)")
-    p.add_argument("--preconditioner", choices=["green-jacobi", "green"],
-                   default="green-jacobi",
-                   help="inner-solve preconditioner: 'green-jacobi' (J-FFT, "
-                        "reference stiffness times a per-pixel Jacobi scaling) "
-                        "or 'green' (plain reference-stiffness Green operator)")
-    p.add_argument("--element", choices=["p1", "q1"], default="q1",
-                   help="finite element (P1 simplices or Q1 hex/quad)")
-    p.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
-                   help="run the forward/adjoint solves and sensitivity on the "
-                   "host (cpu) or on the accelerator (gpu); the L-BFGS "
-                   "optimizer always runs on the host")
-    p.add_argument("--precision", choices=["single", "double"], default="double",
-                   help="scalar precision of the on-grid fields and the "
-                   "FFT-accelerated solves (the FFT engine dispatches on the "
-                   "field dtype); the host L-BFGS optimizer stays double")
-    p.add_argument("--density", choices=["element", "nodal"], default="nodal",
-                   help="density discretization: 'nodal' (nodal FE field, "
-                   "SIMP on the element average of the interpolant, fully "
-                   "consistent Galerkin phase-field regularization) or "
-                   "'element' (per-pixel density, FD Laplacian penalty)")
-    p.add_argument("--output", type=str, default=None,
-                   help="NetCDF file to write the optimized density to")
-    p.add_argument("--dump-every", type=int, default=-1,
-                   help="dump intermediate L-BFGS iterates to the NetCDF output "
-                        "as successive frames: with N>0 the initial "
-                        "configuration and every N-th iterate (N, 2N, ...) are "
-                        "written, and the final iterate is always included; -1 "
-                        "(default) writes only the final density as a single "
-                        "frame")
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="random seed for the --init random/filtered_random density field",
+    )
+    p.add_argument(
+        "--bfgs-maxiter",
+        type=int,
+        default=200,
+        help="maximum number of outer L-BFGS iterations",
+    )
+    p.add_argument(
+        "--output-cg-iters",
+        action="store_true",
+        help="print one line per inner CG iteration (residual and "
+        "relative residual) for every forward/adjoint solve, "
+        "so the CG convergence can be watched live",
+    )
+    p.add_argument(
+        "--bfgs-gtol",
+        type=float,
+        default=1e-5,
+        help="L-BFGS convergence tolerance on the projected gradient",
+    )
+    p.add_argument(
+        "--cg-tol",
+        type=float,
+        default=1e-4,
+        help="inner CG relative tolerance; loose values are safe "
+        "because the objective is adjoint-corrected "
+        "(Lagrangian) and thus second-order accurate in the "
+        "solve error",
+    )
+    p.add_argument(
+        "--cg-maxiter",
+        type=int,
+        default=2000,
+        help="maximum number of inner CG iterations per solve "
+        "(the solve stops here even if --cg-tol is not met)",
+    )
+    p.add_argument(
+        "--preconditioner",
+        choices=["green-jacobi", "green"],
+        default="green-jacobi",
+        help="inner-solve preconditioner: 'green-jacobi' (J-FFT, "
+        "reference stiffness times a per-pixel Jacobi scaling) "
+        "or 'green' (plain reference-stiffness Green operator)",
+    )
+    p.add_argument(
+        "--element",
+        choices=["p1", "q1"],
+        default="q1",
+        help="finite element (P1 simplices or Q1 hex/quad)",
+    )
+    p.add_argument(
+        "--device",
+        choices=["cpu", "gpu"],
+        default="cpu",
+        help="run the forward/adjoint solves and sensitivity on the "
+        "host (cpu) or on the accelerator (gpu); the L-BFGS "
+        "optimizer always runs on the host",
+    )
+    p.add_argument(
+        "--precision",
+        choices=["single", "double"],
+        default="double",
+        help="scalar precision of the on-grid fields and the "
+        "FFT-accelerated solves (the FFT engine dispatches on the "
+        "field dtype); the host L-BFGS optimizer stays double",
+    )
+    p.add_argument(
+        "--density",
+        choices=["element", "nodal"],
+        default="nodal",
+        help="density discretization: 'nodal' (nodal FE field, "
+        "SIMP on the element average of the interpolant, fully "
+        "consistent Galerkin phase-field regularization) or "
+        "'element' (per-pixel density, FD Laplacian penalty)",
+    )
+    p.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="NetCDF file to write the optimized density to",
+    )
+    p.add_argument(
+        "--dump-every",
+        type=int,
+        default=-1,
+        help="dump intermediate L-BFGS iterates to the NetCDF output "
+        "as successive frames: with N>0 the initial "
+        "configuration and every N-th iterate (N, 2N, ...) are "
+        "written, and the final iterate is always included; -1 "
+        "(default) writes only the final density as a single "
+        "frame",
+    )
     args = p.parse_args()
 
     dim = len(args.nb_grid_pts)
@@ -195,11 +244,17 @@ def main():
     # CLI exposes "single"/"double"; muTopOpt works in NumPy dtypes internally.
     dtype = {"single": np.float32, "double": np.float64}[args.precision]
     homog = Homogenization(
-        tuple(args.nb_grid_pts), material, comm=comm, element=args.element,
+        tuple(args.nb_grid_pts),
+        material,
+        comm=comm,
+        element=args.element,
         domain_lengths=args.domain_lengths,
-        preconditioner=args.preconditioner, cg_tol=args.cg_tol,
-        cg_maxiter=args.cg_maxiter, cg_verbose=args.output_cg_iters,
-        device=args.device, dtype=dtype,
+        preconditioner=args.preconditioner,
+        cg_tol=args.cg_tol,
+        cg_maxiter=args.cg_maxiter,
+        cg_verbose=args.output_cg_iters,
+        device=args.device,
+        dtype=dtype,
     )
     if (args.target_E is None) != (args.target_nu is None):
         p.error("--target-E and --target-nu must be given together")
@@ -227,8 +282,8 @@ def main():
         shear = []
         for k in range(dim, len(cases)):  # shear load cases follow the diagonal
             ij = np.unravel_index(
-                int(np.argmax(np.abs(np.triu(cases[k].macro_strain, 1)))),
-                (dim, dim))
+                int(np.argmax(np.abs(np.triu(cases[k].macro_strain, 1)))), (dim, dim)
+            )
             shear.append(float(stresses[k][ij]) / strain_magnitude)
         return K, float(np.mean(shear))
 
@@ -257,10 +312,13 @@ def main():
         grid_spacing=homog.grid_spacing,
     )
 
+    print(muGrid.version_string(communicator=homog.comm, device=homog.device))
     if rank0:
-        print(f"muTopOpt: {dim}D  grid={tuple(args.nb_grid_pts)}  "
-              f"load cases={len(cases)}  preconditioner={args.preconditioner}  "
-              f"device={args.device}  precision={args.precision}")
+        print(
+            f"muTopOpt: {dim}D  grid={tuple(args.nb_grid_pts)}  "
+            f"load cases={len(cases)}  preconditioner={args.preconditioner}  "
+            f"device={args.device}  precision={args.precision}"
+        )
 
     # Per-iteration L-BFGS history, collected across ranks with global
     # reductions so every rank holds the same series (safe to write below).
@@ -278,14 +336,15 @@ def main():
     # overwritten in place afterwards -- update_global_attribute() may shrink an
     # attribute but never grow it.
     dump_every = args.dump_every
-    dump_intermediate = args.output is not None and dump_every is not None \
-        and dump_every > 0
+    dump_intermediate = (
+        args.output is not None and dump_every is not None and dump_every > 0
+    )
     fio = None
     field = None
-    fdg_view = None   # numpy view of the per-frame applied-deformation-gradient
+    fdg_view = None  # numpy view of the per-frame applied-deformation-gradient
     frame_fields = ["density"]  # fields/variables written on every frame
     frame_iters = []  # L-BFGS iteration index of each frame actually written
-    _MSG_LEN = 256    # fixed reservation for the optimizer message string
+    _MSG_LEN = 256  # fixed reservation for the optimizer message string
     if args.output is not None:
         field = homog.scalar_field("density")
         fio = muGrid.FileIONetCDF(
@@ -300,13 +359,15 @@ def main():
         # is filled once and written on every frame.
         fdg_view = fio.register_frame_variable(
             "applied_deformation_gradient",
-            list(applied_deformation_gradient.shape), np.float64,
+            list(applied_deformation_gradient.shape),
+            np.float64,
         )
         fdg_view[...] = applied_deformation_gradient
         frame_fields.append("applied_deformation_gradient")
         # Physical cell size (per-file constant): a global attribute is correct.
-        fio.write_global_attribute("domain_lengths",
-                                   [float(x) for x in homog.domain_lengths])
+        fio.write_global_attribute(
+            "domain_lengths", [float(x) for x in homog.domain_lengths]
+        )
         # Placeholders, sized to the maximum they can reach (the optimizer runs
         # at most args.bfgs_maxiter iterations, hence at most that many history
         # entries and dumped frames). Real values are written after the run.
@@ -350,13 +411,19 @@ def main():
             # and the total inner CG iterations it took (the same total also
             # goes to the NetCDF history above).
             K, G = effective_moduli(last["stresses"])
-            print(f"  bfgs-iter {it:4d}  f={last['objective']:.6e}  "
-                  f"vol_frac={vf:.3f}  K={K:.4g} (target {target_K:.4g})  "
-                  f"G={G:.4g} (target {target_G:.4g})  cg-iters={cg_total}")
+            print(
+                f"  bfgs-iter {it:4d}  f={last['objective']:.6e}  "
+                f"vol_frac={vf:.3f}  K={K:.4g} (target {target_K:.4g})  "
+                f"G={G:.4g} (target {target_G:.4g})  cg-iters={cg_total}"
+            )
 
     rho, info = optimize_bounded_lbfgs(
-        problem, rho0, comm=mpi_comm, maxiter=args.bfgs_maxiter, gtol=args.bfgs_gtol,
-        callback=cb
+        problem,
+        rho0,
+        comm=mpi_comm,
+        maxiter=args.bfgs_maxiter,
+        gtol=args.bfgs_gtol,
+        callback=cb,
     )
 
     converged = bool(info["success"])
@@ -411,8 +478,10 @@ def main():
         upd("frame_iterations", frame_iters)
         fio.close()
         if rank0:
-            print(f"wrote {args.output} ({len(frame_iters)} frame(s), "
-                  f"converged={int(converged)})")
+            print(
+                f"wrote {args.output} ({len(frame_iters)} frame(s), "
+                f"converged={int(converged)})"
+            )
 
 
 if __name__ == "__main__":
