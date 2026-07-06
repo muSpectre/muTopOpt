@@ -291,7 +291,7 @@ def main():
     # The interface width defaults to two grid spacings: wide enough that the
     # regularization can move interfaces (merge/remove features) instead of
     # freezing the initial topology, narrow enough for crisp designs.
-    eta = 2.0 * min(homog.grid_spacing) if args.eta is None else args.eta
+    eta = max(homog.grid_spacing) if args.eta is None else args.eta
     Reg = (
         NodalPhaseFieldRegularization
         if args.density == "nodal"
