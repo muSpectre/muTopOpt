@@ -26,26 +26,39 @@ import numpy as np
 
 class AdaptiveInnerTolerance:
     """Eisenstat--Walker-style *forcing term* coupling the inner CG tolerance
-    to the outer optimizer's stationarity.
+    to the outer optimizer's stationarity, with a stagnation ratchet.
 
-    Each accepted outer iterate sets the inner (forward/adjoint) CG relative
-    tolerance to
+    The inner (forward/adjoint) CG relative tolerance starts coarse at
+    ``rtol_start`` and is retuned once per accepted outer iterate. Two
+    mechanisms drive it down, and it is **monotone non-increasing** (never
+    loosens) and floored at ``rtol_min``:
 
-        rtol = clip( c * ||g_free||^alpha , rtol_min , rtol_start )
+    * **Forcing term.** While the box-KKT-masked gradient ``||g_free||`` (the
+      infinity norm; the same stationarity measure ``l_bfgs_bounded`` converges
+      on, see NuMPI ``_kkt_residual``) is *decreasing*, the tolerance tracks
+      ``clip(c * ||g_free||^alpha, rtol_min, rtol_start)`` -- coarse while far
+      from a stationary point (no oversolving), tightening as it approaches.
 
-    where ``||g_free||`` is the infinity norm of the *box-KKT-masked* gradient
-    -- the same stationarity measure ``l_bfgs_bounded`` uses for convergence
-    (see NuMPI ``_kkt_residual``). Far from the optimum the gradient is large
-    and the inner solves stay coarse (no oversolving); as the outer iterate
-    approaches a stationary point the tolerance tightens towards ``rtol_min``.
+    * **Stagnation ratchet.** If ``||g_free||`` fails to decrease by at least
+      ``stall_rel`` (relative) versus the best value seen, the outer optimizer
+      has stalled at the current accuracy, so the tolerance is *forced* down by
+      the factor ``shrink`` toward ``rtol_min``. This is essential: the pure
+      forcing term only tightens once ``||g_free|| < rtol_start``, but the
+      gradient can plateau *above* ``rtol_start`` (the loose inner solves add
+      gradient/objective noise that halts progress), which would otherwise
+      deadlock the tolerance at the coarse start. Refining the inner accuracy on
+      stagnation breaks that deadlock and is the mechanism of inexact
+      trust-region PDE-constrained optimization (Heinkenschloss & Vicente 2001;
+      Kouri, Heinkenschloss, Ridzal & van Bloemen Waanders 2013/14).
 
-    **Frozen between iterates.** :meth:`advance` recomputes the tolerance once
-    per accepted outer iterate (called from the optimizer callback); within an
+    **Frozen between iterates.** :meth:`advance` retunes the tolerance once per
+    accepted outer iterate (called from the optimizer callback); within an
     iterate's line search :attr:`current` is constant, so every trial point is
-    solved to the *same* accuracy. This keeps the L-BFGS secant pair
-    ``y = g_new - g_old`` consistent (both gradients carry the same solve
-    accuracy), which is the condition under which quasi-Newton methods tolerate
-    inexact gradients (Xie, Byrd & Nocedal 2020; Berahas, Byrd & Nocedal 2019).
+    solved to the *same* accuracy. That -- together with monotonicity -- keeps
+    the L-BFGS secant pair ``y = g_new - g_old`` consistent (both gradients
+    carry the same solve accuracy), the condition under which quasi-Newton
+    methods tolerate inexact gradients (Xie, Byrd & Nocedal 2020; Berahas, Byrd
+    & Nocedal 2019).
 
     Mathematical basis: Dembo--Eisenstat--Steihaug (1982) and Eisenstat--Walker
     (1996) for the forcing term; Carter (1991) / Byrd--Chin--Nocedal--Wu (2012)
@@ -58,19 +71,27 @@ class AdaptiveInnerTolerance:
     order in the CG residual, but the returned gradient is only *first* order,
     so the final gradient error is governed by ``rtol_min``. Pick it small
     enough that the gradient error falls below the outer ``gtol`` -- otherwise
-    L-BFGS cannot certify convergence.
+    L-BFGS cannot certify convergence. In the worst case (persistent
+    stagnation) the ratchet drives ``current`` all the way to ``rtol_min``, so
+    the run degrades to a fixed-``rtol_min`` solve rather than getting stuck.
     """
 
-    def __init__(self, rtol_start, rtol_min, c=1.0, alpha=1.0,
-                 bounds=(0.0, 1.0)):
+    def __init__(self, rtol_start, rtol_min, c=1.0, alpha=1.0, stall_rel=1e-2,
+                 shrink=0.3, bounds=(0.0, 1.0)):
         self.rtol_start = float(rtol_start)
         self.rtol_min = float(rtol_min)
         self.c = float(c)
         self.alpha = float(alpha)
+        self.stall_rel = float(stall_rel)
+        self.shrink = float(shrink)
         self.bounds = bounds
         self.current = float(rtol_start)
         self._latest_gnorm = None
-        # (gnorm, rtol) at each advance, for diagnostics / output.
+        # Smallest ||g_free|| seen so far; a new gradient must beat this (by
+        # stall_rel) to count as progress. +inf so the first iterate always
+        # registers as progress.
+        self._best_gnorm = float("inf")
+        # (gnorm, rtol, stalled) at each advance, for diagnostics / output.
         self.history = []
 
     def observe(self, gnorm):
@@ -82,20 +103,33 @@ class AdaptiveInnerTolerance:
         self._latest_gnorm = float(gnorm)
 
     def advance(self):
-        """Recompute :attr:`current` from the last observed gradient norm.
+        """Retune :attr:`current` from the last observed gradient norm.
 
         Invoked once per accepted outer iterate (from the optimizer callback).
-        A no-op until the first :meth:`observe`."""
+        Monotone non-increasing and floored at ``rtol_min``. A no-op until the
+        first :meth:`observe`."""
         if self._latest_gnorm is None:
             return self.current
-        rtol = self.c * self._latest_gnorm ** self.alpha
-        self.current = float(min(self.rtol_start, max(self.rtol_min, rtol)))
-        self.history.append((self._latest_gnorm, self.current))
+        g = self._latest_gnorm
+        if g < (1.0 - self.stall_rel) * self._best_gnorm:
+            # Genuine progress: let the forcing term set the target.
+            self._best_gnorm = g
+            target = self.c * g ** self.alpha
+            target = min(self.rtol_start, max(self.rtol_min, target))
+            stalled = False
+        else:
+            # Stagnation at the current accuracy: refine (ratchet down).
+            target = self.current * self.shrink
+            stalled = True
+        # Monotone: only ever tighten, never below the floor.
+        self.current = max(self.rtol_min, min(self.current, target))
+        self.history.append((g, self.current, stalled))
         return self.current
 
 
 def _make_inner_tolerance(problem, cg_tol_start, cg_tol_min, cg_forcing_c,
-                          cg_forcing_exp, bounds):
+                          cg_forcing_exp, cg_stall_rel, cg_stall_shrink,
+                          bounds):
     """Build and attach an :class:`AdaptiveInnerTolerance` to ``problem`` when
     adaptive coupling is requested (``cg_tol_start`` given), else detach any
     previous controller and return ``None`` (fixed ``Homogenization.cg_tol``).
@@ -110,7 +144,7 @@ def _make_inner_tolerance(problem, cg_tol_start, cg_tol_min, cg_forcing_c,
         cg_tol_min = getattr(problem.h, "cg_tol", 1e-8)
     controller = AdaptiveInnerTolerance(
         cg_tol_start, cg_tol_min, c=cg_forcing_c, alpha=cg_forcing_exp,
-        bounds=bounds,
+        stall_rel=cg_stall_rel, shrink=cg_stall_shrink, bounds=bounds,
     )
     problem.inner_tolerance = controller
     return controller
@@ -194,7 +228,8 @@ def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
 def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
                            ftol=0.0, xtol=0.0, bounds=(0.0, 1.0), maxcor=10,
                            callback=None, cg_tol_start=None, cg_tol_min=None,
-                           cg_forcing_c=1.0, cg_forcing_exp=1.0):
+                           cg_forcing_c=1.0, cg_forcing_exp=1.0,
+                           cg_stall_rel=1e-2, cg_stall_shrink=0.3):
     """Minimize ``problem`` from ``rho0`` with NuMPI's MPI-distributed,
     box-constrained L-BFGS. Returns ``(rho_opt, info)``.
 
@@ -218,12 +253,19 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
         Coefficient ``c`` and exponent ``alpha`` in
         ``rtol = c * ||g_free||**alpha`` (defaults 1.0, 1.0). ``alpha=1`` gives
         ``rtol = O(||g||)`` and fast local convergence.
+    cg_stall_rel, cg_stall_shrink : float, optional
+        Stagnation ratchet (see :class:`AdaptiveInnerTolerance`): when the
+        projected gradient fails to decrease by at least ``cg_stall_rel``
+        (default 0.01) over an outer iterate, the tolerance is forced down by
+        ``cg_stall_shrink`` (default 0.3) toward ``cg_tol_min``, so a
+        noise-limited plateau cannot stall the run.
     """
     from NuMPI.Optimization import l_bfgs_bounded
 
     history = []
     inner_tol = _make_inner_tolerance(
-        problem, cg_tol_start, cg_tol_min, cg_forcing_c, cg_forcing_exp, bounds)
+        problem, cg_tol_start, cg_tol_min, cg_forcing_c, cg_forcing_exp,
+        cg_stall_rel, cg_stall_shrink, bounds)
 
     # The local density grid is passed as-is: NuMPI's l_bfgs_bounded handles an
     # n-D x0 (keeping its iterate/gradient/history flat internally) and returns
@@ -263,7 +305,8 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
 
 def optimize_lbfgs(problem, rho0, maxiter=200, gtol=1e-5, ftol=1e-9,
                    bounds=(0.0, 1.0), callback=None, cg_tol_start=None,
-                   cg_tol_min=None, cg_forcing_c=1.0, cg_forcing_exp=1.0):
+                   cg_tol_min=None, cg_forcing_c=1.0, cg_forcing_exp=1.0,
+                   cg_stall_rel=1e-2, cg_stall_shrink=0.3):
     """Minimize ``problem`` from ``rho0`` with L-BFGS-B. Returns
     ``(rho_opt, info)``.
 
@@ -275,7 +318,8 @@ def optimize_lbfgs(problem, rho0, maxiter=200, gtol=1e-5, ftol=1e-9,
     shape = np.asarray(rho0).shape
     history = []
     inner_tol = _make_inner_tolerance(
-        problem, cg_tol_start, cg_tol_min, cg_forcing_c, cg_forcing_exp, bounds)
+        problem, cg_tol_start, cg_tol_min, cg_forcing_c, cg_forcing_exp,
+        cg_stall_rel, cg_stall_shrink, bounds)
 
     def fun(x):
         f, g = problem.objective_and_gradient(x.reshape(shape))

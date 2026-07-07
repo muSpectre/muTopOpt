@@ -35,8 +35,9 @@ def _mpi_comm():
 
 
 def test_controller_clips_and_freezes():
-    """The forcing term clips to [rtol_min, rtol_start] and only moves on
-    advance() -- observe() alone must not change the live tolerance."""
+    """The forcing term clips to [rtol_min, rtol_start], only moves on
+    advance() (observe() alone must not change the live tolerance), and is
+    monotone (never loosens once tightened)."""
     c = AdaptiveInnerTolerance(rtol_start=1e-1, rtol_min=1e-6, c=1.0, alpha=1.0)
     assert c.current == 1e-1
 
@@ -47,7 +48,7 @@ def test_controller_clips_and_freezes():
     c.observe(0.5)
     assert c.advance() == pytest.approx(1e-1)
 
-    # In-range gradient maps straight through (alpha = 1, c = 1).
+    # A decreasing (progressing) gradient maps through the forcing term.
     c.observe(1e-3)
     assert c.advance() == pytest.approx(1e-3)
 
@@ -58,7 +59,42 @@ def test_controller_clips_and_freezes():
     # observe() is frozen between advance() calls.
     c.observe(1e-2)
     assert c.current == pytest.approx(1e-6)
-    assert c.advance() == pytest.approx(1e-2)
+    # Monotone: a later large gradient must NOT loosen the tolerance back up
+    # (that would break L-BFGS secant consistency) -- it stays at the floor.
+    assert c.advance() == pytest.approx(1e-6)
+
+
+def test_ratchets_down_on_stagnation():
+    """When the projected gradient plateaus above rtol_start, the stagnation
+    ratchet drives the tolerance down to rtol_min anyway (the production
+    deadlock: rtol would otherwise stay pinned at the coarse start)."""
+    c = AdaptiveInnerTolerance(rtol_start=1e-2, rtol_min=1e-4, c=1.0, alpha=1.0,
+                               stall_rel=1e-2, shrink=0.3)
+    # Constant gradient of 0.05 -- above rtol_start, so the pure forcing term
+    # would pin rtol at 1e-2 forever.
+    seq = []
+    for _ in range(12):
+        c.observe(0.05)
+        seq.append(c.advance())
+
+    assert seq[0] == pytest.approx(1e-2)          # coarse start, first iterate
+    assert seq[1] < 1e-2                           # escaped the deadlock
+    assert all(b <= a + 1e-30 for a, b in zip(seq, seq[1:]))  # non-increasing
+    assert seq[-1] == pytest.approx(1e-4)          # reached the floor
+    # The ratchet is geometric with `shrink` until it hits the floor.
+    assert seq[1] == pytest.approx(1e-2 * 0.3)
+
+
+def test_monotone_under_rising_gradient():
+    """A rising gradient never loosens the tolerance; the ratchet only tightens
+    it (the old forcing-only controller would raise it back toward start)."""
+    c = AdaptiveInnerTolerance(rtol_start=1e-1, rtol_min=1e-6, c=1.0, alpha=1.0)
+    seq = []
+    for g in (1e-2, 1e-1, 1.0, 10.0):
+        c.observe(g)
+        seq.append(c.advance())
+    assert all(b <= a + 1e-30 for a, b in zip(seq, seq[1:]))  # never increases
+    assert seq[-1] < seq[0]
 
 
 def _build(comm, cg_tol):
@@ -121,11 +157,14 @@ def test_adaptive_matches_fixed_with_fewer_cg_iters(comm):
     assert cg_adapt < cg_fixed
 
     # The controller actually tightened over the run and stayed in range.
+    # History entries are (gnorm, rtol, stalled).
     hist = info_adapt["cg_rtol_history"]
     assert hist, "adaptive run recorded no tolerance history"
-    rtols = [r for _, r in hist]
+    rtols = [rtol for _, rtol, _ in hist]
     assert all(1e-6 <= r <= 1e-1 for r in rtols)
     assert rtols[-1] <= rtols[0]
+    # Monotone non-increasing (never loosens).
+    assert all(b <= a + 1e-30 for a, b in zip(rtols, rtols[1:]))
 
 
 def test_gradient_accurate_at_floor(comm):
