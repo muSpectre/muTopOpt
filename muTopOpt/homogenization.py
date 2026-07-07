@@ -299,6 +299,12 @@ class Homogenization:
             return
         if self._prec is None:
             lam_ref, mu_ref = self._reference_lame()
+            # ``dtype=self.dtype`` builds a preconditioner at the field
+            # precision, so a single-precision (float32) material yields a
+            # single-precision preconditioner (complex64 FFT buffers, float32
+            # kernel/diagonal) and the whole forward/adjoint solve stays in
+            # single precision. Requires muGrid that threads dtype through the
+            # preconditioner factories (see the muGrid pin in pyproject.toml).
             if self.preconditioner_kind == "green-jacobi":
                 self._prec = make_green_jacobi_preconditioner(
                     self.engine, self.op, self.lam, self.mu, self.dim,
