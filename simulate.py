@@ -27,6 +27,8 @@ currently serial.
 """
 
 import argparse
+import shlex
+import sys
 
 import muGrid
 import numpy as np
@@ -182,11 +184,13 @@ def main():
     )
     p.add_argument(
         "--device",
-        choices=["cpu", "gpu"],
         default="cpu",
+        metavar="DEVICE",
         help="run the forward/adjoint solves and sensitivity on the "
-        "host (cpu) or on the accelerator (gpu); the L-BFGS "
-        "optimizer always runs on the host",
+        "host ('cpu') or on the accelerator ('gpu', or the platform-"
+        "specific 'rocm'/'cuda'); the L-BFGS optimizer always runs on "
+        "the host. Append ':N' to pin a specific device by id (e.g. "
+        "'rocm:0', 'cuda:1') instead of the default per-rank placement",
     )
     p.add_argument(
         "--precision",
@@ -368,6 +372,11 @@ def main():
         fio.write_global_attribute(
             "domain_lengths", [float(x) for x in homog.domain_lengths]
         )
+        # Full invocation that produced this file, quoted so it can be pasted
+        # back into a shell to reproduce the run. Known up front, so written
+        # with its final value here (no placeholder/update). `sys.argv` is
+        # identical across ranks, so writing from all ranks is consistent.
+        fio.write_global_attribute("command_line", shlex.join(sys.argv))
         # Placeholders, sized to the maximum they can reach (the optimizer runs
         # at most args.bfgs_maxiter iterations, hence at most that many history
         # entries and dumped frames). Real values are written after the run.

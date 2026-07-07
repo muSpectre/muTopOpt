@@ -75,26 +75,28 @@ def _resolve_device(device, comm=None):
     """Map a user-facing device spec to a ``muGrid.Device`` (or ``None`` = CPU).
 
     Accepts ``None``/``"cpu"`` (host), ``"gpu"``/``"rocm"``/``"cuda"`` (an
-    accelerator), or a ready-made ``muGrid.Device``. For the generic strings,
-    each rank binds to GPU ``local_rank % n_gpus`` so an MPI run spreads across
-    the node's accelerators instead of oversubscribing device 0. Pass an
-    explicit ``muGrid.Device`` (e.g. ``muGrid.Device.rocm(2)``) to override.
+    accelerator), an explicit ``"gpu:N"``/``"rocm:N"``/``"cuda:N"`` (a specific
+    device by id), or a ready-made ``muGrid.Device``. The string forms are
+    parsed by ``muGrid.Device.from_string`` (the inverse of a device's
+    ``device_string``); muTopOpt adds only the MPI placement policy on top: a
+    *bare* accelerator alias (no ``:N``) binds each rank to GPU
+    ``local_rank % n_gpus`` so an MPI run spreads across the node's
+    accelerators instead of oversubscribing device 0. An explicit id pins
+    *every* rank to that one device; use it for single-rank runs or to override
+    the automatic placement (e.g. ``"rocm:2"``).
     """
-    if device is None or device == "cpu":
+    if device is None:
         return None
-    if isinstance(device, str):
-        key = device.lower()
-        if key in ("gpu", "rocm", "cuda"):
-            dev_id = _local_rank(comm) % _gpu_device_count()
-            if key == "rocm":
-                return muGrid.Device.rocm(dev_id)
-            if key == "cuda":
-                return muGrid.Device.cuda(dev_id)
-            # "gpu" is the platform accelerator (ROCm or CUDA), chosen by the
-            # build; pass the id so each rank binds its own device, not just 0.
-            return muGrid.Device.gpu(dev_id)
-        raise ValueError(f"unknown device '{device}'")
-    return device  # assume a muGrid.Device instance
+    if not isinstance(device, str):
+        return device  # assume a muGrid.Device instance
+    if device == "cpu":
+        return None
+    # A bare accelerator alias gets muTopOpt's per-rank placement; rewrite it to
+    # an explicit "<kind>:<id>". Everything else (explicit ids, bad spellings)
+    # is handed verbatim to muGrid's parser.
+    if device.lower() in ("gpu", "rocm", "cuda"):
+        device = f"{device.lower()}:{_local_rank(comm) % _gpu_device_count()}"
+    return muGrid.Device.from_string(device)
 
 
 # Process-global guard: the managed allocator, and muGrid's routing to it, must
