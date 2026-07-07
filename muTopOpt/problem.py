@@ -70,6 +70,14 @@ class StressTargetProblem:
             self._nodal_map = NodalElementMap(homogenization)
         self.consistent_objective = bool(consistent_objective)
 
+        # Optional adaptive inner-solve tolerance controller
+        # (:class:`muTopOpt.optimize.AdaptiveInnerTolerance`). When set, every
+        # forward/adjoint solve uses ``inner_tolerance.current`` as its CG
+        # relative tolerance instead of the fixed ``Homogenization.cg_tol``,
+        # and each evaluation reports its box-KKT gradient norm back to the
+        # controller. Attached by the optimizer drivers; ``None`` = fixed tol.
+        self.inner_tolerance = None
+
         # Per-load-case solver fields, reused across iterations.
         self._u = self.h.vector_field("to_prob_u")
         self._adj = self.h.vector_field("to_prob_adjoint")
@@ -107,6 +115,11 @@ class StressTargetProblem:
 
         dlam, dmu = h.material.dlame(rho_e)  # SIMP derivatives, per element
 
+        # Adaptive inner tolerance: the current (frozen-per-outer-iterate)
+        # forcing-term value, or None to use the fixed Homogenization.cg_tol.
+        rtol = (self.inner_tolerance.current
+                if self.inner_tolerance is not None else None)
+
         f = 0.0
         grad = np.zeros_like(rho_e)
         stresses = []
@@ -116,7 +129,7 @@ class StressTargetProblem:
             norm = float(np.sum(lc.target_stress**2))
             # Forward equilibrium.
             u = h.solve_macro(
-                lc.macro_strain, self._u,
+                lc.macro_strain, self._u, rtol=rtol,
                 residual=self._res_u if self.consistent_objective else None,
                 label=f"case {i + 1} fwd")
             cg_iters.append(h.last_cg_iters)
@@ -129,8 +142,8 @@ class StressTargetProblem:
             S = 2.0 * lc.weight * diff / norm
             h.macro_rhs_tensor(S, self._adj_rhs, scale=-1.0 / V)
             adj_scale = h.mat_scale * max(float(np.abs(S / V).max()), 1e-300)
-            adj = h.solve_rhs(self._adj_rhs, self._adj, rhs_scale=adj_scale,
-                              label=f"case {i + 1} adj")
+            adj = h.solve_rhs(self._adj_rhs, self._adj, rtol=rtol,
+                              rhs_scale=adj_scale, label=f"case {i + 1} adj")
             cg_iters.append(h.last_cg_iters)
 
             if self.consistent_objective:
@@ -171,6 +184,26 @@ class StressTargetProblem:
             f += f_reg
             grad += g_reg
 
+        if self.inner_tolerance is not None:
+            # Report the box-KKT gradient norm to the tolerance controller so
+            # it can retune the inner accuracy at the next accepted outer
+            # iterate. This is the *masked* infinity norm -- box-active
+            # components whose gradient points further into the bound are
+            # zeroed, matching the stationarity measure l_bfgs_bounded
+            # converges on (NuMPI ``_kkt_residual``). ``rho`` is the design
+            # variable (element or nodal) the optimizer bounds in [lo, hi].
+            lo, hi = self.inner_tolerance.bounds
+            tol_box = 1e-12
+            r = np.abs(grad)
+            if lo is not None:
+                r[(rho <= lo + tol_box) & (grad >= 0.0)] = 0.0
+            if hi is not None:
+                r[(rho >= hi - tol_box) & (grad <= 0.0)] = 0.0
+            local = float(r.max()) if r.size else 0.0
+            gnorm = float(h.comm.max(local))
+            self.inner_tolerance.observe(gnorm)
+
         self.last = {"objective": f, "stresses": stresses,
-                     "cg_iters": cg_iters, "corrections": corrections}
+                     "cg_iters": cg_iters, "corrections": corrections,
+                     "cg_rtol": rtol}
         return f, grad

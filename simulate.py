@@ -176,6 +176,32 @@ def main():
         "(the solve stops here even if --cg-tol is not met)",
     )
     p.add_argument(
+        "--cg-tol-start",
+        type=float,
+        default=None,
+        help="enable ADAPTIVE inner CG tolerance: solves start at this "
+        "(coarse) relative tolerance and tighten as the outer projected "
+        "gradient shrinks (an Eisenstat-Walker forcing term). When unset, "
+        "the fixed --cg-tol is used throughout. A typical coarse start is "
+        "1e-2",
+    )
+    p.add_argument(
+        "--cg-tol-min",
+        type=float,
+        default=None,
+        help="floor for the adaptive inner tolerance (default: --cg-tol). "
+        "Must be small enough that the final gradient error is below "
+        "--bfgs-gtol, else L-BFGS cannot certify convergence",
+    )
+    p.add_argument(
+        "--cg-forcing-exp",
+        type=float,
+        default=1.0,
+        help="exponent alpha in the forcing term "
+        "rtol = c * ||g_free||**alpha (default 1.0; alpha=1 gives "
+        "rtol=O(||g||) and fast local convergence)",
+    )
+    p.add_argument(
         "--preconditioner",
         choices=["green-jacobi", "green"],
         default="green-jacobi",
@@ -427,10 +453,13 @@ def main():
             # and the total inner CG iterations it took (the same total also
             # goes to the NetCDF history above).
             K, G = effective_moduli(last["stresses"])
+            rtol = last.get("cg_rtol")
+            rtol_str = f"  cg-rtol={rtol:.1e}" if rtol is not None else ""
             print(
                 f"  bfgs-iter {it:4d}  f={last['objective']:.6e}  "
                 f"vol_frac={vf:.3f}  K={K:.4g} (target {target_K:.4g})  "
                 f"G={G:.4g} (target {target_G:.4g})  cg-iters={cg_total}"
+                f"{rtol_str}"
             )
 
     rho, info = optimize_bounded_lbfgs(
@@ -441,7 +470,17 @@ def main():
         gtol=args.bfgs_gtol,
         xtol=args.bfgs_xtol,
         callback=cb,
+        cg_tol_start=args.cg_tol_start,
+        cg_tol_min=args.cg_tol_min,
+        cg_forcing_exp=args.cg_forcing_exp,
     )
+    if rank0 and args.cg_tol_start is not None:
+        floor = args.cg_tol_min if args.cg_tol_min is not None else args.cg_tol
+        print(
+            f"adaptive inner CG tolerance: start {args.cg_tol_start:.1e} -> "
+            f"floor {floor:.1e} "
+            f"(forcing rtol = ||g_free||**{args.cg_forcing_exp:g})"
+        )
 
     converged = bool(info["success"])
     if rank0:
