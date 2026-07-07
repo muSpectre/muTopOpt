@@ -100,7 +100,7 @@ def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
 
 
 def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
-                           ftol=0.0, bounds=(0.0, 1.0), maxcor=10,
+                           ftol=0.0, xtol=0.0, bounds=(0.0, 1.0), maxcor=10,
                            callback=None):
     """Minimize ``problem`` from ``rho0`` with NuMPI's MPI-distributed,
     box-constrained L-BFGS. Returns ``(rho_opt, info)``.
@@ -130,7 +130,7 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
     res = l_bfgs_bounded(
         fun, np.asarray(rho0, dtype=float), jac=None,
         bounds_lo=bounds[0], bounds_hi=bounds[1],
-        gtol=gtol, ftol=ftol, maxiter=maxiter, maxcor=maxcor,
+        gtol=gtol, ftol=ftol, xtol=xtol, maxiter=maxiter, maxcor=maxcor,
         comm=comm, callback=_cb,
     )
     info = {

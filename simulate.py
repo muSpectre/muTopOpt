@@ -153,6 +153,13 @@ def main():
         help="L-BFGS convergence tolerance on the projected gradient",
     )
     p.add_argument(
+        "--bfgs-xtol",
+        type=float,
+        default=0.0,
+        help="L-BFGS convergence tolerance on the step size (relative change "
+        "in the density iterate); 0 disables the criterion",
+    )
+    p.add_argument(
         "--cg-tol",
         type=float,
         default=1e-4,
@@ -432,6 +439,7 @@ def main():
         comm=mpi_comm,
         maxiter=args.bfgs_maxiter,
         gtol=args.bfgs_gtol,
+        xtol=args.bfgs_xtol,
         callback=cb,
     )
 
