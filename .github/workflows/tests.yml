@@ -20,11 +20,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # muTopOpt is pure Python; NuMPI comes from PyPI, but muGrid is built
-        # from source (its latest main) because muTopOpt tracks muGrid features
-        # -- e.g. the single-precision preconditioner (dtype-threaded factories)
-        # -- that are not yet in a PyPI release. Test the oldest and newest
-        # supported Pythons, with and without MPI.
+        # muTopOpt is pure Python; muGrid/NuMPI come from PyPI wheels (the
+        # single-precision preconditioner needs muGrid >= 0.112.0, pinned in
+        # pyproject.toml). Test the oldest and newest supported Pythons, with
+        # and without MPI.
         python-version: [ '3.10', '3.14' ]
         mpi: [ 'no', 'yes' ]
 
@@ -49,17 +48,15 @@ jobs:
       - name: Install muTopOpt and dependencies
         run: |
           python3 -m pip install --upgrade pip
-          # muGrid (with FFT/FE operators + the CG solver) is built from its
-          # latest main so CI runs the version muTopOpt targets, including
-          # features not yet on PyPI (e.g. the dtype-threaded, single-precision
-          # preconditioner). Installed first so the muTopOpt dependency
-          # resolution below sees it already satisfied. NuMPI comes from PyPI.
+          # muGrid (with FFT/FE operators + the CG solver) and NuMPI (the
+          # bound-constrained L-BFGS optimizer) install from PyPI wheels; the
+          # muGrid>=0.112.0 pin pulls the dtype-threaded, single-precision
+          # preconditioner.
           EXTRAS="test,scipy"
           if [ "${{ matrix.mpi }}" == "yes" ]; then
             python3 -m pip install "mpi4py"
             EXTRAS="$EXTRAS,mpi"
           fi
-          python3 -m pip install "muGrid @ git+https://github.com/muSpectre/muGrid.git@main"
           python3 -m pip install ".[${EXTRAS}]"
           python3 -m pip list
 
