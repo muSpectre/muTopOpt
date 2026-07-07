@@ -202,6 +202,23 @@ def main():
         "rtol=O(||g||) and fast local convergence)",
     )
     p.add_argument(
+        "--cg-stall-shrink",
+        type=float,
+        default=0.3,
+        help="stagnation ratchet for the adaptive tolerance: when the "
+        "projected gradient stops decreasing, the inner tolerance is "
+        "multiplied by this factor (default 0.3) toward --cg-tol-min, so a "
+        "noise-limited plateau cannot stall the run",
+    )
+    p.add_argument(
+        "--cg-stall-rel",
+        type=float,
+        default=1e-2,
+        help="minimum relative decrease in the projected gradient counted as "
+        "progress (default 0.01); an iterate that does not beat the best "
+        "gradient by this much triggers the --cg-stall-shrink ratchet",
+    )
+    p.add_argument(
         "--preconditioner",
         choices=["green-jacobi", "green"],
         default="green-jacobi",
@@ -473,6 +490,8 @@ def main():
         cg_tol_start=args.cg_tol_start,
         cg_tol_min=args.cg_tol_min,
         cg_forcing_exp=args.cg_forcing_exp,
+        cg_stall_rel=args.cg_stall_rel,
+        cg_stall_shrink=args.cg_stall_shrink,
     )
     if rank0 and args.cg_tol_start is not None:
         floor = args.cg_tol_min if args.cg_tol_min is not None else args.cg_tol
