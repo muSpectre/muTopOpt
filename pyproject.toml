@@ -15,6 +15,11 @@ requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
     "numpy",
+    # Single-precision (float32) solves need muGrid's dtype-threaded
+    # preconditioner factories, which are on muGrid main but not yet in a PyPI
+    # release; until the next release, install muGrid from source for float32
+    # (double-precision solves work with the pinned release). CI builds muGrid
+    # from main -- see .github/workflows/tests.yml.
     "muGrid>=0.110.0",
     "NuMPI",
 ]
