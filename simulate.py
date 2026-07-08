@@ -45,7 +45,11 @@ from muTopOpt.loadcases import (
     isotropic_stiffness_tensor,
     target_load_cases,
 )
-from muTopOpt.optimize import initial_density, optimize_bounded_lbfgs
+from muTopOpt.optimize import (
+    initial_density,
+    optimize_bounded_lbfgs,
+    optimize_trust_region,
+)
 
 
 class _HelpFormatter(
@@ -134,10 +138,46 @@ def main():
         help="random seed for the --init random/filtered_random density field",
     )
     p.add_argument(
+        "--optimizer",
+        choices=["lbfgs", "tr"],
+        default="lbfgs",
+        help="outer optimizer: 'lbfgs' (bound-constrained L-BFGS) or 'tr' "
+        "(trust-region Newton-CG with exact second-order-adjoint "
+        "Hessian-vector products; robust against loose inner CG "
+        "tolerances, at ~2 extra solves per load case per Hessian "
+        "product; needs NuMPI with tr_newton_bounded)",
+    )
+    p.add_argument(
         "--bfgs-maxiter",
         type=int,
         default=200,
-        help="maximum number of outer L-BFGS iterations",
+        help="maximum number of outer optimizer iterations (L-BFGS or TR)",
+    )
+    p.add_argument(
+        "--tr-delta0",
+        type=float,
+        default=0.05,
+        help="initial trust-region radius, in RMS density change per pixel",
+    )
+    p.add_argument(
+        "--tr-delta-max",
+        type=float,
+        default=0.5,
+        help="maximum trust-region radius, in RMS density change per pixel",
+    )
+    p.add_argument(
+        "--tr-eta",
+        type=float,
+        default=0.1,
+        help="trust-region step acceptance threshold on ared/pred",
+    )
+    p.add_argument(
+        "--hv-cg-tol",
+        type=float,
+        default=1e-3,
+        help="relative CG tolerance of the two extra solves per "
+        "Hessian-vector product (may be loose: the Hessian only shapes "
+        "the trust-region model)",
     )
     p.add_argument(
         "--output-cg-iters",
@@ -352,7 +392,9 @@ def main():
         else PhaseFieldRegularization
     )
     reg = Reg(homog, eta=eta, weight=args.reg_weight)
-    problem = StressTargetProblem(homog, cases, regularization=reg, design=args.density)
+    problem = StressTargetProblem(homog, cases, regularization=reg,
+                                  design=args.density,
+                                  hessian=(args.optimizer == "tr"))
 
     length = args.init_length
     if args.init == "filtered_random" and length is None:
@@ -479,27 +521,50 @@ def main():
                 f"{rtol_str}"
             )
 
-    rho, info = optimize_bounded_lbfgs(
-        problem,
-        rho0,
-        comm=mpi_comm,
-        maxiter=args.bfgs_maxiter,
-        gtol=args.bfgs_gtol,
-        xtol=args.bfgs_xtol,
-        callback=cb,
-        cg_tol_start=args.cg_tol_start,
-        cg_tol_min=args.cg_tol_min,
-        cg_forcing_exp=args.cg_forcing_exp,
-        cg_stall_rel=args.cg_stall_rel,
-        cg_stall_shrink=args.cg_stall_shrink,
-    )
-    if rank0 and args.cg_tol_start is not None:
-        floor = args.cg_tol_min if args.cg_tol_min is not None else args.cg_tol
-        print(
-            f"adaptive inner CG tolerance: start {args.cg_tol_start:.1e} -> "
-            f"floor {floor:.1e} "
-            f"(forcing rtol = ||g_free||**{args.cg_forcing_exp:g})"
+    if args.optimizer == "tr":
+        rho, info = optimize_trust_region(
+            problem,
+            rho0,
+            comm=mpi_comm,
+            maxiter=args.bfgs_maxiter,
+            gtol=args.bfgs_gtol,
+            delta0=args.tr_delta0,
+            delta_max=args.tr_delta_max,
+            eta=args.tr_eta,
+            cg_tol_start=args.cg_tol_start,
+            cg_tol_min=(args.cg_tol_min
+                        if args.cg_tol_min is not None else 1e-10),
+            hv_rtol=args.hv_cg_tol,
+            callback=cb,
         )
+        if rank0:
+            print(
+                f"trust region: {info['nb_hessp']} Hessian products, "
+                f"final state-solve rtol {info['final_cg_rtol']:.1e}"
+            )
+    else:
+        rho, info = optimize_bounded_lbfgs(
+            problem,
+            rho0,
+            comm=mpi_comm,
+            maxiter=args.bfgs_maxiter,
+            gtol=args.bfgs_gtol,
+            xtol=args.bfgs_xtol,
+            callback=cb,
+            cg_tol_start=args.cg_tol_start,
+            cg_tol_min=args.cg_tol_min,
+            cg_forcing_exp=args.cg_forcing_exp,
+            cg_stall_rel=args.cg_stall_rel,
+            cg_stall_shrink=args.cg_stall_shrink,
+        )
+        if rank0 and args.cg_tol_start is not None:
+            floor = (args.cg_tol_min
+                     if args.cg_tol_min is not None else args.cg_tol)
+            print(
+                f"adaptive inner CG tolerance: start {args.cg_tol_start:.1e} "
+                f"-> floor {floor:.1e} "
+                f"(forcing rtol = ||g_free||**{args.cg_forcing_exp:g})"
+            )
 
     converged = bool(info["success"])
     if rank0:

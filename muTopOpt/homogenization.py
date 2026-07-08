@@ -430,10 +430,17 @@ class Homogenization:
             out.s[...] *= scale
         return out
 
-    def homogenized_stress(self, u, E_macro):
+    def homogenized_stress(self, u, E_macro, lam=None, mu=None):
         """Cell-averaged stress ``⟨σ⟩ = (1/V) ∫ C:(Ē + ∇u) dV`` as a
-        ``dim x dim`` array (MPI-reduced)."""
+        ``dim x dim`` array (MPI-reduced).
+
+        ``lam``/``mu`` override the material fields; passing *perturbed* Lamé
+        fields ``dλ/dρ·v``/``dμ/dρ·v`` evaluates the material-derivative
+        stress ``(1/V) ∫ δC:(Ē + ∇u) dV`` (the operator is linear in the
+        material), as needed for Hessian-vector products."""
         E = list(np.asarray(E_macro, dtype=float).ravel())
-        local = self.op.average_stress(u, self.lam, self.mu, E)
+        local = self.op.average_stress(
+            u, self.lam if lam is None else lam,
+            self.mu if mu is None else mu, E)
         glob = np.array([self.comm.sum(float(v)) for v in local])
         return glob.reshape(self.dim, self.dim) / self.domain_volume

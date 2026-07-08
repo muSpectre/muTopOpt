@@ -303,6 +303,135 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
     return np.asarray(res.x), info
 
 
+def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
+                          bounds=(0.0, 1.0), delta0=0.05, delta_max=0.5,
+                          eta=0.1, eta_f=0.25, cg_tol_start=None,
+                          cg_tol_min=1e-10, hv_rtol=1e-3, callback=None,
+                          disp=False):
+    """Minimize ``problem`` from ``rho0`` with NuMPI's MPI-distributed,
+    bound-constrained **trust-region Newton-CG** (``tr_newton_bounded``).
+    Returns ``(rho_opt, info)``.
+
+    Requires a problem constructed with ``hessian=True`` (the per-load-case
+    state caching and second-order-adjoint Hessian-vector product).
+
+    Robustness to truncated inner solves: unlike a line search -- whose
+    sufficient-decrease test must resolve decreases that shrink towards zero
+    and hence eventually drowns in the CG-induced objective noise -- the
+    trust-region acceptance ratio compares against the *computable* predicted
+    reduction ``pred``, and the driver enforces the inexact-trust-region
+    condition ``|f_err| <= eta_f * pred`` through two hooks wired here:
+
+    * ``fun_error``: the adjoint-weighted residual ``sum_G |lambda^T r|``
+      (``problem.last['corrections']``) -- a computable first-order bound on
+      the objective evaluation error, available for free;
+    * ``request_accuracy(target)``: tightens the state-solve relative
+      tolerance using the second-order error relation of the consistent
+      objective (``f_err ~ C rtol^2``, so ``rtol *= sqrt(target/err)``),
+      floored at ``cg_tol_min``.
+
+    Parameters
+    ----------
+    comm : mpi4py.MPI.Comm, optional
+        Communicator of the domain decomposition (as for
+        :func:`optimize_bounded_lbfgs`).
+    delta0, delta_max : float, optional
+        Initial/maximum trust-region radius in RMS-per-pixel density units
+        (0.05 / 0.5 by default: typical density change per pixel).
+    eta : float, optional
+        Step acceptance threshold on ``rho = ared/pred``.
+    eta_f : float, optional
+        Evaluation-error budget as a fraction of ``pred``.
+    cg_tol_start : float, optional
+        Initial state-solve relative tolerance (default: the
+        homogenization's fixed ``cg_tol``). The accuracy control tightens it
+        as needed -- start coarse.
+    cg_tol_min : float, optional
+        Floor for the state-solve tolerance.
+    hv_rtol : float, optional
+        Relative tolerance of the two extra solves in each Hessian-vector
+        product. May be loose (default 1e-3): the Hessian only shapes the
+        trust-region model, which tolerates bounded inexactness.
+    """
+    try:
+        from NuMPI.Optimization import tr_newton_bounded
+    except ImportError as err:
+        raise ImportError(
+            "optimize_trust_region needs NuMPI with tr_newton_bounded "
+            "(NuMPI > 1.5.1 / current NuMPI main)") from err
+
+    if not getattr(problem, "hessian", False):
+        raise ValueError(
+            "optimize_trust_region needs a problem with Hessian support; "
+            "construct StressTargetProblem(..., hessian=True)")
+
+    if cg_tol_start is None:
+        cg_tol_start = getattr(problem.h, "cg_tol", 1e-8)
+    # Reuse AdaptiveInnerTolerance purely as the rtol holder the problem
+    # already knows how to read (`.current`) -- the trust-region accuracy
+    # control below, not the forcing-term/ratchet logic, drives it (advance()
+    # is never called).
+    controller = AdaptiveInnerTolerance(cg_tol_start, cg_tol_min,
+                                        bounds=bounds)
+    problem.inner_tolerance = controller
+
+    history = []
+
+    def fun(x):
+        return problem.objective_and_gradient(x)
+
+    def hessp(x, v):
+        # The Hessian is evaluated around the cached linearization point;
+        # re-prime it if the last evaluation was a rejected trial iterate.
+        problem.ensure_state(x)
+        return problem.hessian_vector_product(v, rtol=hv_rtol)
+
+    def fun_error():
+        # Computable first-order bound on the evaluation error of the
+        # (Lagrangian-corrected) objective: the adjoint-weighted residuals.
+        return float(sum(abs(c) for c in problem.last.get("corrections", [])))
+
+    def request_accuracy(target):
+        # Consistent objective => f_err ~ C * rtol^2: shrink rtol by the
+        # square root of the requested reduction (x0.5 safety), monotone,
+        # floored.
+        err = fun_error()
+        rtol = controller.current
+        if err > 0.0 and target > 0.0:
+            rtol = rtol * 0.5 * np.sqrt(target / err)
+        else:
+            rtol = rtol * 0.1
+        controller.current = float(max(cg_tol_min,
+                                       min(controller.current, rtol)))
+
+    def _cb(x):
+        history.append(problem.last.get("objective"))
+        if callback is not None:
+            callback(len(history), x, problem.last)
+
+    res = tr_newton_bounded(
+        fun, np.asarray(rho0, dtype=float), hessp, jac=None,
+        bounds_lo=bounds[0], bounds_hi=bounds[1],
+        gtol=gtol, maxiter=maxiter,
+        delta0=delta0, delta_max=delta_max, eta=eta,
+        fun_error=fun_error, request_accuracy=request_accuracy, eta_f=eta_f,
+        comm=comm, callback=_cb, disp=disp,
+    )
+    info = {
+        "success": bool(res.success),
+        "message": res.message,
+        "nit": int(res.nit),
+        "objective": float(res.fun),
+        "max_grad": float(res.get("max_grad", np.nan)),
+        "history": history,
+        "nb_hessp": int(res.get("nb_hessp", 0)),
+        "delta_history": res.get("delta_history"),
+        "rho_history": res.get("rho_history"),
+        "final_cg_rtol": controller.current,
+    }
+    return np.asarray(res.x), info
+
+
 def optimize_lbfgs(problem, rho0, maxiter=200, gtol=1e-5, ftol=1e-9,
                    bounds=(0.0, 1.0), callback=None, cg_tol_start=None,
                    cg_tol_min=None, cg_forcing_c=1.0, cg_forcing_exp=1.0,
