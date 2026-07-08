@@ -190,8 +190,11 @@ def main():
     p.add_argument(
         "--bfgs-gtol",
         type=float,
-        default=1e-5,
-        help="L-BFGS convergence tolerance on the projected gradient",
+        default=None,
+        help="convergence tolerance on the projected gradient (L-BFGS and "
+        "TR). Default: 1e-5 in double precision, 1e-4 in single "
+        "precision (the float32 solve accuracy floor makes a tighter "
+        "gradient tolerance uncertifiable)",
     )
     p.add_argument(
         "--bfgs-xtol",
@@ -237,7 +240,11 @@ def main():
         "~2.5x the CG tolerance, so this floor lets L-BFGS certify "
         "convergence at --bfgs-gtol); 1e-10 for the trust-region "
         "optimizer (its accuracy control only tightens as far as the "
-        "predicted reduction requires)",
+        "predicted reduction requires). In single precision the "
+        "default floor is clamped to 1e-6: below that the true "
+        "residual b-Kx of a float32 solve stagnates (only the "
+        "recursive CG residual keeps shrinking) and CG may fail "
+        "outright",
     )
     p.add_argument(
         "--cg-forcing-exp",
@@ -342,19 +349,40 @@ def main():
         except ImportError:
             optimizer = "lbfgs"
 
+    # Precision-aware accuracy limits. In float32 the *true* residual b - Kx
+    # of the CG solve stagnates at |r|/|b| ~ 1.5e-6 (only the recursive CG
+    # residual keeps shrinking below that, and CG can fail outright), so
+    # tolerances below ~1e-6 buy no true accuracy -- and the achievable
+    # gradient accuracy (~2.5x the residual floor) makes a 1e-5 gradient
+    # tolerance uncertifiable.
+    single = args.precision == "single"
+    rtol_floor = 1e-6 if single else 0.0
+    bfgs_gtol = (args.bfgs_gtol if args.bfgs_gtol is not None
+                 else (1e-4 if single else 1e-5))
+
     # Adaptive inner CG tolerance is on by default (<= 0 disables it: fixed
     # --cg-tol throughout). The floor defaults per optimizer: L-BFGS needs the
-    # final gradient error (~2.5x the CG tolerance) below --bfgs-gtol to
-    # certify convergence; the trust-region accuracy control only tightens as
-    # far as the predicted reduction requires, so it just gets ample room.
+    # final gradient error (~2.5x the CG tolerance) below the gradient
+    # tolerance to certify convergence; the trust-region accuracy control only
+    # tightens as far as the predicted reduction requires, so it just gets
+    # ample room.
     cg_tol_start = (args.cg_tol_start
                     if args.cg_tol_start and args.cg_tol_start > 0 else None)
     if args.cg_tol_min is not None:
         cg_tol_min = args.cg_tol_min
+        if cg_tol_min < rtol_floor:
+            import warnings
+
+            warnings.warn(
+                f"--cg-tol-min {cg_tol_min:.1e} is below the single-"
+                f"precision solve accuracy floor (~{rtol_floor:.0e}); the "
+                "true residual cannot reach it and CG may fail",
+                RuntimeWarning,
+            )
     elif optimizer == "tr":
-        cg_tol_min = 1e-10
+        cg_tol_min = max(1e-10, rtol_floor)
     else:
-        cg_tol_min = min(args.cg_tol, args.bfgs_gtol / 3.0)
+        cg_tol_min = max(min(args.cg_tol, bfgs_gtol / 3.0), rtol_floor)
     if cg_tol_start is None and optimizer == "tr":
         # Adaptation disabled: pin the trust-region accuracy control at the
         # fixed --cg-tol (start == floor), i.e. a truly fixed tolerance.
@@ -460,7 +488,7 @@ def main():
             cg_info = f"fixed cg-rtol {fixed:.0e}"
         print(f"optimizer: {optimizer}"
               + ("  (auto)" if args.optimizer == "auto" else "")
-              + f"  {cg_info}")
+              + f"  {cg_info}  gtol {bfgs_gtol:.0e}")
 
     # Per-iteration L-BFGS history, collected across ranks with global
     # reductions so every rank holds the same series (safe to write below).
@@ -573,7 +601,7 @@ def main():
             rho0,
             comm=mpi_comm,
             maxiter=args.bfgs_maxiter,
-            gtol=args.bfgs_gtol,
+            gtol=bfgs_gtol,
             delta0=args.tr_delta0,
             delta_max=args.tr_delta_max,
             eta=args.tr_eta,
@@ -593,7 +621,7 @@ def main():
             rho0,
             comm=mpi_comm,
             maxiter=args.bfgs_maxiter,
-            gtol=args.bfgs_gtol,
+            gtol=bfgs_gtol,
             xtol=args.bfgs_xtol,
             callback=cb,
             cg_tol_start=cg_tol_start,
