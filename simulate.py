@@ -329,6 +329,15 @@ def main():
         "(default) writes only the final density as a single "
         "frame",
     )
+    p.add_argument(
+        "--no-flush",
+        action="store_true",
+        help="do not flush each frame to disk as it is written. By default "
+        "every frame is synced (muGrid FileIONetCDF.sync) so the output can "
+        "be inspected mid-run; the classic/NetCDF-4 backend otherwise "
+        "buffers frames until the file is closed (PnetCDF commits on its "
+        "own). Needs a muGrid that provides sync(); ignored otherwise",
+    )
     args = p.parse_args()
 
     dim = len(args.nb_grid_pts)
@@ -563,11 +572,21 @@ def main():
         fio.write_global_attribute("hv_cg_iters_history", [0] * maxlen)
         fio.write_global_attribute("frame_iterations", [-1] * max_frames)
 
+    # Flush each frame to disk as it is written, so the output can be
+    # inspected while the (possibly long) optimization is still running. The
+    # PnetCDF backend commits collective writes on its own; the classic /
+    # NetCDF-4 backend otherwise buffers frames until close(). sync() needs a
+    # recent enough muGrid (feature-detected on the instance); disabled with
+    # --no-flush.
+    flush_frames = (not args.no_flush) and hasattr(fio, "sync")
+
     def write_frame(it, rho):
         """Stream one density iterate (and the applied deformation gradient) to
         the output as a new frame."""
         field.p[...] = homog.to_device(rho)
         fio.append_frame().write(frame_fields)
+        if flush_frames:
+            fio.sync()
         frame_iters.append(int(it))
 
     # Initial configuration as frame 0 (only when dumping intermediate steps).
