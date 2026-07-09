@@ -5,21 +5,22 @@ metamaterials, built on [muGrid](https://github.com/muSpectre/muGrid).
 
 muTopOpt designs a periodic unit cell whose homogenized (effective) stiffness
 matches a prescribed target — e.g. a given bulk/shear modulus or a negative
-Poisson's ratio. It uses an **element-wise (per-pixel) density** with SIMP
-material interpolation, a stress-matching objective with phase-field
-regularization (no explicit volume constraint), and the **discrete adjoint
-method** for exact sensitivities. The micromechanical equilibrium and the
-adjoint problem — the two expensive parts of every optimization step — are
-solved by muGrid's matrix-free, GPU-capable, J-FFT (Green–Jacobi) preconditioned
-conjugate gradient. The method is that of Jödicke et al., *Topology optimization
-of metamaterials with FFT-accelerated micromechanical solvers*.
+Poisson's ratio. It uses a SIMP material interpolation, a stress-matching
+objective with phase-field regularization (no explicit volume constraint),
+and the discrete adjoint method for exact sensitivities. The micromechanical
+equilibrium and the adjoint problem — the two expensive parts of every
+optimization step — are solved by muGrid's matrix-free, GPU-capable, J-FFT
+(Green–Jacobi) preconditioned conjugate gradient.
 
-**Dimension-agnostic:** the same code runs 2D and 3D unit cells (a 2D cell needs
-3 independent load cases to constrain the effective stiffness, a 3D cell 6).
+See
+* J-FFT: https://arxiv.org/abs/2508.02613
+* Topology optimization: https://arxiv.org/abs/2107.04123
 
 ## Install
 
-Requires an installed `muGrid` (≥ 0.110) with FFT support, plus numpy and scipy.
+Requires an installed `muGrid` with FFT support, plus `numpy` and `scipy`.
+For GPU support, `muGrid` must be compiled with CUDA or ROCm/HIP support
+and you additionally need `cupy`.
 
 ```bash
 pip install -e ".[test]"
@@ -51,54 +52,6 @@ rho, info = optimize_lbfgs(problem, rho0, maxiter=200)
 python simulate.py -n 64 64        --target-K 0.1  --target-G 0.05 --bfgs-maxiter 200
 python simulate.py -n 96 96 96     --target-K 0.1  --target-G 0.05 --eta 2.0 --output cell.nc
 ```
-
-## Design
-
-| Piece | Where |
-|-------|-------|
-| SIMP interpolation `λ(ρ), μ(ρ)` + derivatives | `material.py` |
-| Forward/adjoint solves, homogenized stress, J-FFT precond | `homogenization.py` |
-| Stress-matching objective + adjoint sensitivity assembly | `problem.py` |
-| Phase-field regularization — element-wise (FD Laplacian) and **nodal FE** (fused scalar FE-Laplacian, P1/Q1) | `regularization.py` |
-| Load-case / target-stiffness helpers | `loadcases.py` |
-| Optimizer drivers + density initialization | `optimize.py` |
-
-The design variable `ρ` is one value per pixel (element), which maps directly to
-muGrid's per-pixel `IsotropicStiffnessOperator`; the adjoint sensitivity is the
-fused `compute_sensitivity` kernel followed by the SIMP chain rule, so no full
-stiffness tensor or strain/stress field is ever stored. Everything runs on
-muGrid fields, so with a GPU build of muGrid the solve and sensitivity are
-device-resident.
-
-The outer optimizer is **NuMPI's** bound-constrained, MPI-distributed L-BFGS
-(`l_bfgs_bounded`): the density stays in `[0, 1]` by projection, and every
-reduction is done over the same domain decomposition as the muGrid fields, so
-the optimizer runs correctly on one rank or many. (A serial SciPy L-BFGS-B path,
-`optimize_lbfgs`, is kept as a dependency-light alternative.)
-
-## Status
-
-Working and tested (see `test/`):
-
-- Exact adjoint gradient — validated against finite differences in **2D and 3D**,
-  with and without regularization, in serial and under MPI.
-- End-to-end 2D and 3D optimization reducing the objective toward the target,
-  **serial and MPI-parallel** (NuMPI bounded L-BFGS).
-- **Nodal FE phase-field** variant (`--density nodal`) with the element-consistent,
-  memory-lean fused FE-Laplacian regularization — gradient FD-validated and the
-  FE energy identity checked for P1 and Q1 in 2D and 3D.
-
-Roadmap:
-
-- **GPU end-to-end** — exercise the device path on an MI300A (fields already live
-  on muGrid collections; add a `--device gpu` wiring).
-- **FE-consistent double-well** (Phase 2) — a muGrid shape-function-value (N)
-  interpolation operator for a quadrature-consistent double-well (currently
-  lumped nodal); optionally a corner-average material map.
-- **Decomposition-invariant random init** — `initial_density(kind="random")`
-  currently draws per-rank noise, so MPI and serial runs start from different
-  fields (the `uniform` init and the gradient are decomposition-invariant).
-- Validation against published 2D auxetic designs.
 
 ## License
 
