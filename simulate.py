@@ -588,8 +588,9 @@ def main():
             K, G = effective_moduli(last["stresses"])
             rtol = last.get("cg_rtol")
             rtol_str = f"  cg-rtol={rtol:.1e}" if rtol is not None else ""
+            iter_label = "tr-iter" if optimizer == "tr" else "bfgs-iter"
             print(
-                f"  bfgs-iter {it:4d}  f={last['objective']:.6e}  "
+                f"  {iter_label} {it:4d}  f={last['objective']:.6e}  "
                 f"vol_frac={vf:.3f}  K={K:.4g} (target {target_K:.4g})  "
                 f"G={G:.4g} (target {target_G:.4g})  cg-iters={cg_total}"
                 f"{rtol_str}"
@@ -640,9 +641,10 @@ def main():
             f"G={G:.4g} (target {target_G:.4g})"
         )
         if not converged:
+            opt_name = "trust-region" if optimizer == "tr" else "L-BFGS"
             print(
-                "WARNING: L-BFGS did NOT converge; the written density is "
-                "the last (non-converged) iterate (converged=0 in the "
+                f"WARNING: {opt_name} did NOT converge; the written density "
+                "is the last (non-converged) iterate (converged=0 in the "
                 "output file)."
             )
 
