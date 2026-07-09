@@ -376,6 +376,24 @@ class Homogenization:
                 print(f"    cg-iter    0  {tag}skipped (negligible rhs, x=0)",
                       flush=True)
             return x
+        if warm_start:
+            # Guard the warm start: an initial guess left over from a previous
+            # solve (a different Steihaug direction, or -- worse -- a previous
+            # outer iterate whose material was less ill-conditioned) can be far
+            # *worse* than zero. In the high-contrast SIMP regime ``K⁻¹`` has
+            # huge norm, so a stale guess can give ``|b - K x₀| ≫ |b|``; CG then
+            # cannot recover within any iteration budget. Keep the guess only
+            # if it beats a cold start (``|b - K x₀| < |b|``), else zero it.
+            # One extra operator apply -- negligible against the CG it saves.
+            self._hessp(x, self._Ku)
+            diff = bp - self._Ku.p.ravel()
+            warm_norm = np.sqrt(self.comm.sum(float(self._xp.dot(diff, diff))))
+            if not (warm_norm < b_norm):
+                x.set_zero()
+                if verbose:
+                    print(f"    cg-iter    0  {tag}warm start rejected "
+                          f"(|r0|/|b|={warm_norm / b_norm:.2e}); cold start",
+                          flush=True)
         # Count CG iterations via the solver callback (fires once per
         # iteration). When verbose, the same callback prints one line per CG
         # iteration so the convergence of the inner solve can be watched step

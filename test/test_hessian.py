@@ -164,6 +164,32 @@ def test_warm_start_is_result_invariant(comm):
         np.testing.assert_allclose(w, c, rtol=1e-9, atol=1e-11)
 
 
+def test_warm_start_guard_survives_bad_guess(comm):
+    """A stale/garbage warm-start guess (e.g. left over from a previous outer
+    iterate with different, less ill-conditioned material) must not derail the
+    Hv solves: the guard rejects any guess that does not beat a cold start, so
+    the product still converges to the correct value in a bounded iteration
+    count. Regression for the high-contrast CG stall."""
+    n = 6
+    problem = _make_problem(2, n, comm)
+    rng = np.random.default_rng(7)
+    # A high-contrast (near-binary) design -- the regime where K^{-1} is large
+    # and a bad initial guess blows the CG residual up.
+    rho = np.clip(np.round(rng.uniform(0, 1, (n, n))), 1e-3, 1.0)
+    problem.ensure_state(rho)
+    v = rng.standard_normal((n, n))
+
+    ref = problem.hessian_vector_product(v).copy()
+
+    # Poison every warm-start field with a large stale guess, then repeat.
+    for f in problem._du_cases + problem._dadj_cases:
+        f.p[...] = problem.h.to_device(
+            1e2 * rng.standard_normal(f.p.shape))
+    poisoned = problem.hessian_vector_product(v).copy()
+
+    np.testing.assert_allclose(poisoned, ref, rtol=1e-7, atol=1e-9)
+
+
 def test_hessian_off_raises(comm):
     n = 6
     material = SimpMaterial(E_solid=1.0, nu=0.3, penalty=3.0, void_ratio=1e-2)
