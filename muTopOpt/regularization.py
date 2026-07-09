@@ -94,6 +94,28 @@ class PhaseFieldRegularization:
         )
         return self.weight * f, self.weight * g
 
+    def hessian_vector_product(self, rho, v):
+        """Return ``H_reg v`` for a density direction ``v`` (exact).
+
+        The gradient-penalty Hessian is the (constant, linear) Laplacian
+        operator; the double-well Hessian is the pointwise diagonal
+        ``W''(rho) = 2 (1 - 6 rho + 6 rho^2)`` -- note ``W''(1/2) < 0``: the
+        regularization Hessian is genuinely indefinite in the interfacial
+        region."""
+        rho = np.asarray(rho)
+        v = np.asarray(v)
+        self._rho.p[...] = self.h.to_device(v)
+        self.h.engine.communicate_ghosts(self._rho)
+        self.laplace.apply(self._rho, self._lap)  # (-Delta v)
+        lap_v = self.h.to_host(self._lap.p)
+
+        d2well = 2.0 * (1.0 - 6.0 * rho + 6.0 * rho**2)
+        hv = (
+            self.eta * 2.0 * lap_v * self.vol_pixel
+            + d2well * v * self.vol_pixel / self.eta
+        )
+        return self.weight * hv
+
 
 def fe_laplacian_stencil(dim, grid_spacing, element):
     r"""Constant-coefficient stencil of the scalar FE-Laplacian
@@ -229,3 +251,27 @@ class NodalPhaseFieldRegularization:
         f = self.eta * grad_pen + dwell / self.eta
         g = self.eta * 2.0 * Lrho + dwell_grad / self.eta
         return self.weight * f, self.weight * g
+
+    def hessian_vector_product(self, rho, v):
+        """Return ``H_reg v`` for a nodal density direction ``v``.
+
+        The gradient-penalty Hessian is the (constant, linear) FE-Laplacian
+        ``2 eta L``; the double-well Hessian uses the *lumped* pointwise
+        diagonal ``W''(rho) = 2 (1 - 6 rho + 6 rho^2)`` even when the
+        value/gradient use the consistent Galerkin quadrature -- an
+        approximate model Hessian is admissible in a trust-region method
+        (only boundedness is required) and the lumped diagonal captures the
+        sign structure (indefinite in the interface) exactly."""
+        rho = np.asarray(rho)
+        v = np.asarray(v)
+        self._rho.p[...] = self.h.to_device(v)
+        self.h.engine.communicate_ghosts(self._rho)
+        self.laplace.apply(self._rho, self._Lrho)  # L v
+        Lv = self.h.to_host(self._Lrho.p)
+
+        d2well = 2.0 * (1.0 - 6.0 * rho + 6.0 * rho**2)
+        hv = (
+            self.eta * 2.0 * Lv
+            + d2well * v * self.vol_pixel / self.eta
+        )
+        return self.weight * hv

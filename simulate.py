@@ -45,7 +45,11 @@ from muTopOpt.loadcases import (
     isotropic_stiffness_tensor,
     target_load_cases,
 )
-from muTopOpt.optimize import initial_density, optimize_bounded_lbfgs
+from muTopOpt.optimize import (
+    initial_density,
+    optimize_bounded_lbfgs,
+    optimize_trust_region,
+)
 
 
 class _HelpFormatter(
@@ -134,10 +138,47 @@ def main():
         help="random seed for the --init random/filtered_random density field",
     )
     p.add_argument(
+        "--optimizer",
+        choices=["auto", "lbfgs", "tr"],
+        default="auto",
+        help="outer optimizer: 'tr' (trust-region Newton-CG with exact "
+        "second-order-adjoint Hessian-vector products; robust against "
+        "loose inner CG tolerances, at ~2 extra solves per load case "
+        "per Hessian product; needs NuMPI with tr_newton_bounded), "
+        "'lbfgs' (bound-constrained L-BFGS), or 'auto' (tr when the "
+        "installed NuMPI supports it, else lbfgs)",
+    )
+    p.add_argument(
         "--bfgs-maxiter",
         type=int,
         default=200,
-        help="maximum number of outer L-BFGS iterations",
+        help="maximum number of outer optimizer iterations (L-BFGS or TR)",
+    )
+    p.add_argument(
+        "--tr-delta0",
+        type=float,
+        default=0.05,
+        help="initial trust-region radius, in RMS density change per pixel",
+    )
+    p.add_argument(
+        "--tr-delta-max",
+        type=float,
+        default=0.5,
+        help="maximum trust-region radius, in RMS density change per pixel",
+    )
+    p.add_argument(
+        "--tr-eta",
+        type=float,
+        default=0.1,
+        help="trust-region step acceptance threshold on ared/pred",
+    )
+    p.add_argument(
+        "--hv-cg-tol",
+        type=float,
+        default=1e-3,
+        help="relative CG tolerance of the two extra solves per "
+        "Hessian-vector product (may be loose: the Hessian only shapes "
+        "the trust-region model)",
     )
     p.add_argument(
         "--output-cg-iters",
@@ -149,8 +190,11 @@ def main():
     p.add_argument(
         "--bfgs-gtol",
         type=float,
-        default=1e-5,
-        help="L-BFGS convergence tolerance on the projected gradient",
+        default=None,
+        help="convergence tolerance on the projected gradient (L-BFGS and "
+        "TR). Default: 1e-5 in double precision, 1e-4 in single "
+        "precision (the float32 solve accuracy floor makes a tighter "
+        "gradient tolerance uncertifiable)",
     )
     p.add_argument(
         "--bfgs-xtol",
@@ -178,20 +222,29 @@ def main():
     p.add_argument(
         "--cg-tol-start",
         type=float,
-        default=None,
-        help="enable ADAPTIVE inner CG tolerance: solves start at this "
-        "(coarse) relative tolerance and tighten as the outer projected "
-        "gradient shrinks (an Eisenstat-Walker forcing term). When unset, "
-        "the fixed --cg-tol is used throughout. A typical coarse start is "
-        "1e-2",
+        default=1e-2,
+        help="adaptive inner CG tolerance (ON by default): solves start at "
+        "this (coarse) relative tolerance and tighten automatically -- "
+        "for the trust-region optimizer driven by the computable "
+        "|f_err| <= eta_f*pred accuracy condition, for L-BFGS by an "
+        "Eisenstat-Walker forcing term with a stagnation ratchet. Pass "
+        "0 (or negative) to disable adaptation and use the fixed "
+        "--cg-tol throughout",
     )
     p.add_argument(
         "--cg-tol-min",
         type=float,
         default=None,
-        help="floor for the adaptive inner tolerance (default: --cg-tol). "
-        "Must be small enough that the final gradient error is below "
-        "--bfgs-gtol, else L-BFGS cannot certify convergence",
+        help="floor for the adaptive inner tolerance. Default: "
+        "--bfgs-gtol/3 for L-BFGS (the gradient error scales like "
+        "~2.5x the CG tolerance, so this floor lets L-BFGS certify "
+        "convergence at --bfgs-gtol); 1e-10 for the trust-region "
+        "optimizer (its accuracy control only tightens as far as the "
+        "predicted reduction requires). In single precision the "
+        "default floor is clamped to 1e-6: below that the true "
+        "residual b-Kx of a float32 solve stagnates (only the "
+        "recursive CG residual keeps shrinking) and CG may fail "
+        "outright",
     )
     p.add_argument(
         "--cg-forcing-exp",
@@ -284,6 +337,58 @@ def main():
     if args.domain_lengths is not None and len(args.domain_lengths) != dim:
         p.error(f"--domain-lengths must have {dim} values (one per axis)")
 
+    # Resolve 'auto': the trust-region Newton-CG is the robust default (its
+    # acceptance test cannot drown in inner-solve noise the way a line search
+    # does), but it needs a NuMPI providing tr_newton_bounded.
+    optimizer = args.optimizer
+    if optimizer == "auto":
+        try:
+            from NuMPI.Optimization import tr_newton_bounded  # noqa: F401
+
+            optimizer = "tr"
+        except ImportError:
+            optimizer = "lbfgs"
+
+    # Precision-aware accuracy limits. In float32 the *true* residual b - Kx
+    # of the CG solve stagnates at |r|/|b| ~ 1.5e-6 (only the recursive CG
+    # residual keeps shrinking below that, and CG can fail outright), so
+    # tolerances below ~1e-6 buy no true accuracy -- and the achievable
+    # gradient accuracy (~2.5x the residual floor) makes a 1e-5 gradient
+    # tolerance uncertifiable.
+    single = args.precision == "single"
+    rtol_floor = 1e-6 if single else 0.0
+    bfgs_gtol = (args.bfgs_gtol if args.bfgs_gtol is not None
+                 else (1e-4 if single else 1e-5))
+
+    # Adaptive inner CG tolerance is on by default (<= 0 disables it: fixed
+    # --cg-tol throughout). The floor defaults per optimizer: L-BFGS needs the
+    # final gradient error (~2.5x the CG tolerance) below the gradient
+    # tolerance to certify convergence; the trust-region accuracy control only
+    # tightens as far as the predicted reduction requires, so it just gets
+    # ample room.
+    cg_tol_start = (args.cg_tol_start
+                    if args.cg_tol_start and args.cg_tol_start > 0 else None)
+    if args.cg_tol_min is not None:
+        cg_tol_min = args.cg_tol_min
+        if cg_tol_min < rtol_floor:
+            import warnings
+
+            warnings.warn(
+                f"--cg-tol-min {cg_tol_min:.1e} is below the single-"
+                f"precision solve accuracy floor (~{rtol_floor:.0e}); the "
+                "true residual cannot reach it and CG may fail",
+                RuntimeWarning,
+            )
+    elif optimizer == "tr":
+        cg_tol_min = max(1e-10, rtol_floor)
+    else:
+        cg_tol_min = max(min(args.cg_tol, bfgs_gtol / 3.0), rtol_floor)
+    if cg_tol_start is None and optimizer == "tr":
+        # Adaptation disabled: pin the trust-region accuracy control at the
+        # fixed --cg-tol (start == floor), i.e. a truly fixed tolerance.
+        cg_tol_start = args.cg_tol
+        cg_tol_min = args.cg_tol
+
     if muGrid.has_mpi:
         from mpi4py import MPI
 
@@ -352,7 +457,9 @@ def main():
         else PhaseFieldRegularization
     )
     reg = Reg(homog, eta=eta, weight=args.reg_weight)
-    problem = StressTargetProblem(homog, cases, regularization=reg, design=args.density)
+    problem = StressTargetProblem(homog, cases, regularization=reg,
+                                  design=args.density,
+                                  hessian=(optimizer == "tr"))
 
     length = args.init_length
     if args.init == "filtered_random" and length is None:
@@ -373,6 +480,15 @@ def main():
             f"load cases={len(cases)}  preconditioner={args.preconditioner}  "
             f"device={args.device}  precision={args.precision}"
         )
+        if cg_tol_start is not None and cg_tol_start > cg_tol_min:
+            cg_info = (f"adaptive cg-rtol {cg_tol_start:.0e} -> "
+                       f"{cg_tol_min:.0e}")
+        else:
+            fixed = cg_tol_start if cg_tol_start is not None else args.cg_tol
+            cg_info = f"fixed cg-rtol {fixed:.0e}"
+        print(f"optimizer: {optimizer}"
+              + ("  (auto)" if args.optimizer == "auto" else "")
+              + f"  {cg_info}  gtol {bfgs_gtol:.0e}")
 
     # Per-iteration L-BFGS history, collected across ranks with global
     # reductions so every rank holds the same series (safe to write below).
@@ -479,26 +595,40 @@ def main():
                 f"{rtol_str}"
             )
 
-    rho, info = optimize_bounded_lbfgs(
-        problem,
-        rho0,
-        comm=mpi_comm,
-        maxiter=args.bfgs_maxiter,
-        gtol=args.bfgs_gtol,
-        xtol=args.bfgs_xtol,
-        callback=cb,
-        cg_tol_start=args.cg_tol_start,
-        cg_tol_min=args.cg_tol_min,
-        cg_forcing_exp=args.cg_forcing_exp,
-        cg_stall_rel=args.cg_stall_rel,
-        cg_stall_shrink=args.cg_stall_shrink,
-    )
-    if rank0 and args.cg_tol_start is not None:
-        floor = args.cg_tol_min if args.cg_tol_min is not None else args.cg_tol
-        print(
-            f"adaptive inner CG tolerance: start {args.cg_tol_start:.1e} -> "
-            f"floor {floor:.1e} "
-            f"(forcing rtol = ||g_free||**{args.cg_forcing_exp:g})"
+    if optimizer == "tr":
+        rho, info = optimize_trust_region(
+            problem,
+            rho0,
+            comm=mpi_comm,
+            maxiter=args.bfgs_maxiter,
+            gtol=bfgs_gtol,
+            delta0=args.tr_delta0,
+            delta_max=args.tr_delta_max,
+            eta=args.tr_eta,
+            cg_tol_start=cg_tol_start,
+            cg_tol_min=cg_tol_min,
+            hv_rtol=args.hv_cg_tol,
+            callback=cb,
+        )
+        if rank0:
+            print(
+                f"trust region: {info['nb_hessp']} Hessian products, "
+                f"final state-solve rtol {info['final_cg_rtol']:.1e}"
+            )
+    else:
+        rho, info = optimize_bounded_lbfgs(
+            problem,
+            rho0,
+            comm=mpi_comm,
+            maxiter=args.bfgs_maxiter,
+            gtol=bfgs_gtol,
+            xtol=args.bfgs_xtol,
+            callback=cb,
+            cg_tol_start=cg_tol_start,
+            cg_tol_min=cg_tol_min,
+            cg_forcing_exp=args.cg_forcing_exp,
+            cg_stall_rel=args.cg_stall_rel,
+            cg_stall_shrink=args.cg_stall_shrink,
         )
 
     converged = bool(info["success"])

@@ -71,3 +71,13 @@ class SimpMaterial:
         dlam = df * (self.lam_solid - self.lam_void)
         dmu = df * (self.mu_solid - self.mu_void)
         return dlam, dmu
+
+    def d2lame(self, rho):
+        """Return the second density derivatives
+        (d^2 lambda/drho^2, d^2 mu/drho^2) -- needed for exact
+        (second-order-adjoint) Hessian-vector products."""
+        p = self.penalty
+        d2f = p * (p - 1.0) * np.power(rho, p - 2.0)
+        d2lam = d2f * (self.lam_solid - self.lam_void)
+        d2mu = d2f * (self.mu_solid - self.mu_void)
+        return d2lam, d2mu
