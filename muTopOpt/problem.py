@@ -60,9 +60,11 @@ class StressTargetProblem:
 
         ``hessian=True`` enables exact (second-order-adjoint) Hessian-vector
         products (:meth:`hessian_vector_product`, for the trust-region
-        Newton-CG optimizer). It allocates two extra vector fields *per load
-        case* -- the per-case forward and adjoint solutions must survive the
-        load-case loop -- plus a handful of scratch fields, so it is opt-in."""
+        Newton-CG optimizer). It allocates *four* vector fields per load case
+        -- the forward/adjoint solutions that must survive the load-case loop,
+        plus the sensitivity/co-state fields kept per case so the Hv solves can
+        warm-start from the previous product -- and a handful of shared scratch
+        fields, so it is opt-in."""
         self.h = homogenization
         self.dim = homogenization.dim
         self.load_cases = [self._as_case(lc) for lc in load_cases]
@@ -110,8 +112,18 @@ class StressTargetProblem:
             self._dmu_v = self.h.scalar_field("to_prob_hv_dmu")
             self._hv_rhs = self.h.vector_field("to_prob_hv_rhs")
             self._hv_tmp = self.h.vector_field("to_prob_hv_tmp")
-            self._du = self.h.vector_field("to_prob_hv_du")
-            self._dadj = self.h.vector_field("to_prob_hv_dadj")
+            # Per-case sensitivity/co-state fields. Kept per case (not shared)
+            # so each Hessian-vector product warm-starts its two solves from
+            # the same load case's previous solution -- successive Hv products
+            # (trust-region CG iterations) have a slowly-varying rhs, so the
+            # warm start cuts the CG count. Zero-initialized, so the first Hv
+            # cold-starts. (2*n_cases extra vector fields; see the docstring.)
+            self._du_cases = [
+                self.h.vector_field(f"to_prob_hv_du_case{i}")
+                for i in range(n)]
+            self._dadj_cases = [
+                self.h.vector_field(f"to_prob_hv_dadj_case{i}")
+                for i in range(n)]
         # Host-side snapshot of the last evaluation (design iterate, per-case
         # sensitivity kernels and stress data) that hessian_vector_product
         # differentiates around; None until the first evaluation.
@@ -320,8 +332,19 @@ class StressTargetProblem:
         rho_e = cache["rho_e"]
 
         v = np.asarray(v, dtype=float)
-        v_e = (self._nodal_map.gather_mean(v)
-               if self.design == "nodal" else v)
+        # The reduced Hessian is a linear operator, so H v = ||v|| * H (v/||v||)
+        # exactly. Solve for the *unit* direction and rescale: this keeps every
+        # Hv-solve right-hand side at a comparable magnitude regardless of the
+        # trust-region CG direction's scale, which (a) makes warm-starting from
+        # the previous product well-scaled and (b) makes the fixed relative CG
+        # tolerance mean the same accuracy every time.
+        vnorm = float(np.sqrt(h.comm.sum(float(np.sum(v * v)))))
+        if vnorm == 0.0:
+            self.last_hv_cg_iters = []
+            return np.zeros_like(v)
+        vhat = v / vnorm
+        v_e = (self._nodal_map.gather_mean(vhat)
+               if self.design == "nodal" else vhat)
 
         dlam, dmu = h.material.dlame(rho_e)
         d2lam, d2mu = h.material.d2lame(rho_e)
@@ -346,25 +369,29 @@ class StressTargetProblem:
         for i, lc in enumerate(self.load_cases):
             u = self._u_cases[i]
             adj = self._adj_cases[i]
+            du = self._du_cases[i]
+            dadj = self._dadj_cases[i]
             E = lc.macro_strain
             norm = float(np.sum(lc.target_stress**2))
             S = cache["S"][i]
 
-            # Forward sensitivity: K du = -(dK v) u - Bᵀ (dC v):Ē.
+            # Forward sensitivity: K du = -(dK v) u - Bᵀ (dC v):Ē. Warm-started
+            # from this case's previous product (rhs is O(1) in the unit
+            # direction, so the guess is well-scaled).
             h.engine.communicate_ghosts(u)
             h.op.apply(u, self._dlam_v, self._dmu_v, self._hv_rhs)
             h.op.apply_macro_rhs(self._dlam_v, self._dmu_v,
                                  list(E.ravel()), self._hv_tmp)
             self._hv_rhs.s[...] = -self._hv_rhs.s - self._hv_tmp.s
             scale_fwd = pert_scale * max(float(np.abs(E).max()), 1e-300)
-            h.solve_rhs(self._hv_rhs, self._du, rtol=rtol,
-                        rhs_scale=scale_fwd, label=f"case {i + 1} hv-fwd")
+            h.solve_rhs(self._hv_rhs, du, rtol=rtol, rhs_scale=scale_fwd,
+                        warm_start=True, label=f"case {i + 1} hv-fwd")
             cg_iters.append(h.last_cg_iters)
 
             # d<sigma> = (1/V)∫ (dC v):(Ē + ∇u) + (1/V)∫ C:∇du.
             dsigma = (
                 h.homogenized_stress(u, E, lam=self._dlam_v, mu=self._dmu_v)
-                + h.homogenized_stress(self._du, np.zeros((d, d)))
+                + h.homogenized_stress(du, np.zeros((d, d)))
             )
             dS = 2.0 * lc.weight * dsigma / norm
 
@@ -380,8 +407,8 @@ class StressTargetProblem:
             scale_adj = max(
                 pert_scale * float(np.abs(S / V).max()),
                 h.mat_scale * float(np.abs(dS / V).max()), 1e-300)
-            h.solve_rhs(self._hv_rhs, self._dadj, rtol=rtol,
-                        rhs_scale=scale_adj, label=f"case {i + 1} hv-adj")
+            h.solve_rhs(self._hv_rhs, dadj, rtol=rtol, rhs_scale=scale_adj,
+                        warm_start=True, label=f"case {i + 1} hv-adj")
             cg_iters.append(h.last_cg_iters)
 
             # Chain rule of grad = dC (Ē+∇u):(S/V+∇l), term by term:
@@ -389,16 +416,16 @@ class StressTargetProblem:
             hv_e += ((2.0 * d2mu * cache["g_shear"][i]
                       + d2lam * cache["g_vol"][i]) * v_e)
             # (b) state variation: dC (∇du):(S/V + ∇l);
-            h.engine.communicate_ghosts(self._du)
+            h.engine.communicate_ghosts(du)
             h.op.compute_sensitivity(
-                self._du, zero_E, adj, list((S / V).ravel()),
+                du, zero_E, adj, list((S / V).ravel()),
                 self._g_shear, self._g_vol)
             hv_e += (2.0 * dmu * h.to_host(self._g_shear.p)
                      + dlam * h.to_host(self._g_vol.p))
             # (c) costate variation: dC (Ē+∇u):(dS/V + ∇dl).
-            h.engine.communicate_ghosts(self._dadj)
+            h.engine.communicate_ghosts(dadj)
             h.op.compute_sensitivity(
-                u, list(E.ravel()), self._dadj, list((dS / V).ravel()),
+                u, list(E.ravel()), dadj, list((dS / V).ravel()),
                 self._g_shear, self._g_vol)
             hv_e += (2.0 * dmu * h.to_host(self._g_shear.p)
                      + dlam * h.to_host(self._g_vol.p))
@@ -409,8 +436,11 @@ class StressTargetProblem:
             hv = hv_e
 
         if self.regularization is not None:
+            # Also linear in the direction; evaluate on the unit direction to
+            # match hv_e, then the common vnorm rescaling below recovers H v.
             hv = hv + self.regularization.hessian_vector_product(
-                cache["rho"], v)
+                cache["rho"], vhat)
 
         self.last_hv_cg_iters = cg_iters
-        return hv
+        # Undo the unit-direction normalization: H v = ||v|| * H (v/||v||).
+        return vnorm * hv

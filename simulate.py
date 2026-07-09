@@ -493,7 +493,8 @@ def main():
     # Per-iteration L-BFGS history, collected across ranks with global
     # reductions so every rank holds the same series (safe to write below).
     n_global = comm.sum(float(rho0.size))
-    hist = {"objective": [], "volume_fraction": [], "cg_iters": []}
+    hist = {"objective": [], "volume_fraction": [], "cg_iters": [],
+            "hv_cg_iters": []}
 
     # `--dump-every N` (N>0) streams the initial density (iteration 0) and every
     # N-th iterate to the output file as successive frames; the final iterate is
@@ -557,6 +558,9 @@ def main():
         fio.write_global_attribute("lbfgs_objective_history", [0.0] * maxlen)
         fio.write_global_attribute("lbfgs_volume_fraction_history", [0.0] * maxlen)
         fio.write_global_attribute("lbfgs_cg_iters_history", [0] * maxlen)
+        # Per-iteration Hessian-vector-product CG iterations (trust region;
+        # all zero for L-BFGS) -- the dominant, otherwise-unrecorded cost.
+        fio.write_global_attribute("hv_cg_iters_history", [0] * maxlen)
         fio.write_global_attribute("frame_iterations", [-1] * max_frames)
 
     def write_frame(it, rho):
@@ -574,26 +578,34 @@ def main():
         vf = comm.sum(float(np.sum(rho))) / n_global
         cg = last.get("cg_iters", [])
         cg_total = int(sum(cg))
+        # Trust-region Hessian-vector-product CG work for this outer step
+        # (0 for L-BFGS); the state/adjoint `cg_total` above alone badly
+        # understates the trust-region cost.
+        hv_cg = int(last.get("hv_cg_iters", 0))
+        nb_hessp = int(last.get("nb_hessp", 0))
         hist["objective"].append(float(last["objective"]))
         hist["volume_fraction"].append(vf)
         hist["cg_iters"].append(cg_total)
+        hist["hv_cg_iters"].append(hv_cg)
         if dump_intermediate and it % dump_every == 0:
             write_frame(it, rho)
         if rank0:
             # Per-CG-iteration residuals are reported live during the solves
             # themselves (--output-cg-iters); here we always summarize the
             # outer step, the current effective moduli against their targets,
-            # and the total inner CG iterations it took (the same total also
-            # goes to the NetCDF history above).
+            # and the inner CG iterations it took (the same totals also go to
+            # the NetCDF history above).
             K, G = effective_moduli(last["stresses"])
             rtol = last.get("cg_rtol")
             rtol_str = f"  cg-rtol={rtol:.1e}" if rtol is not None else ""
+            hv_str = (f"  hv-cg={hv_cg} ({nb_hessp} Hv)"
+                      if nb_hessp else "")
             iter_label = "tr-iter" if optimizer == "tr" else "bfgs-iter"
             print(
                 f"  {iter_label} {it:4d}  f={last['objective']:.6e}  "
                 f"vol_frac={vf:.3f}  K={K:.4g} (target {target_K:.4g})  "
                 f"G={G:.4g} (target {target_G:.4g})  cg-iters={cg_total}"
-                f"{rtol_str}"
+                f"{hv_str}{rtol_str}"
             )
 
     if optimizer == "tr":
@@ -682,6 +694,7 @@ def main():
             upd("lbfgs_objective_history", hist["objective"])
             upd("lbfgs_volume_fraction_history", hist["volume_fraction"])
             upd("lbfgs_cg_iters_history", hist["cg_iters"])
+            upd("hv_cg_iters_history", hist["hv_cg_iters"])
         upd("frame_iterations", frame_iters)
         fio.close()
         if rank0:
