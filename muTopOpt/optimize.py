@@ -376,6 +376,12 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
     problem.inner_tolerance = controller
 
     history = []
+    # Hessian-vector-product CG work accumulated since the last accepted
+    # iterate. The Steihaug solves are the bulk of the trust-region cost but
+    # happen outside objective_and_gradient, so they are invisible to
+    # ``problem.last['cg_iters']``; tally them here and attribute them to the
+    # outer iterate whose step they computed.
+    hv_stats = {"cg": 0, "hessp": 0}
 
     def fun(x):
         return problem.objective_and_gradient(x)
@@ -384,7 +390,10 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
         # The Hessian is evaluated around the cached linearization point;
         # re-prime it if the last evaluation was a rejected trial iterate.
         problem.ensure_state(x)
-        return problem.hessian_vector_product(v, rtol=hv_rtol)
+        hv = problem.hessian_vector_product(v, rtol=hv_rtol)
+        hv_stats["cg"] += int(sum(problem.last_hv_cg_iters))
+        hv_stats["hessp"] += 1
+        return hv
 
     def fun_error():
         # Computable first-order bound on the evaluation error of the
@@ -405,6 +414,12 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
                                        min(controller.current, rtol)))
 
     def _cb(x):
+        # Attribute the Hessian-vector-product work since the last accepted
+        # iterate to this one, then reset the tally.
+        problem.last["hv_cg_iters"] = hv_stats["cg"]
+        problem.last["nb_hessp"] = hv_stats["hessp"]
+        hv_stats["cg"] = 0
+        hv_stats["hessp"] = 0
         history.append(problem.last.get("objective"))
         if callback is not None:
             callback(len(history), x, problem.last)

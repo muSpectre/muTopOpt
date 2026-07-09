@@ -335,7 +335,7 @@ class Homogenization:
         self.op.apply(u, self.lam, self.mu, Au)
 
     def solve_rhs(self, b, x, rtol=None, maxiter=None, rhs_scale=None,
-                  residual=None, label=None):
+                  residual=None, label=None, warm_start=False):
         """Solve ``K x = b`` in place; returns ``x``.
 
         A negligible right-hand side (e.g. a spatially uniform material, whose
@@ -349,8 +349,15 @@ class Homogenization:
         copied into it (used for the adjoint-corrected objective).
 
         ``label`` tags this solve in the live convergence trace emitted when
-        ``self.cg_verbose`` is set (e.g. ``"case 1 fwd"``)."""
-        x.set_zero()
+        ``self.cg_verbose`` is set (e.g. ``"case 1 fwd"``).
+
+        ``warm_start`` uses the current contents of ``x`` as the CG initial
+        guess instead of zeroing it. For a sequence of solves with the same
+        operator and slowly-varying right-hand side (e.g. the Hessian-vector
+        products across trust-region CG iterations) this cuts the iteration
+        count; the previous solution must already be in ``x``."""
+        if not warm_start:
+            x.set_zero()
         bp = b.p.ravel()
         b_norm = np.sqrt(self.comm.sum(float(self._xp.dot(bp, bp))))
         scale = rhs_scale if rhs_scale is not None else getattr(
@@ -359,7 +366,9 @@ class Homogenization:
         tag = f"{label}  " if label else ""
         if b_norm <= 1e-9 * scale:
             # Exact solution x = 0; no CG iterations performed. The residual
-            # of x = 0 is b itself (round-off-level by construction).
+            # of x = 0 is b itself (round-off-level by construction). Zero even
+            # under warm_start: a negligible rhs really does mean x = 0.
+            x.set_zero()
             if residual is not None:
                 residual.s[...] = b.s
             self.last_cg_iters = 0

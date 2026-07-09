@@ -136,6 +136,34 @@ def test_ensure_state_reprimes_after_other_evaluation(comm):
     np.testing.assert_allclose(hv_a2, hv_a, rtol=1e-12, atol=1e-14)
 
 
+def test_warm_start_is_result_invariant(comm):
+    """Warm-starting the Hv solves (reusing the previous product's solution as
+    the CG initial guess) must not change the converged result: a warm-started
+    sequence of products must match cold-started ones at tight tolerance, for
+    each of several distinct directions."""
+    n = 6
+    problem = _make_problem(2, n, comm)
+    rng = np.random.default_rng(6)
+    rho = rng.uniform(0.2, 0.8, (n, n))
+    problem.ensure_state(rho)
+    directions = [rng.standard_normal((n, n)) for _ in range(4)]
+
+    # Cold reference: zero the per-case warm fields before each product.
+    cold = []
+    for v in directions:
+        for f in problem._du_cases + problem._dadj_cases:
+            f.set_zero()
+        cold.append(problem.hessian_vector_product(v).copy())
+
+    # Warm: let the fields persist across the sequence (the production path).
+    for f in problem._du_cases + problem._dadj_cases:
+        f.set_zero()
+    warm = [problem.hessian_vector_product(v).copy() for v in directions]
+
+    for c, w in zip(cold, warm):
+        np.testing.assert_allclose(w, c, rtol=1e-9, atol=1e-11)
+
+
 def test_hessian_off_raises(comm):
     n = 6
     material = SimpMaterial(E_solid=1.0, nu=0.3, penalty=3.0, void_ratio=1e-2)
