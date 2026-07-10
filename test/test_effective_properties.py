@@ -105,7 +105,10 @@ def test_optimizer_recovers_reachable_effective_stiffness(comm):
     rho0 = initial_density(h.nb_pixels, kind="random", seed=99,
                            volume_fraction=0.5)
     f0, _ = problem.objective_and_gradient(rho0)
-    rho, info = optimize_bounded_lbfgs(problem, rho0, maxiter=300)
+    # Reachable target: drive to near-complete stationarity (the default
+    # mesh-invariant gtol is calibrated for production stopping, not for
+    # this collapse-to-zero check).
+    rho, info = optimize_bounded_lbfgs(problem, rho0, maxiter=300, gtol=0.01)
 
     C_got = effective_stiffness(h, rho)
     rel = np.linalg.norm(C_got - C_ref) / np.linalg.norm(C_ref)

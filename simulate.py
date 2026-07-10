@@ -192,9 +192,12 @@ def main():
         type=float,
         default=None,
         help="convergence tolerance on the projected gradient (L-BFGS and "
-        "TR). Default: 1e-5 in double precision, 1e-4 in single "
-        "precision (the float32 solve accuracy floor makes a tighter "
-        "gradient tolerance uncertifiable)",
+        "TR), measured on the mesh-invariant volume-fraction derivative "
+        "(V/V_pixel)*df/drho -- the same value means the same physical "
+        "stationarity at every resolution (typical initial designs start "
+        "at ~100 in these units). Default: 2.5 in double precision, 25 in "
+        "single precision (the float32 solve accuracy floor makes a "
+        "tighter gradient tolerance uncertifiable)",
     )
     p.add_argument(
         "--bfgs-xtol",
@@ -235,10 +238,11 @@ def main():
         "--cg-tol-min",
         type=float,
         default=None,
-        help="floor for the adaptive inner tolerance. Default: "
-        "--bfgs-gtol/3 for L-BFGS (the gradient error scales like "
-        "~2.5x the CG tolerance, so this floor lets L-BFGS certify "
-        "convergence at --bfgs-gtol); 1e-10 for the trust-region "
+        help="floor for the adaptive inner tolerance. Default for L-BFGS: "
+        "--bfgs-gtol/1e4, capped at --cg-tol (the mesh-invariant "
+        "gradient error stays below ~1e3 x the CG tolerance -- measured "
+        "at 32^3/64^3 with a 10x margin -- so this floor lets L-BFGS "
+        "certify convergence at --bfgs-gtol); 1e-10 for the trust-region "
         "optimizer (its accuracy control only tightens as far as the "
         "predicted reduction requires). In single precision the "
         "default floor is clamped to 1e-6: below that the true "
@@ -250,9 +254,9 @@ def main():
         "--cg-forcing-exp",
         type=float,
         default=1.0,
-        help="exponent alpha in the forcing term "
-        "rtol = c * ||g_free||**alpha (default 1.0; alpha=1 gives "
-        "rtol=O(||g||) and fast local convergence)",
+        help="exponent alpha in the relative forcing term "
+        "rtol = rtol_start * (||g_free||/||g_0||)**alpha (default 1.0; "
+        "alpha=1 gives rtol=O(||g||) and fast local convergence)",
     )
     p.add_argument(
         "--cg-stall-shrink",
@@ -361,20 +365,32 @@ def main():
     # Precision-aware accuracy limits. In float32 the *true* residual b - Kx
     # of the CG solve stagnates at |r|/|b| ~ 1.5e-6 (only the recursive CG
     # residual keeps shrinking below that, and CG can fail outright), so
-    # tolerances below ~1e-6 buy no true accuracy -- and the achievable
-    # gradient accuracy (~2.5x the residual floor) makes a 1e-5 gradient
-    # tolerance uncertifiable.
+    # tolerances below ~1e-6 buy no true accuracy.
+    #
+    # The gradient tolerance is measured on the mesh-invariant volume-fraction
+    # derivative ĝ = (V/V_pixel) df/drho (see muTopOpt.optimize.
+    # _gradient_scale) -- the raw per-pixel gradient shrinks like 1/N with
+    # resolution, so an absolute per-pixel gtol falsely certified untouched
+    # initial designs as converged on fine grids. Typical initial designs
+    # start at ||ĝ||_inf ~ O(100); the defaults reproduce the pre-scaling
+    # 64^3 behavior (1e-4 per-pixel * 64^3 ~ 26) at every resolution. The
+    # single-precision default stays 10x coarser: the achievable ĝ accuracy
+    # at the float32 residual floor makes a tighter tolerance uncertifiable.
     single = args.precision == "single"
     rtol_floor = 1e-6 if single else 0.0
     bfgs_gtol = (args.bfgs_gtol if args.bfgs_gtol is not None
-                 else (1e-4 if single else 1e-5))
+                 else (25.0 if single else 2.5))
 
     # Adaptive inner CG tolerance is on by default (<= 0 disables it: fixed
     # --cg-tol throughout). The floor defaults per optimizer: L-BFGS needs the
-    # final gradient error (~2.5x the CG tolerance) below the gradient
-    # tolerance to certify convergence; the trust-region accuracy control only
-    # tightens as far as the predicted reduction requires, so it just gets
-    # ample room.
+    # final gradient error below the gradient tolerance to certify
+    # convergence -- in the mesh-invariant ĝ units the error is bounded by
+    # ~1e3 x the CG tolerance (measured at 32^3/64^3 on the initial iterate;
+    # _KAPPA_EFF below includes a 10x margin for late high-contrast designs),
+    # so the floor is bfgs_gtol/_KAPPA_EFF, capped at the fixed --cg-tol. The
+    # trust-region accuracy control only tightens as far as the predicted
+    # reduction requires, so it just gets ample room.
+    _KAPPA_EFF = 1e4  # mesh-invariant gradient error per unit CG rtol
     cg_tol_start = (args.cg_tol_start
                     if args.cg_tol_start and args.cg_tol_start > 0 else None)
     if args.cg_tol_min is not None:
@@ -391,7 +407,7 @@ def main():
     elif optimizer == "tr":
         cg_tol_min = max(1e-10, rtol_floor)
     else:
-        cg_tol_min = max(min(args.cg_tol, bfgs_gtol / 3.0), rtol_floor)
+        cg_tol_min = max(min(args.cg_tol, bfgs_gtol / _KAPPA_EFF), rtol_floor)
     if cg_tol_start is None and optimizer == "tr":
         # Adaptation disabled: pin the trust-region accuracy control at the
         # fixed --cg-tol (start == floor), i.e. a truly fixed tolerance.
@@ -497,7 +513,7 @@ def main():
             cg_info = f"fixed cg-rtol {fixed:.0e}"
         print(f"optimizer: {optimizer}"
               + ("  (auto)" if args.optimizer == "auto" else "")
-              + f"  {cg_info}  gtol {bfgs_gtol:.0e}")
+              + f"  {cg_info}  gtol {bfgs_gtol:.3g}")
 
     # Per-iteration L-BFGS history, collected across ranks with global
     # reductions so every rank holds the same series (safe to write below).

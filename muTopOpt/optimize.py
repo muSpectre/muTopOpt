@@ -24,6 +24,26 @@ with ``rho`` shaped like :attr:`Homogenization.nb_pixels`.
 import numpy as np
 
 
+def _gradient_scale(problem):
+    """``V_e/V``: converts a *mesh-invariant* ``gtol`` -- measured on the
+    volume-fraction derivative ``ĝ = (V/V_e) ∂f/∂ρ``, i.e. the derivative of
+    the objective with respect to a density perturbation occupying a unit
+    *fraction* of the cell -- to the raw per-variable gradient the inner
+    optimizer (NuMPI/SciPy) compares against.
+
+    The objective matches *volume-averaged* stresses, so a single design
+    variable's gradient entry is ``O(V_e/V) = O(1/N)``: an absolute per-pixel
+    ``gtol`` would mean a different physical stationarity at every resolution
+    (and falsely certify convergence of the untouched initial design on fine
+    grids). Both the element and the nodal design have one variable per pixel
+    of the periodic grid, so one scale covers both. MPI-safe: ``grid_spacing``
+    and ``domain_volume`` are global quantities, identical on every rank."""
+    h = getattr(problem, "h", None)
+    if h is None:
+        return 1.0
+    return float(np.prod(h.grid_spacing)) / h.domain_volume  # = 1/N_global
+
+
 class AdaptiveInnerTolerance:
     """Eisenstat--Walker-style *forcing term* coupling the inner CG tolerance
     to the outer optimizer's stationarity, with a stagnation ratchet.
@@ -36,8 +56,15 @@ class AdaptiveInnerTolerance:
     * **Forcing term.** While the box-KKT-masked gradient ``||g_free||`` (the
       infinity norm; the same stationarity measure ``l_bfgs_bounded`` converges
       on, see NuMPI ``_kkt_residual``) is *decreasing*, the tolerance tracks
-      ``clip(c * ||g_free||^alpha, rtol_min, rtol_start)`` -- coarse while far
-      from a stationary point (no oversolving), tightening as it approaches.
+      ``clip(c * rtol_start * (||g_free|| / ||g_0||)^alpha, rtol_min,
+      rtol_start)`` with ``||g_0||`` the first observed gradient norm
+      (Eisenstat--Walker "choice 2") -- coarse while far from a stationary
+      point (no oversolving), tightening proportionally as it approaches.
+      The *relative* form makes the coupling independent of the units (and
+      hence the mesh resolution) of the reported gradient norm: an absolute
+      term ``c * ||g_free||^alpha`` compared a mesh-dependent per-pixel
+      gradient against mesh-independent tolerances and over-tightened
+      immediately on fine grids.
 
     * **Stagnation ratchet.** If ``||g_free||`` fails to decrease by at least
       ``stall_rel`` (relative) versus the best value seen, the outer optimizer
@@ -87,6 +114,9 @@ class AdaptiveInnerTolerance:
         self.bounds = bounds
         self.current = float(rtol_start)
         self._latest_gnorm = None
+        # First observed ||g_free||: the reference of the relative forcing
+        # term. Fixed by the first observe(), i.e. the initial iterate.
+        self._g_first = None
         # Smallest ||g_free|| seen so far; a new gradient must beat this (by
         # stall_rel) to count as progress. +inf so the first iterate always
         # registers as progress.
@@ -101,6 +131,8 @@ class AdaptiveInnerTolerance:
         trials); it only stores the value -- :attr:`current` is untouched until
         :meth:`advance`."""
         self._latest_gnorm = float(gnorm)
+        if self._g_first is None:
+            self._g_first = self._latest_gnorm
 
     def advance(self):
         """Retune :attr:`current` from the last observed gradient norm.
@@ -112,9 +144,14 @@ class AdaptiveInnerTolerance:
             return self.current
         g = self._latest_gnorm
         if g < (1.0 - self.stall_rel) * self._best_gnorm:
-            # Genuine progress: let the forcing term set the target.
+            # Genuine progress: let the (relative) forcing term set the
+            # target -- units of the observed norm cancel in g / g_first.
             self._best_gnorm = g
-            target = self.c * g ** self.alpha
+            if self._g_first > 0.0:
+                target = (self.c * self.rtol_start
+                          * (g / self._g_first) ** self.alpha)
+            else:
+                target = self.rtol_min
             target = min(self.rtol_start, max(self.rtol_min, target))
             stalled = False
         else:
@@ -225,7 +262,7 @@ def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
     raise ValueError(f"unknown initial-density kind '{kind}'")
 
 
-def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
+def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
                            ftol=0.0, xtol=0.0, bounds=(0.0, 1.0), maxcor=10,
                            callback=None, cg_tol_start=None, cg_tol_min=None,
                            cg_forcing_c=1.0, cg_forcing_exp=1.0,
@@ -235,6 +272,13 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
 
     Parameters
     ----------
+    gtol : float, optional
+        Convergence tolerance on the infinity norm of the box-projected
+        gradient, measured on the *mesh-invariant* volume-fraction derivative
+        ``ĝ = (V/V_e) ∂f/∂ρ`` (see :func:`_gradient_scale`; typical initial
+        designs start at ``||ĝ||_inf ~ O(100)``), so the same value means the
+        same physical stationarity at every resolution. ``info['max_grad']``
+        is reported in the same units.
     comm : mpi4py.MPI.Comm, optional
         The communicator over which the density is distributed (the *same*
         decomposition as the muGrid fields, typically ``MPI.COMM_WORLD``).
@@ -250,9 +294,10 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
         ``cg_tol``. Must be small enough that the final gradient error is below
         ``gtol`` (the norm condition), or convergence cannot be certified.
     cg_forcing_c, cg_forcing_exp : float, optional
-        Coefficient ``c`` and exponent ``alpha`` in
-        ``rtol = c * ||g_free||**alpha`` (defaults 1.0, 1.0). ``alpha=1`` gives
-        ``rtol = O(||g||)`` and fast local convergence.
+        Coefficient ``c`` and exponent ``alpha`` in the relative forcing term
+        ``rtol = c * rtol_start * (||g_free|| / ||g_0||)**alpha`` (defaults
+        1.0, 1.0). ``alpha=1`` gives ``rtol = O(||g||)`` and fast local
+        convergence.
     cg_stall_rel, cg_stall_shrink : float, optional
         Stagnation ratchet (see :class:`AdaptiveInnerTolerance`): when the
         projected gradient fails to decrease by at least ``cg_stall_rel``
@@ -284,18 +329,21 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
         if callback is not None:
             callback(len(history), x, problem.last)
 
+    # NuMPI compares the raw per-variable gradient; gtol/max_grad are in
+    # mesh-invariant ĝ units (see _gradient_scale).
+    gscale = _gradient_scale(problem)
     res = l_bfgs_bounded(
         fun, np.asarray(rho0, dtype=float), jac=None,
         bounds_lo=bounds[0], bounds_hi=bounds[1],
-        gtol=gtol, ftol=ftol, xtol=xtol, maxiter=maxiter, maxcor=maxcor,
-        comm=comm, callback=_cb,
+        gtol=gtol * gscale, ftol=ftol, xtol=xtol, maxiter=maxiter,
+        maxcor=maxcor, comm=comm, callback=_cb,
     )
     info = {
         "success": bool(res.success),
         "message": res.message,
         "nit": int(res.nit),
         "objective": float(res.fun),
-        "max_grad": float(res.get("max_grad", np.nan)),
+        "max_grad": float(res.get("max_grad", np.nan)) / gscale,
         "history": history,
         "cg_rtol_history": (inner_tol.history if inner_tol is not None
                             else None),
@@ -303,7 +351,7 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
     return np.asarray(res.x), info
 
 
-def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
+def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
                           bounds=(0.0, 1.0), delta0=0.05, delta_max=0.5,
                           eta=0.1, eta_f=0.25, cg_tol_start=None,
                           cg_tol_min=1e-10, hv_rtol=1e-3, callback=None,
@@ -332,6 +380,10 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
 
     Parameters
     ----------
+    gtol : float, optional
+        Convergence tolerance on the box-projected gradient, in the same
+        mesh-invariant units as :func:`optimize_bounded_lbfgs` (the
+        volume-fraction derivative ``ĝ = (V/V_e) ∂f/∂ρ``).
     comm : mpi4py.MPI.Comm, optional
         Communicator of the domain decomposition (as for
         :func:`optimize_bounded_lbfgs`).
@@ -424,10 +476,13 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
         if callback is not None:
             callback(len(history), x, problem.last)
 
+    # NuMPI compares the raw per-variable gradient; gtol/max_grad are in
+    # mesh-invariant ĝ units (see _gradient_scale).
+    gscale = _gradient_scale(problem)
     res = tr_newton_bounded(
         fun, np.asarray(rho0, dtype=float), hessp, jac=None,
         bounds_lo=bounds[0], bounds_hi=bounds[1],
-        gtol=gtol, maxiter=maxiter,
+        gtol=gtol * gscale, maxiter=maxiter,
         delta0=delta0, delta_max=delta_max, eta=eta,
         fun_error=fun_error, request_accuracy=request_accuracy, eta_f=eta_f,
         comm=comm, callback=_cb, disp=disp,
@@ -437,7 +492,7 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
         "message": res.message,
         "nit": int(res.nit),
         "objective": float(res.fun),
-        "max_grad": float(res.get("max_grad", np.nan)),
+        "max_grad": float(res.get("max_grad", np.nan)) / gscale,
         "history": history,
         "nb_hessp": int(res.get("nb_hessp", 0)),
         "delta_history": res.get("delta_history"),
@@ -447,12 +502,16 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=1e-5,
     return np.asarray(res.x), info
 
 
-def optimize_lbfgs(problem, rho0, maxiter=200, gtol=1e-5, ftol=1e-9,
+def optimize_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=1e-9,
                    bounds=(0.0, 1.0), callback=None, cg_tol_start=None,
                    cg_tol_min=None, cg_forcing_c=1.0, cg_forcing_exp=1.0,
                    cg_stall_rel=1e-2, cg_stall_shrink=0.3):
     """Minimize ``problem`` from ``rho0`` with L-BFGS-B. Returns
     ``(rho_opt, info)``.
+
+    ``gtol`` is in the same mesh-invariant units as
+    :func:`optimize_bounded_lbfgs` (the volume-fraction derivative
+    ``ĝ = (V/V_e) ∂f/∂ρ``).
 
     ``cg_tol_start`` (and the other ``cg_*`` arguments) enable the same
     adaptive inner CG tolerance as :func:`optimize_bounded_lbfgs`; see
@@ -476,11 +535,14 @@ def optimize_lbfgs(problem, rho0, maxiter=200, gtol=1e-5, ftol=1e-9,
         if callback is not None:
             callback(len(history), xk.reshape(shape), problem.last)
 
+    # SciPy's pgtol compares the raw per-variable gradient; gtol is in
+    # mesh-invariant ĝ units (see _gradient_scale).
     res = minimize(
         fun, np.asarray(rho0, dtype=float).ravel(),
         jac=True, method="L-BFGS-B",
         bounds=[bounds] * int(np.prod(shape)),
-        options={"maxiter": maxiter, "gtol": gtol, "ftol": ftol},
+        options={"maxiter": maxiter, "gtol": gtol * _gradient_scale(problem),
+                 "ftol": ftol},
         callback=_cb,
     )
     info = {

@@ -86,6 +86,14 @@ class StressTargetProblem:
         # and each evaluation reports its box-KKT gradient norm back to the
         # controller. Attached by the optimizer drivers; ``None`` = fixed tol.
         self.inner_tolerance = None
+        # Mesh-invariant gradient scale V/V_e (= the global pixel count):
+        # stationarity norms are reported on the volume-fraction derivative
+        # ĝ = (V/V_e) ∂f/∂ρ, whose magnitude does not depend on the grid
+        # resolution (the raw per-pixel gradient is O(V_e/V)). Matches the
+        # units of the optimizer drivers' gtol (muTopOpt.optimize.
+        # _gradient_scale is the reciprocal).
+        self._gnorm_scale = (homogenization.domain_volume
+                             / float(np.prod(homogenization.grid_spacing)))
 
         # Per-load-case solver fields, reused across iterations.
         self._u = self.h.vector_field("to_prob_u")
@@ -261,7 +269,11 @@ class StressTargetProblem:
             if hi is not None:
                 r[(rho >= hi - tol_box) & (grad <= 0.0)] = 0.0
             local = float(r.max()) if r.size else 0.0
-            gnorm = float(h.comm.max(local))
+            # Reported in mesh-invariant ĝ units (see _gnorm_scale) so the
+            # controller history is human-readable and consistent with the
+            # drivers' gtol/max_grad; the relative forcing term itself is
+            # unit-agnostic.
+            gnorm = float(h.comm.max(local)) * self._gnorm_scale
             self.inner_tolerance.observe(gnorm)
 
         self.last = {"objective": f, "stresses": stresses,

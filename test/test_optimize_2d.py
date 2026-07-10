@@ -5,6 +5,7 @@ exercises the serial and (under mpirun) the parallel optimizer.
 """
 
 import numpy as np
+import pytest
 
 from muTopOpt import Homogenization, PhaseFieldRegularization, SimpMaterial, \
     StressTargetProblem
@@ -19,6 +20,43 @@ def _mpi_comm():
         return MPI.COMM_WORLD if MPI.COMM_WORLD.size > 1 else None
     except ImportError:
         return None
+
+
+def test_mesh_invariant_gradient_norm(comm):
+    """The convergence criterion is mesh-independent: ``info['max_grad']`` is
+    measured on the volume-fraction derivative ``ĝ = (V/V_e) ∂f/∂ρ``, so the
+    *same* continuum design reports the *same* stationarity norm at every
+    resolution -- one gtol means one physical stopping point. (The raw
+    per-pixel gradient is O(1/N); an absolute per-pixel gtol falsely
+    certified untouched initial designs as converged on fine grids.)"""
+    max_grads = []
+    for n in (8, 16):
+        material = SimpMaterial(
+            E_solid=1.0, nu=0.3, penalty=3.0, void_ratio=1e-3)
+        homog = Homogenization((n, n), material, comm=comm, cg_tol=1e-10)
+        cases = target_load_cases(
+            2, isotropic_stiffness_tensor(2, K=0.08, G=0.03), magnitude=0.01)
+        # Fixed physical interface width: the same continuum regularization
+        # at both resolutions (the eta default is one grid spacing, which
+        # would change the continuum problem between grids).
+        reg = PhaseFieldRegularization(homog, eta=0.25)
+        problem = StressTargetProblem(homog, cases, regularization=reg)
+        # A uniform density is the same continuum design on every grid (its
+        # element average and homogenized response are resolution-exact).
+        rho0 = initial_density(
+            homog.nb_pixels, kind="uniform", volume_fraction=0.5)
+        # A gtol far above any gradient makes the optimizer certify
+        # convergence immediately and report the *initial* norm.
+        _, info = optimize_bounded_lbfgs(
+            problem, rho0, comm=_mpi_comm(), maxiter=1, gtol=1e9)
+        assert info["nit"] == 0
+        max_grads.append(info["max_grad"])
+    # Same design, same norm -- across a 4x change in pixel count (per-pixel
+    # inf-norms would differ by that factor).
+    assert max_grads[0] == pytest.approx(max_grads[1], rel=1e-3)
+    # O(1) scale: the volume-fraction derivative of an O(1) objective, not a
+    # per-pixel O(1/N) entry.
+    assert max_grads[0] > 1e-2
 
 
 def test_lbfgs_reduces_objective_2d(comm):

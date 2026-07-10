@@ -35,8 +35,8 @@ def _mpi_comm():
 
 
 def test_controller_clips_and_freezes():
-    """The forcing term clips to [rtol_min, rtol_start], only moves on
-    advance() (observe() alone must not change the live tolerance), and is
+    """The relative forcing term clips to [rtol_min, rtol_start], only moves
+    on advance() (observe() alone must not change the live tolerance), and is
     monotone (never loosens once tightened)."""
     c = AdaptiveInnerTolerance(rtol_start=1e-1, rtol_min=1e-6, c=1.0, alpha=1.0)
     assert c.current == 1e-1
@@ -44,13 +44,16 @@ def test_controller_clips_and_freezes():
     # advance() before any observe() is a no-op.
     assert c.advance() == 1e-1
 
-    # A large gradient clamps to the coarse start (never oversolve early).
+    # The first observed gradient is the reference g_0 of the relative
+    # forcing term: the first iterate starts at the coarse rtol_start
+    # regardless of the gradient's units/magnitude (never oversolve early).
     c.observe(0.5)
     assert c.advance() == pytest.approx(1e-1)
 
-    # A decreasing (progressing) gradient maps through the forcing term.
+    # A decreasing (progressing) gradient maps through the relative forcing
+    # term rtol_start * (g / g_0)**alpha.
     c.observe(1e-3)
-    assert c.advance() == pytest.approx(1e-3)
+    assert c.advance() == pytest.approx(1e-1 * 1e-3 / 0.5)
 
     # A tiny gradient clamps to the floor.
     c.observe(1e-9)
