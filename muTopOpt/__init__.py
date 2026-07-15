@@ -38,6 +38,7 @@ from .regularization import (
     PhaseFieldRegularization,
     fe_laplacian_stencil,
 )
+from .timing import timer
 
 __all__ = [
     "Homogenization",
@@ -53,4 +54,5 @@ __all__ = [
     "fe_laplacian_stencil",
     "effective_stiffness",
     "isotropic_moduli_2d",
+    "timer",
 ]

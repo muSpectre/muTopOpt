@@ -28,6 +28,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .timing import timer
+
 
 @dataclass
 class LoadCase:
@@ -158,6 +160,10 @@ class StressTargetProblem:
         """Return (f, df/drho) for a density array of shape
         :attr:`Homogenization.nb_pixels` (element-wise or nodal, per the
         ``design`` chosen at construction)."""
+        with timer("objective_and_gradient"):
+            return self._objective_and_gradient(rho)
+
+    def _objective_and_gradient(self, rho):
         rho = np.asarray(rho, dtype=float)
         h = self.h
         V = h.domain_volume
@@ -188,11 +194,12 @@ class StressTargetProblem:
             norm = float(np.sum(lc.target_stress**2))
             # Forward equilibrium. With Hessian support the solution must
             # survive the loop (one field per case).
-            u = h.solve_macro(
-                lc.macro_strain,
-                self._u_cases[i] if self.hessian else self._u, rtol=rtol,
-                residual=self._res_u if self.consistent_objective else None,
-                label=f"case {i + 1} fwd")
+            with timer("forward solve"):
+                u = h.solve_macro(
+                    lc.macro_strain,
+                    self._u_cases[i] if self.hessian else self._u, rtol=rtol,
+                    residual=self._res_u if self.consistent_objective else None,
+                    label=f"case {i + 1} fwd")
             cg_iters.append(h.last_cg_iters)
             sigma = h.homogenized_stress(u, lc.macro_strain)
             stresses.append(sigma)
@@ -203,10 +210,12 @@ class StressTargetProblem:
             S = 2.0 * lc.weight * diff / norm
             h.macro_rhs_tensor(S, self._adj_rhs, scale=-1.0 / V)
             adj_scale = h.mat_scale * max(float(np.abs(S / V).max()), 1e-300)
-            adj = h.solve_rhs(self._adj_rhs,
-                              self._adj_cases[i] if self.hessian
-                              else self._adj, rtol=rtol,
-                              rhs_scale=adj_scale, label=f"case {i + 1} adj")
+            with timer("adjoint solve"):
+                adj = h.solve_rhs(self._adj_rhs,
+                                  self._adj_cases[i] if self.hessian
+                                  else self._adj, rtol=rtol,
+                                  rhs_scale=adj_scale,
+                                  label=f"case {i + 1} adj")
             cg_iters.append(h.last_cg_iters)
 
             if self.consistent_objective:
@@ -225,14 +234,15 @@ class StressTargetProblem:
             # Sensitivity: geometry contractions with total forward strain
             # (macro Ē) and total costate strain (fluctuation adj + macro S/V);
             # the S/V macro folds in the explicit d<sigma>/drho term.
-            h.op.compute_sensitivity(
-                u, list(lc.macro_strain.ravel()),
-                adj, list((S / V).ravel()),
-                self._g_shear, self._g_vol,
-            )
-            g_shear = h.to_host(self._g_shear.p)
-            g_vol = h.to_host(self._g_vol.p)
-            grad += 2.0 * dmu * g_shear + dlam * g_vol
+            with timer("sensitivity"):
+                h.op.compute_sensitivity(
+                    u, list(lc.macro_strain.ravel()),
+                    adj, list((S / V).ravel()),
+                    self._g_shear, self._g_vol,
+                )
+                g_shear = h.to_host(self._g_shear.p)
+                g_vol = h.to_host(self._g_vol.p)
+                grad += 2.0 * dmu * g_shear + dlam * g_vol
 
             if self.hessian:
                 # Snapshot the per-case kernels and adjoint source for the
@@ -258,7 +268,8 @@ class StressTargetProblem:
         if self.regularization is not None:
             # The regularization acts on the design variables themselves
             # (nodal for the nodal design).
-            f_reg, g_reg = self.regularization.value_and_gradient(rho)
+            with timer("regularization"):
+                f_reg, g_reg = self.regularization.value_and_gradient(rho)
             f += f_reg
             grad += g_reg
 
@@ -342,6 +353,10 @@ class StressTargetProblem:
         Note ``W''`` of the double-well makes ``H`` genuinely indefinite --
         intended for optimizers that exploit negative curvature (Steihaug).
         """
+        with timer("hessian_vector_product"):
+            return self._hessian_vector_product(v, rtol=rtol)
+
+    def _hessian_vector_product(self, v, rtol=None):
         if self._cache is None:
             raise RuntimeError(
                 "no cached linearization point; call ensure_state(rho) or "
@@ -399,14 +414,15 @@ class StressTargetProblem:
             # Forward sensitivity: K du = -(dK v) u - Bᵀ (dC v):Ē. Warm-started
             # from this case's previous product (rhs is O(1) in the unit
             # direction, so the guess is well-scaled).
-            h.engine.communicate_ghosts(u)
-            h.op.apply(u, self._dlam_v, self._dmu_v, self._hv_rhs)
-            h.op.apply_macro_rhs(self._dlam_v, self._dmu_v,
-                                 list(E.ravel()), self._hv_tmp)
-            self._hv_rhs.s[...] = -self._hv_rhs.s - self._hv_tmp.s
-            scale_fwd = pert_scale * max(float(np.abs(E).max()), 1e-300)
-            h.solve_rhs(self._hv_rhs, du, rtol=rtol, rhs_scale=scale_fwd,
-                        warm_start=True, label=f"case {i + 1} hv-fwd")
+            with timer("hv forward solve"):
+                h.engine.communicate_ghosts(u)
+                h.op.apply(u, self._dlam_v, self._dmu_v, self._hv_rhs)
+                h.op.apply_macro_rhs(self._dlam_v, self._dmu_v,
+                                     list(E.ravel()), self._hv_tmp)
+                self._hv_rhs.s[...] = -self._hv_rhs.s - self._hv_tmp.s
+                scale_fwd = pert_scale * max(float(np.abs(E).max()), 1e-300)
+                h.solve_rhs(self._hv_rhs, du, rtol=rtol, rhs_scale=scale_fwd,
+                            warm_start=True, label=f"case {i + 1} hv-fwd")
             cg_iters.append(h.last_cg_iters)
 
             # d<sigma> = (1/V)∫ (dC v):(Ē + ∇u) + (1/V)∫ C:∇du.
@@ -418,38 +434,42 @@ class StressTargetProblem:
 
             # Second adjoint:
             # K dl = -(dK v) l - (1/V) Bᵀ [(dC v):S + C:dS].
-            h.engine.communicate_ghosts(adj)
-            h.op.apply(adj, self._dlam_v, self._dmu_v, self._hv_rhs)
-            h.op.apply_macro_rhs(self._dlam_v, self._dmu_v,
-                                 list(S.ravel()), self._hv_tmp)
-            self._hv_rhs.s[...] = -self._hv_rhs.s - self._hv_tmp.s / V
-            h.op.apply_macro_rhs(h.lam, h.mu, list(dS.ravel()), self._hv_tmp)
-            self._hv_rhs.s[...] -= self._hv_tmp.s / V
-            scale_adj = max(
-                pert_scale * float(np.abs(S / V).max()),
-                h.mat_scale * float(np.abs(dS / V).max()), 1e-300)
-            h.solve_rhs(self._hv_rhs, dadj, rtol=rtol, rhs_scale=scale_adj,
-                        warm_start=True, label=f"case {i + 1} hv-adj")
+            with timer("hv adjoint solve"):
+                h.engine.communicate_ghosts(adj)
+                h.op.apply(adj, self._dlam_v, self._dmu_v, self._hv_rhs)
+                h.op.apply_macro_rhs(self._dlam_v, self._dmu_v,
+                                     list(S.ravel()), self._hv_tmp)
+                self._hv_rhs.s[...] = -self._hv_rhs.s - self._hv_tmp.s / V
+                h.op.apply_macro_rhs(h.lam, h.mu, list(dS.ravel()),
+                                     self._hv_tmp)
+                self._hv_rhs.s[...] -= self._hv_tmp.s / V
+                scale_adj = max(
+                    pert_scale * float(np.abs(S / V).max()),
+                    h.mat_scale * float(np.abs(dS / V).max()), 1e-300)
+                h.solve_rhs(self._hv_rhs, dadj, rtol=rtol,
+                            rhs_scale=scale_adj, warm_start=True,
+                            label=f"case {i + 1} hv-adj")
             cg_iters.append(h.last_cg_iters)
 
             # Chain rule of grad = dC (Ē+∇u):(S/V+∇l), term by term:
-            # (a) second material derivative, with the cached kernels;
-            hv_e += ((2.0 * d2mu * cache["g_shear"][i]
-                      + d2lam * cache["g_vol"][i]) * v_e)
-            # (b) state variation: dC (∇du):(S/V + ∇l);
-            h.engine.communicate_ghosts(du)
-            h.op.compute_sensitivity(
-                du, zero_E, adj, list((S / V).ravel()),
-                self._g_shear, self._g_vol)
-            hv_e += (2.0 * dmu * h.to_host(self._g_shear.p)
-                     + dlam * h.to_host(self._g_vol.p))
-            # (c) costate variation: dC (Ē+∇u):(dS/V + ∇dl).
-            h.engine.communicate_ghosts(dadj)
-            h.op.compute_sensitivity(
-                u, list(E.ravel()), dadj, list((dS / V).ravel()),
-                self._g_shear, self._g_vol)
-            hv_e += (2.0 * dmu * h.to_host(self._g_shear.p)
-                     + dlam * h.to_host(self._g_vol.p))
+            with timer("hv sensitivity"):
+                # (a) second material derivative, with the cached kernels;
+                hv_e += ((2.0 * d2mu * cache["g_shear"][i]
+                          + d2lam * cache["g_vol"][i]) * v_e)
+                # (b) state variation: dC (∇du):(S/V + ∇l);
+                h.engine.communicate_ghosts(du)
+                h.op.compute_sensitivity(
+                    du, zero_E, adj, list((S / V).ravel()),
+                    self._g_shear, self._g_vol)
+                hv_e += (2.0 * dmu * h.to_host(self._g_shear.p)
+                         + dlam * h.to_host(self._g_vol.p))
+                # (c) costate variation: dC (Ē+∇u):(dS/V + ∇dl).
+                h.engine.communicate_ghosts(dadj)
+                h.op.compute_sensitivity(
+                    u, list(E.ravel()), dadj, list((dS / V).ravel()),
+                    self._g_shear, self._g_vol)
+                hv_e += (2.0 * dmu * h.to_host(self._g_shear.p)
+                         + dlam * h.to_host(self._g_vol.p))
 
         if self.design == "nodal":
             hv = self._nodal_map.scatter_mean(hv_e)
@@ -459,8 +479,9 @@ class StressTargetProblem:
         if self.regularization is not None:
             # Also linear in the direction; evaluate on the unit direction to
             # match hv_e, then the common vnorm rescaling below recovers H v.
-            hv = hv + self.regularization.hessian_vector_product(
-                cache["rho"], vhat)
+            with timer("regularization"):
+                hv = hv + self.regularization.hessian_vector_product(
+                    cache["rho"], vhat)
 
         self.last_hv_cg_iters = cg_iters
         # Undo the unit-direction normalization: H v = ||v|| * H (v/||v||).

@@ -30,6 +30,7 @@ import argparse
 import os
 import shlex
 import sys
+import time
 
 import muGrid
 import numpy as np
@@ -54,6 +55,7 @@ from muTopOpt.optimize import (
     optimize_trust_region,
 )
 from muTopOpt.restart import INITIAL_DENSITY_KINDS, restart_density
+from muTopOpt.timing import timer
 
 
 class _HelpFormatter(
@@ -437,19 +439,20 @@ def main():
     material = SimpMaterial(args.solid_E, args.solid_nu, args.penalty, args.void_ratio)
     # CLI exposes "single"/"double"; muTopOpt works in NumPy dtypes internally.
     dtype = {"single": np.float32, "double": np.float64}[args.precision]
-    homog = Homogenization(
-        tuple(args.nb_grid_pts),
-        material,
-        comm=comm,
-        element=args.element,
-        domain_lengths=args.domain_lengths,
-        preconditioner=args.preconditioner,
-        cg_tol=args.cg_tol,
-        cg_maxiter=args.cg_maxiter,
-        cg_verbose=args.output_cg_iters,
-        device=args.device,
-        dtype=dtype,
-    )
+    with timer("setup"):
+        homog = Homogenization(
+            tuple(args.nb_grid_pts),
+            material,
+            comm=comm,
+            element=args.element,
+            domain_lengths=args.domain_lengths,
+            preconditioner=args.preconditioner,
+            cg_tol=args.cg_tol,
+            cg_maxiter=args.cg_maxiter,
+            cg_verbose=args.output_cg_iters,
+            device=args.device,
+            dtype=dtype,
+        )
     if (args.target_E is None) != (args.target_nu is None):
         p.error("--target-E and --target-nu must be given together")
     if args.target_E is not None:
@@ -498,29 +501,32 @@ def main():
         if args.density == "nodal"
         else PhaseFieldRegularization
     )
-    reg = Reg(homog, eta=eta, weight=args.reg_weight)
-    problem = StressTargetProblem(homog, cases, regularization=reg,
-                                  design=args.density,
-                                  hessian=(optimizer == "tr"))
+    with timer("setup"):
+        reg = Reg(homog, eta=eta, weight=args.reg_weight)
+        problem = StressTargetProblem(homog, cases, regularization=reg,
+                                      design=args.density,
+                                      hessian=(optimizer == "tr"))
 
     if args.init in INITIAL_DENSITY_KINDS:
         length = args.init_length
         if args.init == "filtered_random" and length is None:
             length = 3.0 * reg.eta
-        rho0 = initial_density(
-            homog.nb_pixels,
-            kind=args.init,
-            volume_fraction=args.init_volume_fraction,
-            seed=args.seed,
-            length=length,
-            grid_spacing=homog.grid_spacing,
-        )
+        with timer("initial density"):
+            rho0 = initial_density(
+                homog.nb_pixels,
+                kind=args.init,
+                volume_fraction=args.init_volume_fraction,
+                seed=args.seed,
+                length=length,
+                grid_spacing=homog.grid_spacing,
+            )
     else:
         # Restart from the last frame of a previous run (every rank reads the
         # global field through muGrid; Fourier-resampled if the grids differ),
         # then slice out this rank's subdomain.
-        rho0_global, restart_meta = restart_density(
-            args.init, args.nb_grid_pts)
+        with timer("initial density"):
+            rho0_global, restart_meta = restart_density(
+                args.init, args.nb_grid_pts)
         if rank0:
             src_grid = restart_meta["nb_grid_pts"]
             resample_str = (
@@ -661,11 +667,12 @@ def main():
     def write_frame(it, rho):
         """Stream one density iterate (and the applied deformation gradient) to
         the output as a new frame."""
-        field.p[...] = homog.to_device(rho)
-        fio.append_frame().write(frame_fields)
-        if flush_frames:
-            fio.sync()
-        frame_iters.append(int(it))
+        with timer("file output"):
+            field.p[...] = homog.to_device(rho)
+            fio.append_frame().write(frame_fields)
+            if flush_frames:
+                fio.sync()
+            frame_iters.append(int(it))
 
     # Initial configuration as frame 0 (only when dumping intermediate steps).
     if dump_intermediate:
@@ -676,7 +683,15 @@ def main():
     # run; the callback reports the per-outer-iterate delta.
     stall_seen = [0]
 
+    # Wall-clock reference of the per-iteration timing printed with each outer
+    # iterate; reset right before the optimizer starts.
+    t_iter = [time.perf_counter()]
+
     def cb(it, rho, last):
+        # Wall time of this outer iterate: everything since the previous
+        # callback (line search / trust-region solves, frame dump, ...).
+        now = time.perf_counter()
+        dt, t_iter[0] = now - t_iter[0], now
         vf = comm.sum(float(np.sum(rho))) / n_global
         cg = last.get("cg_iters", [])
         cg_total = int(sum(cg))
@@ -715,43 +730,45 @@ def main():
                 f"G={G:.4g} (target {target_G:.4g})  "
                 f"E={E:.4g} (target {target_E:.4g})  "
                 f"nu={nu:.4g} (target {target_nu:.4g})  cg-iters={cg_total}"
-                f"{hv_str}{rtol_str}"
+                f"{hv_str}{rtol_str}  t={dt:.2f}s"
             )
 
-    if optimizer == "tr":
-        rho, info = optimize_trust_region(
-            problem,
-            rho0,
-            comm=mpi_comm,
-            maxiter=args.bfgs_maxiter,
-            gtol=bfgs_gtol,
-            delta0=args.tr_delta0,
-            delta_max=args.tr_delta_max,
-            eta=args.tr_eta,
-            cg_tol_start=cg_tol_start,
-            cg_tol_min=cg_tol_min,
-            hv_rtol=args.hv_cg_tol,
-            callback=cb,
-        )
-        if rank0:
-            print(
-                f"trust region: {info['nb_hessp']} Hessian products, "
-                f"final state-solve rtol {info['final_cg_rtol']:.1e}"
+    t_iter[0] = time.perf_counter()
+    with timer("optimization"):
+        if optimizer == "tr":
+            rho, info = optimize_trust_region(
+                problem,
+                rho0,
+                comm=mpi_comm,
+                maxiter=args.bfgs_maxiter,
+                gtol=bfgs_gtol,
+                delta0=args.tr_delta0,
+                delta_max=args.tr_delta_max,
+                eta=args.tr_eta,
+                cg_tol_start=cg_tol_start,
+                cg_tol_min=cg_tol_min,
+                hv_rtol=args.hv_cg_tol,
+                callback=cb,
             )
-    else:
-        rho, info = optimize_bounded_lbfgs(
-            problem,
-            rho0,
-            comm=mpi_comm,
-            maxiter=args.bfgs_maxiter,
-            gtol=bfgs_gtol,
-            xtol=args.bfgs_xtol,
-            callback=cb,
-            cg_tol_start=cg_tol_start,
-            cg_tol_min=cg_tol_min,
-            cg_forcing_exp=args.cg_forcing_exp,
-            cg_stall_rel=args.cg_stall_rel,
-            cg_stall_shrink=args.cg_stall_shrink,
+        else:
+            rho, info = optimize_bounded_lbfgs(
+                problem,
+                rho0,
+                comm=mpi_comm,
+                maxiter=args.bfgs_maxiter,
+                gtol=bfgs_gtol,
+                xtol=args.bfgs_xtol,
+                callback=cb,
+                cg_tol_start=cg_tol_start,
+                cg_tol_min=cg_tol_min,
+                cg_forcing_exp=args.cg_forcing_exp,
+                cg_stall_rel=args.cg_stall_rel,
+                cg_stall_shrink=args.cg_stall_shrink,
+            )
+    if optimizer == "tr" and rank0:
+        print(
+            f"trust region: {info['nb_hessp']} Hessian products, "
+            f"final state-solve rtol {info['final_cg_rtol']:.1e}"
         )
 
     converged = bool(info["success"])
@@ -798,23 +815,28 @@ def main():
         def upd(name, value):
             fio.update_global_attribute(name, name, value)
 
-        upd("converged", [int(converged)])
-        upd("optimizer_message", str(info["message"])[:_MSG_LEN])
-        upd("nb_iterations", [int(info["nit"])])
-        upd("final_objective", [float(info["objective"])])
-        upd("final_max_gradient", [float(info["max_grad"])])
-        if hist["objective"]:
-            upd("lbfgs_objective_history", hist["objective"])
-            upd("lbfgs_volume_fraction_history", hist["volume_fraction"])
-            upd("lbfgs_cg_iters_history", hist["cg_iters"])
-            upd("hv_cg_iters_history", hist["hv_cg_iters"])
-        upd("frame_iterations", frame_iters)
-        fio.close()
+        with timer("file output"):
+            upd("converged", [int(converged)])
+            upd("optimizer_message", str(info["message"])[:_MSG_LEN])
+            upd("nb_iterations", [int(info["nit"])])
+            upd("final_objective", [float(info["objective"])])
+            upd("final_max_gradient", [float(info["max_grad"])])
+            if hist["objective"]:
+                upd("lbfgs_objective_history", hist["objective"])
+                upd("lbfgs_volume_fraction_history", hist["volume_fraction"])
+                upd("lbfgs_cg_iters_history", hist["cg_iters"])
+                upd("hv_cg_iters_history", hist["hv_cg_iters"])
+            upd("frame_iterations", frame_iters)
+            fio.close()
         if rank0:
             print(
                 f"wrote {args.output} ({len(frame_iters)} frame(s), "
                 f"converged={int(converged)})"
             )
+
+    # Full hierarchical timing breakdown. Collective when parallel: every rank
+    # participates in the gather, rank 0 prints a single min/mean/max summary.
+    timer.print_summary(title="muTopOpt timing summary", comm=comm)
 
 
 if __name__ == "__main__":

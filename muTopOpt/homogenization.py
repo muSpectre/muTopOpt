@@ -35,6 +35,7 @@ from muGrid.Preconditioners import (
 from muGrid.Solvers import ConvergenceError, conjugate_gradients
 
 from .material import SimpMaterial
+from .timing import timer
 
 # muGrid's ``conjugate_gradients`` gained an optional ``residual`` out-field
 # (the final r = b - Kx, needed for the adjoint-corrected objective) after
@@ -312,16 +313,19 @@ class Homogenization:
     def set_density(self, rho):
         """Interpolate rho -> (lambda, mu), fill ghosts, and (re)build/refresh
         the preconditioner. ``rho`` has shape :attr:`nb_pixels`."""
-        lam, mu = self.material.lame(np.asarray(rho))
-        self.lam.p[...] = self.to_device(lam)
-        self.mu.p[...] = self.to_device(mu)
-        self.engine.communicate_ghosts(self.lam)
-        self.engine.communicate_ghosts(self.mu)
-        # Stiffness scale (max |λ|, |2μ|), reduced across ranks, used to detect a
-        # negligible (round-off-only) right-hand side.
-        local = max(float(np.abs(lam).max()), float(2.0 * np.abs(mu).max()))
-        self._mat_scale = self.comm.max(local)
-        self._update_preconditioner()
+        with timer("set_density"):
+            lam, mu = self.material.lame(np.asarray(rho))
+            self.lam.p[...] = self.to_device(lam)
+            self.mu.p[...] = self.to_device(mu)
+            self.engine.communicate_ghosts(self.lam)
+            self.engine.communicate_ghosts(self.mu)
+            # Stiffness scale (max |λ|, |2μ|), reduced across ranks, used to
+            # detect a negligible (round-off-only) right-hand side.
+            local = max(float(np.abs(lam).max()),
+                        float(2.0 * np.abs(mu).max()))
+            self._mat_scale = self.comm.max(local)
+            with timer("preconditioner"):
+                self._update_preconditioner()
 
     def _reference_lame(self):
         # Global (MPI-reduced) means -> a rank-consistent reference material.

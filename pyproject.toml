@@ -18,6 +18,7 @@ dependencies = [
     # >= 0.112.0 for the dtype-threaded preconditioner factories, which let a
     # float32 Homogenization run the whole solve in single precision.
     "muGrid>=0.112.0",
+    "muTimer",
     "NuMPI",
 ]
 
