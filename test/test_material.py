@@ -1,8 +1,15 @@
 """Unit tests for the SIMP material interpolation and its derivatives."""
 
 import numpy as np
+import pytest
 
-from muTopOpt import SimpMaterial, lame_from_E_nu
+from muTopOpt import SimpMaterial, E_nu_from_lame, lame_from_E_nu
+
+
+@pytest.mark.parametrize("E,nu", [(1.0, 0.3), (0.5, 0.1), (2.3, 0.45)])
+def test_E_nu_lame_roundtrip(E, nu):
+    np.testing.assert_allclose(
+        E_nu_from_lame(*lame_from_E_nu(E, nu)), [E, nu], rtol=1e-12)
 
 
 def test_endpoints():

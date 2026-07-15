@@ -58,6 +58,15 @@ class StressTargetProblem:
         the correction vanishes; with it, loose inner tolerances (e.g.
         ``cg_tol ~ 1e-3``) suffice for clean L-BFGS line searches.
 
+        Caveat: the remaining ``O(rtol²)`` evaluation error means reported
+        values computed at *different* inner tolerances are not directly
+        comparable -- when an adaptive controller tightens the tolerance
+        between outer iterates, the reported objective can appear to
+        increase by up to the old tolerance's evaluation error (bounded by
+        ``sum(|last['corrections']|)``) even though the true objective
+        decreased. Compare values across iterates at equal ``cg_rtol`` only
+        (both are recorded in :attr:`last`).
+
         ``hessian=True`` enables exact (second-order-adjoint) Hessian-vector
         products (:meth:`hessian_vector_product`, for the trust-region
         Newton-CG optimizer). It allocates *four* vector fields per load case

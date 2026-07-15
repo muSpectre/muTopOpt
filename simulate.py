@@ -27,6 +27,7 @@ currently serial.
 """
 
 import argparse
+import os
 import shlex
 import sys
 
@@ -34,12 +35,14 @@ import muGrid
 import numpy as np
 
 from muTopOpt import (
+    E_nu_from_lame,
     Homogenization,
     NodalPhaseFieldRegularization,
     PhaseFieldRegularization,
     SimpMaterial,
     StressTargetProblem,
 )
+from muTopOpt.bounds import target_feasibility
 from muTopOpt.loadcases import (
     isotropic_stiffness_from_E_nu,
     isotropic_stiffness_tensor,
@@ -50,6 +53,7 @@ from muTopOpt.optimize import (
     optimize_bounded_lbfgs,
     optimize_trust_region,
 )
+from muTopOpt.restart import INITIAL_DENSITY_KINDS, restart_density
 
 
 class _HelpFormatter(
@@ -119,11 +123,13 @@ def main():
     )
     p.add_argument(
         "--init",
-        choices=["uniform", "random", "filtered_random"],
         default="filtered_random",
+        metavar="KIND_OR_FILE",
         help="initial density field: 'uniform' (constant), 'random' "
-        "(white noise) or 'filtered_random' (noise smoothed to a correlation "
-        "length; least prone to locking the initial topology)",
+        "(white noise), 'filtered_random' (noise smoothed to a correlation "
+        "length; least prone to locking the initial topology), or the NetCDF "
+        "output of a previous run to restart from its last frame (Fourier-"
+        "resampled if the stored grid does not match -n)",
     )
     p.add_argument(
         "--init-length",
@@ -349,6 +355,10 @@ def main():
         p.error("-n takes 2 or 3 values")
     if args.domain_lengths is not None and len(args.domain_lengths) != dim:
         p.error(f"--domain-lengths must have {dim} values (one per axis)")
+    if args.init not in INITIAL_DENSITY_KINDS and not os.path.exists(args.init):
+        p.error(
+            f"--init must be one of {', '.join(INITIAL_DENSITY_KINDS)} or an "
+            f"existing NetCDF restart file; '{args.init}' is neither")
 
     # Resolve 'auto': the trust-region Newton-CG is the robust default (its
     # acceptance test cannot drown in inner-solve noise the way a line search
@@ -471,7 +481,14 @@ def main():
             shear.append(float(stresses[k][ij]) / strain_magnitude)
         return K, float(np.mean(shear))
 
+    # Young's modulus and Poisson's ratio equivalent to (K, G) in the same
+    # convention (K = lambda + 2 mu / dim, G = mu; plane-strain in 2D, so these
+    # are the true 3D constants, matching --target-E/--target-nu).
+    def E_nu_from_K_G(K, G):
+        return E_nu_from_lame(K - 2.0 * G / dim, G)
+
     target_K, target_G = effective_moduli([lc.target_stress for lc in cases])
+    target_E, target_nu = E_nu_from_K_G(target_K, target_G)
     # The interface width defaults to two grid spacings: wide enough that the
     # regularization can move interfaces (merge/remove features) instead of
     # freezing the initial topology, narrow enough for crisp designs.
@@ -486,17 +503,43 @@ def main():
                                   design=args.density,
                                   hessian=(optimizer == "tr"))
 
-    length = args.init_length
-    if args.init == "filtered_random" and length is None:
-        length = 3.0 * reg.eta
-    rho0 = initial_density(
-        homog.nb_pixels,
-        kind=args.init,
-        volume_fraction=args.init_volume_fraction,
-        seed=args.seed,
-        length=length,
-        grid_spacing=homog.grid_spacing,
-    )
+    if args.init in INITIAL_DENSITY_KINDS:
+        length = args.init_length
+        if args.init == "filtered_random" and length is None:
+            length = 3.0 * reg.eta
+        rho0 = initial_density(
+            homog.nb_pixels,
+            kind=args.init,
+            volume_fraction=args.init_volume_fraction,
+            seed=args.seed,
+            length=length,
+            grid_spacing=homog.grid_spacing,
+        )
+    else:
+        # Restart from the last frame of a previous run (every rank reads the
+        # global field through muGrid; Fourier-resampled if the grids differ),
+        # then slice out this rank's subdomain.
+        rho0_global, restart_meta = restart_density(
+            args.init, args.nb_grid_pts)
+        if rank0:
+            src_grid = restart_meta["nb_grid_pts"]
+            resample_str = (
+                f", Fourier-resampled {tuple(src_grid)} -> "
+                f"{tuple(args.nb_grid_pts)}"
+                if restart_meta["resampled"] else "")
+            print(f"init: last frame of {args.init}{resample_str}")
+            if (restart_meta["domain_lengths"] is not None
+                    and not np.allclose(restart_meta["domain_lengths"],
+                                        homog.domain_lengths)):
+                print(
+                    f"WARNING: restart file has domain lengths "
+                    f"{restart_meta['domain_lengths']}, this run uses "
+                    f"{homog.domain_lengths}; the design is stretched onto "
+                    "the new cell")
+        rho0 = rho0_global[
+            tuple(slice(lo, lo + n) for lo, n in
+                  zip(homog.engine.subdomain_locations, homog.nb_pixels))
+        ].copy()
 
     print(muGrid.version_string(communicator=homog.comm, device=homog.device))
     if rank0:
@@ -514,6 +557,16 @@ def main():
         print(f"optimizer: {optimizer}"
               + ("  (auto)" if args.optimizer == "auto" else "")
               + f"  {cg_info}  gtol {bfgs_gtol:.3g}")
+        feas = target_feasibility(dim, target_K, target_G,
+                                  args.solid_E, args.solid_nu)
+        if np.isfinite(feas["phi_min"]):
+            print(f"target: K={target_K:.4g}  G={target_G:.4g}  "
+                  f"E={target_E:.4g}  nu={target_nu:.4g}  ->  "
+                  f"min solid fraction {feas['phi_min']:.2f} "
+                  f"(Hashin-Shtrikman: K {feas['phi_hs_K']:.2f}, "
+                  f"G {feas['phi_hs_G']:.2f}; Voigt: {feas['phi_voigt']:.2f})")
+        for msg in feas["warnings"]:
+            print(f"WARNING: {msg}")
 
     # Per-iteration L-BFGS history, collected across ranks with global
     # reductions so every rank holds the same series (safe to write below).
@@ -564,6 +617,15 @@ def main():
         fio.write_global_attribute(
             "domain_lengths", [float(x) for x in homog.domain_lengths]
         )
+        # Grid shape and scalar precision of the stored density. Both are
+        # needed to *read* the file back (muGrid must register a field of the
+        # stored shape and dtype before it can read, and its Python API cannot
+        # inquire them from the file), so `--init <file>` restarts rely on
+        # these; see muTopOpt.restart.
+        fio.write_global_attribute(
+            "nb_grid_pts", [int(n) for n in args.nb_grid_pts]
+        )
+        fio.write_global_attribute("precision", args.precision)
         # Full invocation that produced this file, quoted so it can be pasted
         # back into a shell to reproduce the run. Known up front, so written
         # with its final value here (no placeholder/update). `sys.argv` is
@@ -609,10 +671,17 @@ def main():
     if dump_intermediate:
         write_frame(0, rho0)
 
+    # Inner solves cut short by the CG stagnation safeguard (see
+    # Homogenization.solve_rhs): `cg_stagnation_count` accumulates over the
+    # run; the callback reports the per-outer-iterate delta.
+    stall_seen = [0]
+
     def cb(it, rho, last):
         vf = comm.sum(float(np.sum(rho))) / n_global
         cg = last.get("cg_iters", [])
         cg_total = int(sum(cg))
+        stalled = homog.cg_stagnation_count - stall_seen[0]
+        stall_seen[0] = homog.cg_stagnation_count
         # Trust-region Hessian-vector-product CG work for this outer step
         # (0 for L-BFGS); the state/adjoint `cg_total` above alone badly
         # understates the trust-region cost.
@@ -631,15 +700,21 @@ def main():
             # and the inner CG iterations it took (the same totals also go to
             # the NetCDF history above).
             K, G = effective_moduli(last["stresses"])
+            E, nu = E_nu_from_K_G(K, G)
             rtol = last.get("cg_rtol")
             rtol_str = f"  cg-rtol={rtol:.1e}" if rtol is not None else ""
+            # Solves that hit their finite-precision floor and returned a
+            # best-effort iterate this outer step (0 = all solves converged).
+            rtol_str += f"  cg-stalled={stalled}" if stalled else ""
             hv_str = (f"  hv-cg={hv_cg} ({nb_hessp} Hv)"
                       if nb_hessp else "")
             iter_label = "tr-iter" if optimizer == "tr" else "bfgs-iter"
             print(
                 f"  {iter_label} {it:4d}  f={last['objective']:.6e}  "
                 f"vol_frac={vf:.3f}  K={K:.4g} (target {target_K:.4g})  "
-                f"G={G:.4g} (target {target_G:.4g})  cg-iters={cg_total}"
+                f"G={G:.4g} (target {target_G:.4g})  "
+                f"E={E:.4g} (target {target_E:.4g})  "
+                f"nu={nu:.4g} (target {target_nu:.4g})  cg-iters={cg_total}"
                 f"{hv_str}{rtol_str}"
             )
 
@@ -682,10 +757,13 @@ def main():
     converged = bool(info["success"])
     if rank0:
         K, G = effective_moduli(problem.last["stresses"])
+        E, nu = E_nu_from_K_G(K, G)
         print(
             f"done: {info['message']}  f={info['objective']:.6e}  "
             f"iters={info['nit']}  K={K:.4g} (target {target_K:.4g})  "
-            f"G={G:.4g} (target {target_G:.4g})"
+            f"G={G:.4g} (target {target_G:.4g})  "
+            f"E={E:.4g} (target {target_E:.4g})  "
+            f"nu={nu:.4g} (target {target_nu:.4g})"
         )
         if not converged:
             opt_name = "trust-region" if optimizer == "tr" else "L-BFGS"

@@ -29,7 +29,7 @@ Typical use::
 __version__ = "0.0.1"
 
 from .homogenization import Homogenization
-from .material import SimpMaterial, lame_from_E_nu
+from .material import SimpMaterial, E_nu_from_lame, lame_from_E_nu
 from .nodal import ConsistentDoubleWell, NodalElementMap
 from .problem import LoadCase, StressTargetProblem
 from .properties import effective_stiffness, isotropic_moduli_2d
@@ -43,6 +43,7 @@ __all__ = [
     "Homogenization",
     "SimpMaterial",
     "lame_from_E_nu",
+    "E_nu_from_lame",
     "LoadCase",
     "StressTargetProblem",
     "PhaseFieldRegularization",

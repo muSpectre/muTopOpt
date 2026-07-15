@@ -34,6 +34,16 @@ def lame_from_E_nu(E, nu):
     return lam, mu
 
 
+def E_nu_from_lame(lam, mu):
+    """Young's modulus and Poisson's ratio (E, nu) from the Lamé parameters --
+    the inverse of :func:`lame_from_E_nu`, in the same plane-strain / 3D
+    convention (in 2D these are the true 3D constants of the plane-strain
+    material, not the directional in-plane values)."""
+    E = mu * (3.0 * lam + 2.0 * mu) / (lam + mu)
+    nu = lam / (2.0 * (lam + mu))
+    return E, nu
+
+
 class SimpMaterial:
     """Power-law (SIMP) interpolation of isotropic Lamé parameters.
 

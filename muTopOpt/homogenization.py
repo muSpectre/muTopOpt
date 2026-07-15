@@ -32,7 +32,7 @@ from muGrid.Preconditioners import (
     make_green_jacobi_preconditioner,
     make_reference_stiffness_preconditioner,
 )
-from muGrid.Solvers import conjugate_gradients
+from muGrid.Solvers import ConvergenceError, conjugate_gradients
 
 from .material import SimpMaterial
 
@@ -44,6 +44,13 @@ import inspect as _inspect
 
 _CG_HAS_RESIDUAL = "residual" in _inspect.signature(
     conjugate_gradients).parameters
+
+
+class _CGStagnation(Exception):
+    """Internal control flow of :meth:`Homogenization.solve_rhs`: raised from
+    the CG iteration callback when the solve has stopped making progress (the
+    finite-precision residual floor), so the solve can be cut short and the
+    best iterate returned instead of burning the full iteration budget."""
 
 
 def _local_rank(comm):
@@ -240,6 +247,36 @@ class Homogenization:
         self.preconditioner_kind = preconditioner
         self.cg_tol = cg_tol
         self.cg_maxiter = cg_maxiter
+        # Stagnation safeguard of the CG solves (see solve_rhs): a solve whose
+        # residual has not improved by at least `cg_stagnation_rel` (relative)
+        # within the last `cg_stagnation_patience` iterations has hit its
+        # finite-precision floor (or is diverging from it -- float32 CG on a
+        # round-off-level rhs can blow the residual up by orders of magnitude
+        # before the iteration cap); it is aborted and the best iterate seen so
+        # far is returned, with the true residual recomputed. Preconditioned
+        # solves here converge in O(100) iterations, so 100 dead iterations
+        # reliably means the floor, not a plateau.
+        #
+        # A *cold-started* solve that has never improved on its initial
+        # residual |b| is aborted much sooner -- after
+        # `cg_no_progress_patience` iterations, or immediately once the
+        # residual diverges `cg_divergence_factor`x (in the norm) above it.
+        # That is the signature of a round-off-level rhs (float32 above all):
+        # the very first CG step is rounding garbage (|r| jumps by ~1e6 on a
+        # semi-definite operator) and the solve never gets back below |b|, so
+        # waiting out the full patience wastes ~100 iterations per solve --
+        # and the correct answer at that precision is x = 0 anyway. A healthy
+        # cold-started solve improves on |b| within the first few iterations;
+        # warm-started solves are exempt (a good initial guess makes early
+        # residual excursions above the small r0 legitimate).
+        self.cg_stagnation_patience = 100
+        self.cg_stagnation_rel = 1e-2
+        self.cg_no_progress_patience = 25
+        self.cg_divergence_factor = 1e3
+        # Number of solves cut short by the safeguard (diagnostic).
+        self.cg_stagnation_count = 0
+        self._x_best = self.fc.real_field(
+            "to_cg_best", (self.dim,), dtype=self.dtype)
         # When True, print a live per-CG-iteration residual on rank 0 during
         # every solve, so convergence can be watched as it happens (opt-in;
         # verbose over a full optimization). See ``solve_rhs``.
@@ -355,7 +392,17 @@ class Homogenization:
         guess instead of zeroing it. For a sequence of solves with the same
         operator and slowly-varying right-hand side (e.g. the Hessian-vector
         products across trust-region CG iterations) this cuts the iteration
-        count; the previous solution must already be in ``x``."""
+        count; the previous solution must already be in ``x``.
+
+        This method never raises on non-convergence. A solve that stagnates
+        (no relative residual improvement of :attr:`cg_stagnation_rel` within
+        :attr:`cg_stagnation_patience` iterations -- the finite-precision
+        residual floor), hits the iteration cap, or breaks down returns the
+        *best iterate* seen, with its true residual ``b - K x`` recomputed
+        (and never worse than the zero solution). The callers tolerate a
+        less-accurate solve: the consistent objective is second-order in the
+        state-solve residual and reports the remaining error, and the
+        trust-region model only needs a bounded Hessian-vector product."""
         if not warm_start:
             x.set_zero()
         bp = b.p.ravel()
@@ -364,7 +411,13 @@ class Homogenization:
             self, "_mat_scale", 1.0)
         verbose = self.cg_verbose and self.comm.rank == 0
         tag = f"{label}  " if label else ""
-        if b_norm <= 1e-9 * scale:
+        # Negligible-rhs threshold, relative to the natural force scale of this
+        # solve. The historic 1e-9 is calibrated for float64; in float32 the
+        # assembly round-off alone is ~eps*scale ~ 1e-7*scale, so a rhs below a
+        # few eps is indistinguishable from noise (and CG on pure noise
+        # diverges -- the operator is only semi-definite for void_ratio=0).
+        negligible = max(1e-9, 10.0 * float(np.finfo(self.dtype).eps)) * scale
+        if b_norm <= negligible:
             # Exact solution x = 0; no CG iterations performed. The residual
             # of x = 0 is b itself (round-off-level by construction). Zero even
             # under warm_start: a negligible rhs really does mean x = 0.
@@ -376,6 +429,7 @@ class Homogenization:
                 print(f"    cg-iter    0  {tag}skipped (negligible rhs, x=0)",
                       flush=True)
             return x
+        cold_start = True
         if warm_start:
             # Guard the warm start: an initial guess left over from a previous
             # solve (a different Steihaug direction, or -- worse -- a previous
@@ -394,33 +448,106 @@ class Homogenization:
                     print(f"    cg-iter    0  {tag}warm start rejected "
                           f"(|r0|/|b|={warm_norm / b_norm:.2e}); cold start",
                           flush=True)
+            else:
+                cold_start = False
         # Count CG iterations via the solver callback (fires once per
         # iteration). When verbose, the same callback prints one line per CG
         # iteration so the convergence of the inner solve can be watched step
         # by step. ``rr`` is the globally reduced squared residual ||r||^2; CG
         # converges at ||r|| <= rtol*||b||.
+        #
+        # The callback doubles as the stagnation safeguard: it snapshots the
+        # best iterate seen so far and aborts the solve (via _CGStagnation)
+        # once the residual has not beaten the reference by at least
+        # ``cg_stagnation_rel`` for ``cg_stagnation_patience`` consecutive
+        # iterations. In finite precision -- float32 above all -- the *true*
+        # residual has a floor; past it the recursive CG residual stagnates or
+        # diverges (on a round-off-level rhs it can grow by orders of
+        # magnitude), and without the safeguard the solve burns its full
+        # iteration budget and raises. ``guard['best']``/``guard['ref']`` are
+        # squared norms; ``rel`` compares in the norm, hence the square.
         counter = {"n": 0}
         rtol_eff = self.cg_tol if rtol is None else rtol
+        stall = (1.0 - self.cg_stagnation_rel) ** 2
+        diverge = self.cg_divergence_factor ** 2
+        guard = {"best": np.inf, "best_iter": 0, "ref": np.inf, "ref_iter": 0,
+                 "saved": False}
 
         def _count(iteration, state):
             counter["n"] += 1
+            rr = float(state["rr"])
             if verbose:
-                res = np.sqrt(float(state["rr"]))
+                res = np.sqrt(rr)
                 rel = res / b_norm if b_norm > 0 else 0.0
                 print(f"    cg-iter {iteration:4d}  {tag}|r|={res:.3e}  "
                       f"|r|/|b|={rel:.2e}  (rtol={rtol_eff:.1e})", flush=True)
+            if rr < guard["best"]:
+                guard["best"] = rr
+                guard["best_iter"] = iteration
+                self._x_best.s[...] = x.s
+                guard["saved"] = True
+            elif cold_start and guard["best_iter"] == 0 and (
+                    iteration >= self.cg_no_progress_patience
+                    or rr > diverge * guard["best"]):
+                # A cold start that has never improved on |r0| = |b|: the rhs
+                # is round-off noise and the solve cannot progress. Only ever
+                # fires on cold starts -- a warm start's small r0 makes early
+                # excursions above it legitimate.
+                raise _CGStagnation()
+            if rr < stall * guard["ref"]:
+                guard["ref"] = rr
+                guard["ref_iter"] = iteration
+            elif iteration - guard["ref_iter"] >= self.cg_stagnation_patience:
+                raise _CGStagnation()
 
         cg_kwargs = {}
         if residual is not None and _CG_HAS_RESIDUAL:
             cg_kwargs["residual"] = residual
-        conjugate_gradients(
-            self.comm, self.fc, b, x,
-            hessp=self._hessp, prec=self._prec,
-            rtol=rtol_eff,
-            maxiter=self.cg_maxiter if maxiter is None else maxiter,
-            callback=_count,
-            **cg_kwargs,
-        )
+        try:
+            conjugate_gradients(
+                self.comm, self.fc, b, x,
+                hessp=self._hessp, prec=self._prec,
+                rtol=rtol_eff,
+                maxiter=self.cg_maxiter if maxiter is None else maxiter,
+                callback=_count,
+                **cg_kwargs,
+            )
+        except (_CGStagnation, ConvergenceError) as err:
+            # Truncated solve (stagnation, iteration cap, or NaN breakdown):
+            # fall back to the best iterate instead of failing the whole
+            # optimization. The callers tolerate a solve that is merely less
+            # accurate than requested -- the consistent (Lagrangian) objective
+            # is second-order in the state-solve residual and reports the
+            # remaining error through `corrections`, and the trust-region
+            # model only needs a bounded Hessian-vector product -- whereas a
+            # raised ConvergenceError kills the run.
+            if not guard["saved"]:
+                raise  # NaN before the first callback; nothing to salvage
+            x.s[...] = self._x_best.s
+            # True (non-recursive) residual of the returned iterate; the best
+            # recursive rr can be far below it past the precision floor.
+            self._hessp(x, self._Ku)
+            self._Ku.s[...] = b.s - self._Ku.s
+            rp = self._Ku.p.ravel()
+            true_norm = np.sqrt(self.comm.sum(float(self._xp.dot(rp, rp))))
+            if not (true_norm < b_norm):
+                # Worse than doing nothing: the zero solution (residual b) is
+                # the safest answer for a rhs this close to round-off.
+                x.set_zero()
+                self._Ku.s[...] = b.s
+                true_norm = b_norm
+            if residual is not None:
+                residual.s[...] = self._Ku.s
+            self.last_cg_iters = counter["n"]
+            self.cg_stagnation_count += 1
+            if verbose:
+                why = ("stagnated" if isinstance(err, _CGStagnation)
+                       else str(err))
+                print(f"    cg {tag}{why} after {counter['n']} iterations; "
+                      f"accepted best iterate at |r|/|b|="
+                      f"{true_norm / b_norm:.2e} (target {rtol_eff:.1e})",
+                      flush=True)
+            return x
         if residual is not None and not _CG_HAS_RESIDUAL:
             # Released muGrid without the residual out-field: recover
             # r = b - K x with one extra operator apply.
