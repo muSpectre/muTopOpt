@@ -107,8 +107,14 @@ def main():
     p.add_argument(
         "--reg-weight",
         type=float,
-        default=1.0,
+        default=1. ,
         help="overall strength of the phase-field regularization",
+    )
+    p.add_argument(
+        "--load-weight",
+        type=float,
+        default=1.,
+        help="overall strength of the load cases",
     )
     p.add_argument(
         "--init-volume-fraction",
@@ -169,7 +175,7 @@ def main():
     p.add_argument(
         "--cg-tol",
         type=float,
-        default=1e-6,
+        default=1e-4,
         help="inner CG relative tolerance",
     )
     p.add_argument(
@@ -239,7 +245,7 @@ def main():
         "--precision",
         choices=["single", "double"],
         default="double",
-        help="scalar precision of the on-grid fields and the FFT-accelerated solves",
+        help="scalar precision of the on-grid fields and the FFT-accelerated solver",
     )
     p.add_argument(
         "--density",
@@ -332,7 +338,7 @@ def main():
     cases = target_load_cases(
         dim,
         lambda E: kappa_target @ E,
-        weights=[5.0] * dim,
+        weights=[args.load_weight]*dim,
     )
 
     # Effective conductivity tensor from the homogenized flux response.
@@ -358,14 +364,21 @@ def main():
         length = args.init_length
         if args.init == "filtered_random" and length is None:
             length = 3.0 * reg.eta
-        rho0 = initial_density(
-            homog.nb_pixels,
+        # Generate the initial density on the full global grid so that MPI-parallel
+        # runs start from exactly the same field as a serial run (the local
+        # subdomain for each rank is just a slice of that global field).
+        rho0_global = initial_density(
+            tuple(args.nb_grid_pts),
             kind=args.init,
             volume_fraction=args.init_volume_fraction,
             seed=args.seed,
             length=length,
             grid_spacing=homog.grid_spacing,
         )
+        rho0 = rho0_global[
+            tuple(slice(lo, lo + n) for lo, n in
+                  zip(homog.engine.subdomain_locations, homog.nb_pixels))
+        ].copy()
     else:
         # Restart from a previous run
         rho0_global, restart_meta = restart_density(
