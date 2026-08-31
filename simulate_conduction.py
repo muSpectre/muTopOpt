@@ -26,6 +26,7 @@ import argparse
 import os
 import shlex
 import sys
+import time
 
 import muGrid
 import numpy as np
@@ -52,14 +53,15 @@ class _HelpFormatter(
 
 
 def main():
+    start = time.time()
     p = argparse.ArgumentParser(description=__doc__, formatter_class=_HelpFormatter)
     p.add_argument(
         "-n",
         "--nb-grid-pts",
         type=int,
         nargs="+",
-       # required=True,
-        default= [16, 16],
+        # required=True,
+        default=[32, 32],
         help="grid points per axis (2 or 3 values)",
     )
     p.add_argument(
@@ -68,7 +70,7 @@ def main():
         nargs="+",
         default=None,
         help="physical edge length of the unit cell per axis (2 or 3 values, "
-        "matching -n); default: unit length on every axis",
+             "matching -n); default: unit length on every axis",
     )
     p.add_argument(
         "--kappa-solid",
@@ -85,29 +87,29 @@ def main():
     p.add_argument(
         "--void-ratio",
         type=float,
-        default=1e-4,
+        default=1e-8,
         help="void/solid conductivity ratio",
     )
     p.add_argument(
         "--target-kappa",
         type=float,
         nargs="+",
-        default=[0.5],
+        default=[0.4, 0, 0, 0.2],
         help="target conductivity: one value for an isotropic tensor "
-        "(kappa * I) or dim*dim values for an arbitrary tensor "
-        "(row-major, e.g. --target-kappa 0.5 0.1 0.1 0.5 for a 2x2 tensor)",
+             "(kappa * I) or dim*dim values for an arbitrary tensor "
+             "(row-major, e.g. --target-kappa 0.5 0.1 0.1 0.5 for a 2x2 tensor)",
     )
     p.add_argument(
         "--eta",
         type=float,
         default=None,
         help="phase-field interface width, in physical length units "
-        "(default: two grid spacings)",
+             "(default: two grid spacings)",
     )
     p.add_argument(
         "--reg-weight",
         type=float,
-        default=1. ,
+        default=1.,
         help="overall strength of the phase-field regularization",
     )
     p.add_argument(
@@ -119,7 +121,7 @@ def main():
     p.add_argument(
         "--init-volume-fraction",
         type=float,
-        default=0.5,
+        default=0.9,
         help="volume fraction of the initial density field",
     )
     p.add_argument(
@@ -127,10 +129,10 @@ def main():
         default="filtered_random",
         metavar="KIND_OR_FILE",
         help="initial density field: 'uniform' (constant), 'random' "
-        "(white noise), 'filtered_random' (noise smoothed to a correlation "
-        "length; least prone to locking the initial topology), or the NetCDF "
-        "output of a previous run to restart from its last frame (Fourier-"
-        "resampled if the stored grid does not match -n)",
+             "(white noise), 'filtered_random' (noise smoothed to a correlation "
+             "length; least prone to locking the initial topology), or the NetCDF "
+             "output of a previous run to restart from its last frame (Fourier-"
+             "resampled if the stored grid does not match -n)",
     )
     p.add_argument(
         "--init-length",
@@ -155,22 +157,23 @@ def main():
         type=float,
         default=None,
         help="convergence tolerance on the projected gradient (L-BFGS), "
-        "measured on the mesh-invariant volume-fraction derivative "
-        "(V/V_pixel)*df/drho -- the same value means the same physical "
-        "stationarity at every resolution. Default: 2.5",
+             "measured on the mesh-invariant volume-fraction derivative "
+             "(V/V_pixel)*df/drho -- the same value means the same physical "
+             "stationarity at every resolution. Default: 2.5",
     )
     p.add_argument(
         "--bfgs-xtol",
         type=float,
         default=0.0,
         help="L-BFGS convergence tolerance on the step size (relative change "
-        "in the density iterate); 0 disables the criterion",
+             "in the density iterate); 0 disables the criterion",
     )
+
     p.add_argument(
         "--output-cg-iters",
         action="store_true",
         help="print one line per inner CG iteration (residual and "
-        "relative residual) for every forward/adjoint solve",
+             "relative residual) for every forward/adjoint solve",
     )
     p.add_argument(
         "--cg-tol",
@@ -189,16 +192,16 @@ def main():
         type=float,
         default=1e-2,
         help="adaptive inner CG tolerance (ON by default): solves start at "
-        "this (coarse) relative tolerance and tighten automatically via "
-        "Eisenstat-Walker forcing term with a stagnation ratchet. Pass "
-        "0 (or negative) to disable adaptation and use the fixed --cg-tol",
+             "this (coarse) relative tolerance and tighten automatically via "
+             "Eisenstat-Walker forcing term with a stagnation ratchet. Pass "
+             "0 (or negative) to disable adaptation and use the fixed --cg-tol",
     )
     p.add_argument(
         "--cg-tol-min",
         type=float,
         default=None,
         help="floor for the adaptive inner tolerance. Default: "
-        "--bfgs-gtol/1e4, capped at --cg-tol",
+             "--bfgs-gtol/1e4, capped at --cg-tol",
     )
     p.add_argument(
         "--cg-forcing-exp",
@@ -217,16 +220,16 @@ def main():
         type=float,
         default=1e-2,
         help="minimum relative decrease in the projected gradient counted as "
-        "progress",
+             "progress",
     )
     p.add_argument(
         "--preconditioner",
         choices=["green-jacobi", "green"],
         default="green-jacobi",
         help="inner-solve preconditioner: 'green-jacobi' (J-FFT, "
-        "Green operator times a per-node Jacobi diagonal assembled "
-        "via a 2^dim-colour scheme) or 'green' (plain reference-"
-        "conductivity Green operator)",
+             "Green operator times a per-node Jacobi diagonal assembled "
+             "via a 2^dim-colour scheme) or 'green' (plain reference-"
+             "conductivity Green operator)",
     )
     p.add_argument(
         "--element",
@@ -239,7 +242,7 @@ def main():
         default="cpu",
         metavar="DEVICE",
         help="run the forward/adjoint solves and sensitivity on the "
-        "host ('cpu') or on the accelerator ('gpu')",
+             "host ('cpu') or on the accelerator ('gpu')",
     )
     p.add_argument(
         "--precision",
@@ -256,18 +259,26 @@ def main():
     p.add_argument(
         "--output",
         type=str,
-        default=None,
+        default='test_output.nc',
         help="NetCDF file to write the optimized density to",
+    )
+    p.add_argument(
+        "--temperature-rtol",
+        type=float,
+        default=1e-8,
+        help="relative CG tolerance of the extra per-load-case solves that "
+             "produce the stored temperature fields (one solve per load case "
+             "per written frame)",
     )
     p.add_argument(
         "--dump-every",
         type=int,
         default=-1,
         help="dump intermediate L-BFGS iterates to the NetCDF output "
-        "as successive frames: with N>0 the initial "
-        "configuration and every N-th iterate (N, 2N, ...) are "
-        "written, and the final iterate is always included; -1 "
-        "(default) writes only the final density as a single frame",
+             "as successive frames: with N>0 the initial "
+             "configuration and every N-th iterate (N, 2N, ...) are "
+             "written, and the final iterate is always included; -1 "
+             "(default) writes only the final density as a single frame",
     )
     p.add_argument(
         "--no-flush",
@@ -331,14 +342,14 @@ def main():
         kappa_isotropic = False
     else:
         p.error(
-            f"--target-kappa takes 1 value (isotropic) or {dim*dim} values "
+            f"--target-kappa takes 1 value (isotropic) or {dim * dim} values "
             f"(full {dim}x{dim} tensor); got {len(args.target_kappa)}"
         )
     flux_magnitude = 1.0
     cases = target_load_cases(
         dim,
         lambda E: kappa_target @ E,
-        weights=[args.load_weight]*dim,
+        weights=[args.load_weight] * dim,
     )
 
     # Effective conductivity tensor from the homogenized flux response.
@@ -420,18 +431,51 @@ def main():
 
     dump_every = args.dump_every
     dump_intermediate = (
-        args.output is not None and dump_every is not None and dump_every > 0
+            args.output is not None and dump_every is not None and dump_every > 0
     )
     fio = None
     field = None
+    # Temperature fields, one per unit macro-gradient load case. Created once
+    # here and reused for every frame: muGrid writes whatever is in the
+    # registered field collection, so the field object that is *solved into*
+    # must be the same object that was registered.
+    temperature_fields = {}
+    # Total gradient and flux per load case, on the quadrature points. These
+    # cannot reuse homog._g / homog._flux directly: those are single scratch
+    # fields shared by all load cases and overwritten by the next solve.
+    gradient_fields = {}
+    flux_fields = {}
+    # Every field written on each frame. muGrid opens a new frame per
+    # append_frame() call, so all of these must go into a *single* write() --
+    # one append_frame() per field would scatter density and temperatures
+    # across separate frames, leaving each frame's other variables at their
+    # NetCDF fill value (which is what "the temperatures are empty" looked
+    # like on read-back).
+    frame_fields = ["density"]
     frame_iters = []
     _MSG_LEN = 256
+
+    def _like_flux(name):
+        """A field with the same layout as homog._g / homog._flux: dim
+        components on the quadrature points (2 per pixel for P1 in 2D)."""
+        return homog.fc.real_field(
+            name, (homog.dim,), "quad", dtype=homog.dtype)
+
     if args.output is not None:
         field = homog.scalar_field("density")
         fio = muGrid.FileIONetCDF(
             args.output, muGrid.FileIONetCDF.OpenMode.Overwrite, comm
         )
         fio.register_field_collection(homog.fc, field_names=["density"])
+
+        for i in range(homog.dim):
+            temperature_fields[i] = homog.scalar_field(f"temperature_{i}")
+            gradient_fields[i] = _like_flux(f"gradient_{i}")
+            flux_fields[i] = _like_flux(f"flux_{i}")
+            for name in (f"temperature_{i}", f"gradient_{i}", f"flux_{i}"):
+                fio.register_field_collection(homog.fc, field_names=[name])
+                frame_fields.append(name)
+
         fio.write_global_attribute(
             "domain_lengths", [float(x) for x in homog.domain_lengths]
         )
@@ -455,10 +499,60 @@ def main():
 
     flush_frames = (not args.no_flush) and hasattr(fio, "sync") if fio else False
 
+    # Physical node positions x, for the affine part T_macro = g . x that
+    # solve_macro does not include (it returns the periodic fluctuation only).
+    # engine.coords is (dim, *nb_subdomain_grid_pts): integer grid indices in
+    # some muFFT versions, normalized [0, 1) coordinates in others.
+    _coords = np.asarray(homog.engine.coords)
+    _scale = np.asarray(
+        homog.grid_spacing if np.issubdtype(_coords.dtype, np.integer)
+        else homog.domain_lengths, dtype=float)
+    positions = _coords * _scale.reshape((dim,) + (1,) * dim)
+
     def write_frame(it, rho):
-        """Stream one density iterate to the output as a new frame."""
+        """Stream one density iterate and its temperature fields to the output
+        as a single new frame."""
+        homog.set_density(rho)
         field.p[...] = homog.to_device(rho)
-        fio.append_frame().write(["density"])
+
+        # Populate every temperature field *before* the frame is opened, so
+        # one write() can commit all of them together.
+        macro_gradients = np.eye(homog.dim)
+        for k in range(homog.dim):
+            # Clear last frame's contents: the affine part added below is not
+            # a valid starting iterate should solve_macro warm-start from the
+            # field it is handed.
+            temperature_fields[k].s[0] = 0.0
+            homog.solve_macro(
+                macro_gradients[k],
+                temperature_fields[k],
+                rtol=args.temperature_rtol,
+            )
+
+            # Gradient and flux must be taken from the *periodic* fluctuation:
+            # homog.grad is a periodic FE operator, so applying it to a field
+            # that already carries the affine ramp puts a spurious spike in
+            # the cells that wrap around the cell boundary. The macro gradient
+            # is added afterwards instead, giving the total field
+            # grad(T) = g + grad(T_fluct).
+            homog.engine.communicate_ghosts(temperature_fields[k])
+            homog.grad.apply(temperature_fields[k], homog._g)
+            g_tot = np.asarray(homog._g.s)
+            g_tot = g_tot + macro_gradients[k].reshape(
+                (dim,) + (1,) * (g_tot.ndim - 1))
+            gradient_fields[k].s[...] = homog.to_device(g_tot)
+            flux_fields[k].s[...] = homog.to_device(
+                np.asarray(homog.kappa.s) * g_tot)
+
+            # Total temperature = periodic fluctuation + g . x. This makes the
+            # stored field non-periodic, so it shows a jump across the cell
+            # boundary when plotted -- that ramp is the macro gradient itself.
+            # Must come after grad.apply above.
+            affine = np.tensordot(macro_gradients[k], positions, axes=(0, 0))
+            temperature_fields[k].s[0] += homog.to_device(affine)
+
+        fio.append_frame().write(frame_fields)
+
         if flush_frames:
             fio.sync()
         frame_iters.append(int(it))
@@ -487,12 +581,13 @@ def main():
             rtol_str += f"  cg-stalled={stalled}" if stalled else ""
             print(
                 f"  bfgs-iter {it:4d}  f={last['objective']:.6e}  "
-                f"vol_frac={vf:.3f} " 
+                f"vol_frac={vf:.3f} "
                 f"cg-iters={cg_total}{rtol_str}"
             )
             # Format the array separately first
-            kappa_str = np.array2string(kappa_eff, formatter={'float_kind': lambda x: f"{x:.4f}"})
-            print(f"Optimized: kappa=\n{kappa_str} (anisotropic)")
+            kappa_str = np.array2string(
+                kappa_eff, formatter={'float_kind': lambda x: f"{x:.4f}"})
+            # print(f"Optimized: kappa=\n{kappa_str} (anisotropic)")
 
     rho, info = optimize_bounded_lbfgs(
         problem,
@@ -510,13 +605,22 @@ def main():
     )
 
     converged = bool(info["success"])
+
+    homog.set_density(rho)
+    homog_data = homog.homogenized_tangent()
+
     if rank0:
         kappa_eff = effective_conductivity(problem.last["fluxes"])
         print(
             f"done: {info['message']}  f={info['objective']:.6e}  ")
         # Format the array separately first
-        kappa_str = np.array2string(kappa_eff, formatter={'float_kind': lambda x: f"{x:.4f}"})
+        kappa_str = np.array2string(
+            kappa_eff, formatter={'float_kind': lambda x: f"{x:.4f}"})
         print(f"Optimized: kappa=\n{kappa_str} (anisotropic)")
+        homog_data_str = np.array2string(
+            homog_data, formatter={'float_kind': lambda x: f"{x:.4f}"})
+        print(f"Optimized: homog_data_str=\n{homog_data_str} (anisotropic)")
+
         if not converged:
             print(
                 f"WARNING: L-BFGS did NOT converge; the written density "
@@ -550,6 +654,8 @@ def main():
                 f"wrote {args.output} ({len(frame_iters)} frame(s), "
                 f"converged={int(converged)})"
             )
+            end = time.time()
+            print(f"Elapsed: {end - start:.4f}s")
 
 
 if __name__ == "__main__":
