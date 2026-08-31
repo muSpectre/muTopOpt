@@ -103,17 +103,17 @@ class SimpConductivity:
 
 class HomogenizationConductivity:
     def __init__(
-        self,
-        nb_grid_pts,
-        material: SimpConductivity,
-        comm=None,
-        domain_lengths=None,
-        element="q1",
-        preconditioner="green-jacobi",
-        cg_tol=1e-8,
-        cg_maxiter=2000,
-        cg_verbose=False,
-        dtype=np.float64,
+            self,
+            nb_grid_pts,
+            material: SimpConductivity,
+            comm=None,
+            domain_lengths=None,
+            element="q1",
+            preconditioner="green-jacobi",
+            cg_tol=1e-8,
+            cg_maxiter=2000,
+            cg_verbose=False,
+            dtype=np.float64,
     ):
         """See :class:`muTopOpt.homogenization.Homogenization` for the shared
         conventions (grid, MPI, dtype, CG hardening).  Two preconditioners are
@@ -504,3 +504,35 @@ class HomogenizationConductivity:
 
         dot = np.einsum("i...,i...->...", g_fwd, g_co)  # (nb_quad, *nb_pixels)
         return np.einsum("q,q...->...", self.quad_weights, dot)
+
+    def homogenized_tangent(self):
+        """Cell-averaged material data ``<A[i,:]> = (1/V) int kappa (E_macro + grad u) dV``
+        as a length-``dim`` array (MPI-reduced).
+
+        This is just sequesnce of :meth:`homogenized_flux`
+
+        Sign convention: ``q`` is the *constitutive* flux ``kappa * grad T``
+        (no Fourier's-law minus sign), matching the stress analogy
+        ``sigma = C:(E_macro + grad u)`` this module mirrors, so that
+        ``target_flux = kappa_target @ macro_gradient`` (see
+        :mod:`muTopOpt.loadcases_conduction`) is the response you would
+        actually measure.
+
+        target_flux is one column of the target material tangent matrix."""
+
+        macro_gradients = np.eye(self.dim)
+        _u = self.temperature_field("to_prob_u_homogenization")
+
+        tangent = []
+        cg_iters = []
+        for i in np.arange(self.dim):
+            macro_gradient = macro_gradients[i]
+
+            u = self.solve_macro(
+                macro_gradient, _u, rtol=1e-8,
+                label=f"case {i + 1} fwd")
+            cg_iters.append(self.last_cg_iters)
+            q = self.homogenized_flux(u, macro_gradient)
+            tangent.append(q)
+
+        return np.asarray(tangent)
