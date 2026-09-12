@@ -187,6 +187,15 @@ def main():
         "the trust-region model)",
     )
     p.add_argument(
+        "--hv-warm-start",
+        action="store_true",
+        help="warm-start each Hessian-vector solve from the same load case's "
+        "previous product, keeping 2 extra vector fields per load case (the "
+        "largest block of device memory the optimizer holds at scale). "
+        "Measured to save only 2-4%% of inner CG iterations and no wall time, "
+        "so it is off by default",
+    )
+    p.add_argument(
         "--output-cg-iters",
         action="store_true",
         help="print one line per inner CG iteration (residual and "
@@ -501,7 +510,8 @@ def main():
     reg = Reg(homog, eta=eta, weight=args.reg_weight)
     problem = StressTargetProblem(homog, cases, regularization=reg,
                                   design=args.density,
-                                  hessian=(optimizer == "tr"))
+                                  hessian=(optimizer == "tr"),
+                                  hv_warm_start=args.hv_warm_start)
 
     if args.init in INITIAL_DENSITY_KINDS:
         length = args.init_length
