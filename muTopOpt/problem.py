@@ -39,7 +39,8 @@ class LoadCase:
 
 class StressTargetProblem:
     def __init__(self, homogenization, load_cases, regularization=None,
-                 design="element", consistent_objective=True, hessian=False):
+                 design="element", consistent_objective=True, hessian=False,
+                 hv_warm_start=False):
         """``design='element'`` optimizes a per-pixel density (the material of
         each element is ``SIMP(rho_e)`` directly). ``design='nodal'`` optimizes
         a *nodal* FE density: each element's material is ``SIMP(rho_e)`` with
@@ -129,18 +130,35 @@ class StressTargetProblem:
             self._dmu_v = self.h.scalar_field("to_prob_hv_dmu")
             self._hv_rhs = self.h.vector_field("to_prob_hv_rhs")
             self._hv_tmp = self.h.vector_field("to_prob_hv_tmp")
-            # Per-case sensitivity/co-state fields. Kept per case (not shared)
-            # so each Hessian-vector product warm-starts its two solves from
-            # the same load case's previous solution -- successive Hv products
-            # (trust-region CG iterations) have a slowly-varying rhs, so the
-            # warm start cuts the CG count. Zero-initialized, so the first Hv
-            # cold-starts. (2*n_cases extra vector fields; see the docstring.)
-            self._du_cases = [
-                self.h.vector_field(f"to_prob_hv_du_case{i}")
-                for i in range(n)]
-            self._dadj_cases = [
-                self.h.vector_field(f"to_prob_hv_dadj_case{i}")
-                for i in range(n)]
+            # Per-case sensitivity/co-state fields. Kept per case (not
+            # shared) so each Hessian-vector product warm-starts its two
+            # solves from the same load case's previous solution -- successive
+            # Hv products (trust-region CG iterations) have a slowly-varying
+            # rhs, so the warm start cuts the CG count. Zero-initialized, so
+            # the first Hv cold-starts.
+            #
+            # These are 2*n_cases vector fields and, at scale, the single
+            # largest block of device memory the optimizer holds (2x6 fields =
+            # 135 MB at 96^3 in single precision, ~28% of the resident set).
+            # Measured, the warm start is not worth that: cold-starting
+            # every Hv solve costs 2-4% more inner CG iterations and no
+            # measurable wall time (32^3: 5779 -> 5989 iterations, 11.14 s ->
+            # 11.15 s; 48^3: 33.6 s -> 34.0 s). It is therefore off by
+            # default, and `hv_warm_start=True` restores the per-case fields
+            # for anyone whose problem benefits more than these did.
+            self.hv_warm_start = bool(hv_warm_start)
+            if self.hv_warm_start:
+                self._du_cases = [
+                    self.h.vector_field(f"to_prob_hv_du_case{i}")
+                    for i in range(n)]
+                self._dadj_cases = [
+                    self.h.vector_field(f"to_prob_hv_dadj_case{i}")
+                    for i in range(n)]
+            else:
+                du = self.h.vector_field("to_prob_hv_du")
+                dadj = self.h.vector_field("to_prob_hv_dadj")
+                self._du_cases = [du] * n
+                self._dadj_cases = [dadj] * n
         # Host-side snapshot of the last evaluation (design iterate, per-case
         # sensitivity kernels and stress data) that hessian_vector_product
         # differentiates around; None until the first evaluation.
@@ -392,6 +410,12 @@ class StressTargetProblem:
             adj = self._adj_cases[i]
             du = self._du_cases[i]
             dadj = self._dadj_cases[i]
+            if not self.hv_warm_start:
+                # Shared scratch: it holds the previous *case's* solution, not
+                # this one's, so start from zero rather than from an unrelated
+                # iterate.
+                du.set_zero()
+                dadj.set_zero()
             E = lc.macro_strain
             norm = float(np.sum(lc.target_stress**2))
             S = cache["S"][i]

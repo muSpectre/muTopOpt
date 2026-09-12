@@ -106,6 +106,23 @@ def _resolve_device(device, comm=None):
     return muGrid.Device.from_string(device)
 
 
+def _device_has_unified_memory():
+    """True when the GPU physically shares memory with the host (an APU such as
+    MI300A), so managed allocations cost nothing to access from either side.
+
+    ``integrated`` is the portable flag for this in both CUDA and HIP; on a
+    discrete card it is 0 and managed memory forces page migration on every
+    access. Returns False when the device cannot be queried.
+    """
+    try:
+        import cupy
+
+        props = cupy.cuda.runtime.getDeviceProperties(0)
+    except Exception:
+        return False
+    return bool(props.get("integrated", 0))
+
+
 # Process-global guard: the managed allocator, and muGrid's routing to it, must
 # be installed exactly once per process. Re-registering muGrid's allocator while
 # device fields are alive would drop the keepalive of their buffers and free
@@ -197,13 +214,20 @@ class Homogenization:
         self.domain_volume = float(np.prod(self.domain_lengths))
 
         self.device = _resolve_device(device, self.comm)
-        # On a GPU, default to the managed (unified) allocator so device fields
-        # can use the full HBM of a unified-memory APU rather than the smaller
-        # coarse-grained window (see _enable_managed_device_allocator). Must be
-        # installed before the engine allocates any device field. Opt out with
-        # managed_memory=False or MUTOPOPT_MANAGED=0.
+        # On a unified-memory APU, default to the managed allocator so device
+        # fields can use the full HBM rather than the smaller coarse-grained
+        # window (see _enable_managed_device_allocator). On a *discrete* GPU
+        # managed memory is a large pessimization instead: host and device do
+        # not share physical memory, so every page the solver touches migrates
+        # over PCIe. Measured on an RTX PRO 500 (discrete): 9x slower per CG
+        # iteration at 64^3, and 96^3 failed to make progress at all. Default
+        # from the device itself, and let the caller override either way with
+        # managed_memory=True/False or MUTOPOPT_MANAGED=1/0.
+        # Must be installed before the engine allocates any device field.
         if managed_memory is None:
-            managed_memory = os.environ.get("MUTOPOPT_MANAGED", "1") != "0"
+            env = os.environ.get("MUTOPOPT_MANAGED")
+            managed_memory = (env != "0") if env is not None \
+                else _device_has_unified_memory()
         self.managed_memory = False
         if self.device is not None and managed_memory:
             self.managed_memory = _enable_managed_device_allocator()
@@ -484,7 +508,10 @@ class Homogenization:
             if rr < guard["best"]:
                 guard["best"] = rr
                 guard["best_iter"] = iteration
-                self._x_best.s[...] = x.s
+                # Full-buffer device copy. The `.s[...] = .s` form goes
+                # through a strided (ghost-excluded) view, which is ~7x
+                # slower and ran on most CG iterations.
+                muGrid.linalg.copy(x, self._x_best)
                 guard["saved"] = True
             elif cold_start and guard["best_iter"] == 0 and (
                     iteration >= self.cg_no_progress_patience
@@ -523,7 +550,7 @@ class Homogenization:
             # raised ConvergenceError kills the run.
             if not guard["saved"]:
                 raise  # NaN before the first callback; nothing to salvage
-            x.s[...] = self._x_best.s
+            muGrid.linalg.copy(self._x_best, x)
             # True (non-recursive) residual of the returned iterate; the best
             # recursive rr can be far below it past the precision floor.
             self._hessp(x, self._Ku)
