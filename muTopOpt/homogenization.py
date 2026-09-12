@@ -508,7 +508,10 @@ class Homogenization:
             if rr < guard["best"]:
                 guard["best"] = rr
                 guard["best_iter"] = iteration
-                self._x_best.s[...] = x.s
+                # Full-buffer device copy. The `.s[...] = .s` form goes
+                # through a strided (ghost-excluded) view, which is ~7x
+                # slower and ran on most CG iterations.
+                muGrid.linalg.copy(x, self._x_best)
                 guard["saved"] = True
             elif cold_start and guard["best_iter"] == 0 and (
                     iteration >= self.cg_no_progress_patience
@@ -547,7 +550,7 @@ class Homogenization:
             # raised ConvergenceError kills the run.
             if not guard["saved"]:
                 raise  # NaN before the first callback; nothing to salvage
-            x.s[...] = self._x_best.s
+            muGrid.linalg.copy(self._x_best, x)
             # True (non-recursive) residual of the returned iterate; the best
             # recursive rr can be far below it past the precision floor.
             self._hessp(x, self._Ku)
