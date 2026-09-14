@@ -49,6 +49,13 @@ print(f'  package   {muGrid.__file__}')
 print(f'  extension {ext}')
 "
 
+# rocFFT compiles its kernels at runtime (the `fft_rtc_*` names in a kernel
+# trace). Without a persistent cache every process recompiles them from
+# scratch, which costs minutes per (grid, precision) before the first solve --
+# absorbed by the benchmark's warmup, so it does not distort ms/CG-iter, but it
+# makes a sweep far slower than the work it measures.
+export ROCFFT_RTC_CACHE_PATH="${ROCFFT_RTC_CACHE_PATH:-$HOME/.cache/rocfft_kernels.db}"
+
 # UCX_TLS=^rocm_ipc: the ROCm IPC rendezvous transport triggers an rkey-size
 # assertion failure between ranks; disable it so UCX falls back to
 # rocm_copy / shared-memory transfers. Harmless for the pure-CPU MPI run.
