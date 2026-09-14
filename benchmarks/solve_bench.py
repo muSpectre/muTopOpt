@@ -53,7 +53,7 @@ CSV_COLUMNS = (
 )
 
 
-def build(args):
+def build(args, timer=None):
     """Construct the homogenization problem and apply a fixed design."""
     dtype = {"single": np.float32, "double": np.float64}[args.precision]
     material = SimpMaterial(
@@ -63,7 +63,7 @@ def build(args):
     homog = Homogenization(
         (args.n,) * args.dim, material,
         element=args.element, preconditioner=args.preconditioner,
-        device=args.device, dtype=dtype,
+        device=args.device, dtype=dtype, timer=timer,
     )
     # The same smooth random design simulate.py starts from (correlation
     # length 3*eta, eta = one grid spacing), so the material contrast the
@@ -113,6 +113,10 @@ def run(homog, strains, nb_solves, rtol, warmup):
     for k in range(warmup):
         one(k)
     sync()
+    if homog.timer is not None:
+        # Drop the warmup from the phase breakdown: FFT planning and first-touch
+        # allocation are one-off costs and would otherwise dominate it.
+        homog.timer.reset()
 
     times, iters = [], []
     for k in range(nb_solves):
@@ -158,12 +162,26 @@ def main():
     p.add_argument("--solid-nu", dest="solid_nu", type=float, default=0.3)
     p.add_argument("--penalty", type=float, default=2.0)
     p.add_argument("--void-ratio", dest="void_ratio", type=float, default=1e-3)
+    p.add_argument("--breakdown", action="store_true",
+                   help="also report where the wall time of a solve goes, per "
+                        "CG phase. On a GPU these are host-side times: the "
+                        "operator and preconditioner phases measure only the "
+                        "cost of queueing their kernels, and the wait for that "
+                        "work lands in the reduction phases that read a value "
+                        "back to the host -- so the split shows how much of "
+                        "the solve is spent blocked, which a kernel trace does "
+                        "not")
     p.add_argument("--csv", metavar="FILE",
                    help="append one row per repeat to FILE (header written "
                         "when the file is new)")
     args = p.parse_args()
 
-    homog = build(args)
+    timer = None
+    if args.breakdown:
+        from muTimer import Timer
+
+        timer = Timer()
+    homog = build(args, timer=timer)
     strains = unit_strains(args.dim)
 
     print(f"n={args.n}^{args.dim}  device={args.device}  "
@@ -201,6 +219,9 @@ def main():
         print(f"  ms/CG-iter over {args.repeat} repeats: "
               f"min {min(vals):.3f}  median {np.median(vals):.3f}  "
               f"max {max(vals):.3f}")
+
+    if timer is not None:
+        timer.print_summary(title="wall time per CG phase")
 
     if args.csv:
         new = not os.path.exists(args.csv)

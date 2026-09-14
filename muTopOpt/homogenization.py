@@ -175,6 +175,7 @@ class Homogenization:
         device=None,
         dtype=np.float64,
         managed_memory=None,
+        timer=None,
     ):
         """``dtype`` (``np.float64`` default, or ``np.float32``) is the
         precision of all grid fields and hence of the forward/adjoint solves,
@@ -189,7 +190,16 @@ class Homogenization:
         512^3 in double precision) use the full package. ``None`` (default)
         enables it automatically whenever a GPU device is selected; pass
         ``False`` (or set ``MUTOPOPT_MANAGED=0``) to force the default
-        allocator. Ignored on CPU."""
+        allocator. Ignored on CPU.
+
+        ``timer`` (a ``muTimer.Timer``) is handed to the CG solver and the
+        preconditioner so a benchmark can read back where the *wall* time of a
+        solve goes. On a GPU the phases are host-side: the operator and
+        preconditioner regions measure only the cost of queueing their kernels,
+        and the wait for that work lands in the next region that reads a
+        reduction back to the host. That is the intended reading -- the gap
+        between these numbers and the GPU-busy time from a kernel trace is the
+        pipeline bubble."""
         self.dim = len(nb_grid_pts)
         if self.dim not in (2, 3):
             raise ValueError("nb_grid_pts must be 2- or 3-dimensional")
@@ -269,6 +279,7 @@ class Homogenization:
             self._xp = np
 
         self.preconditioner_kind = preconditioner
+        self.timer = timer
         self.cg_tol = cg_tol
         self.cg_maxiter = cg_maxiter
         # Stagnation safeguard of the CG solves (see solve_rhs): a solve whose
@@ -370,7 +381,7 @@ class Homogenization:
                 self._prec = make_green_jacobi_preconditioner(
                     self.engine, self.op, self.lam, self.mu, self.dim,
                     reference_lambda=lam_ref, reference_mu=mu_ref,
-                    dtype=self.dtype,
+                    dtype=self.dtype, timer=self.timer,
                 )
             elif self.preconditioner_kind == "green":
 
@@ -379,7 +390,8 @@ class Homogenization:
                     self.op.apply_uniform(u, lam_ref, mu_ref, f)
 
                 self._prec = make_reference_stiffness_preconditioner(
-                    self.engine, apply_ref, self.dim, dtype=self.dtype
+                    self.engine, apply_ref, self.dim, dtype=self.dtype,
+                    timer=self.timer,
                 )
             else:
                 raise ValueError(
@@ -534,7 +546,7 @@ class Homogenization:
             conjugate_gradients(
                 self.comm, self.fc, b, x,
                 hessp=self._hessp, prec=self._prec,
-                rtol=rtol_eff,
+                rtol=rtol_eff, timer=self.timer,
                 maxiter=self.cg_maxiter if maxiter is None else maxiter,
                 callback=_count,
                 **cg_kwargs,
