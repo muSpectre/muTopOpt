@@ -38,8 +38,10 @@ import argparse
 import csv
 import os
 import platform
+import re
 import time
 
+import muGrid
 import numpy as np
 
 from muTopOpt import Homogenization, SimpMaterial
@@ -47,10 +49,41 @@ from muTopOpt.optimize import initial_density
 
 #: Fields written by ``--csv``, in order.
 CSV_COLUMNS = (
-    "timestamp", "host", "device", "precision", "dim", "n", "nb_pixels",
+    "timestamp", "host", "gpu", "mugrid_version", "mugrid_commit",
+    "mugrid_dirty", "device", "precision", "dim", "n", "nb_pixels",
     "preconditioner", "element", "rtol", "solves", "iters_per_solve",
     "ms_per_solve", "ms_per_cg_iter",
 )
+
+
+def provenance(homog):
+    """Identify the machine and the muGrid build a row was measured on.
+
+    Both are needed to compare two rows, and neither is implied by the
+    hostname: the work this benchmark measures happens inside muGrid, and a
+    muGrid change can be worth a couple of percent on one GPU and threefold on
+    another (a device copy between managed allocations is a DMA transfer on a
+    discrete card and a host memmove on a unified-memory APU). A row is only
+    comparable against one with the same ``gpu`` and ``mugrid_version``.
+    """
+    version = getattr(muGrid, "__version__", "unknown")
+    commit = re.search(r"-g([0-9a-f]+)", version)
+    gpu = ""
+    if homog.on_device:
+        try:
+            props = homog._xp.cuda.runtime.getDeviceProperties(0)
+            name = props["name"].decode()
+            arch = props.get("gcnArchName", b"").decode().split(":")[0]
+            gpu = f"{name} ({arch})" if arch else name
+        except Exception:  # a device that cannot be queried is still a run
+            gpu = "unknown"
+    return {
+        "host": platform.node(),
+        "gpu": gpu,
+        "mugrid_version": version,
+        "mugrid_commit": commit.group(1) if commit else "",
+        "mugrid_dirty": int(version.endswith("-dirty")),
+    }
 
 
 def build(args, timer=None):
@@ -199,7 +232,7 @@ def main():
               f"ms/CG-iter {per_iter:7.3f}", flush=True)
         rows.append({
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "host": platform.node(),
+            **provenance(homog),
             "device": args.device,
             "precision": args.precision,
             "dim": args.dim,
@@ -225,6 +258,13 @@ def main():
 
     if args.csv:
         new = not os.path.exists(args.csv)
+        if not new:
+            with open(args.csv, newline="") as fh:
+                header = next(csv.reader(fh), None)
+            if header != list(CSV_COLUMNS):
+                raise SystemExit(
+                    f"{args.csv} was written with different columns; appending "
+                    "would silently misalign it. Write to a new file.")
         with open(args.csv, "a", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
             if new:
