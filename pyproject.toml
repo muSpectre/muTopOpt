@@ -17,6 +17,11 @@ dependencies = [
     "numpy",
     # >= 0.112.0 for the dtype-threaded preconditioner factories, which let a
     # float32 Homogenization run the whole solve in single precision.
+    #
+    # NOTE: the consistent nodal double well (muTopOpt.nodal.ConsistentDoubleWell)
+    # calls muGrid's NodalMomentOperator, which is newer than this pin. Raise the
+    # pin to the first muGrid release that ships it before tagging v1.0.0 --
+    # muGrid 1.2.0 does not have it.
     "muGrid>=0.112.0",
     "NuMPI",
 ]
