@@ -31,9 +31,7 @@ Two ingredients live here:
   on Q1 elements.
 """
 
-from itertools import product
-from math import factorial
-
+import muGrid
 import numpy as np
 
 #: Sub-simplex decompositions used by the P1 elements (matching
@@ -141,111 +139,60 @@ class NodalElementMap:
         return self.scatter([w * s for w in self.avg_weights])
 
 
-def _gauss_points_unit_interval():
-    """3-point Gauss rule mapped to [0, 1] (exact to polynomial degree 5)."""
-    g = np.sqrt(3.0 / 5.0)
-    pts = [(0.5 * (1.0 - g), 5.0 / 18.0), (0.5, 8.0 / 18.0),
-           (0.5 * (1.0 + g), 5.0 / 18.0)]
-    return pts
-
-
 class ConsistentDoubleWell:
     """Exact Galerkin integral of ``W(rho) = rho^2 (1-rho)^2`` of the nodal FE
     interpolant, with its exact nodal gradient.
 
-    P1 (simplices): closed form. On a ``d``-simplex ``T`` with corner values
-    ``a``, ``\\int_T rho^k = d! |T| k!/(k+d)! h_k(a)`` with the complete
-    homogeneous symmetric polynomial ``h_k``, so
-    ``\\int_T W = |T| [C2 h2 - 2 C3 h3 + C4 h4]``, ``Ck = d! k!/(k+d)!``.
+    ``W`` is quartic, so its cell integral is a fixed combination of the
+    moments ``M_k = int_e rho(x)^k dx`` of the interpolant:
+    ``rho^2 (1-rho)^2 = rho^2 - 2 rho^3 + rho^4``, hence
+    ``int_e W = M2 - 2 M3 + M4``, and the nodal gradient is the same
+    combination of the moment gradients.
 
-    Q1 (multilinear): 3-point tensor Gauss quadrature, exact for the
-    degree-(4 per axis) integrand.
+    muGrid's fused :class:`NodalMomentOperator` computes both in a single
+    pass, exactly for either element (3-point-per-axis tensor Gauss on Q1, the
+    same rule per sub-simplex on P1). Evaluating the quadrature
+    array-at-a-time instead -- the previous implementation here -- materialises
+    the interpolant at every quadrature point of every cell at once, which in
+    3D is a 27-fold copy of the grid plus a temporary per polynomial term, and
+    made this term the dominant memory consumer of a whole optimisation.
     """
+
+    #: Number of moments the operator returns, and the coefficients of W on
+    #: them (M2, M3, M4).
+    NB_MOMENTS = 3
+    W_COEFFS = np.array([1.0, -2.0, 1.0])
 
     def __init__(self, nodal_map: NodalElementMap):
         self.m = nodal_map
-        dim = self.m.dim
-        if self.m.element_name == "p1":
-            self._Ck = {
-                k: factorial(dim) * factorial(k) / factorial(k + dim)
-                for k in (2, 3, 4)
-            }
-        else:  # q1
-            pts1d = _gauss_points_unit_interval()
-            gauss = []
-            for combo in product(pts1d, repeat=dim):
-                xi = [c[0] for c in combo]
-                w = float(np.prod([c[1] for c in combo]))
-                # Multilinear shape function of corner c at xi.
-                N = [
-                    float(np.prod([
-                        xi[d] if _node_offset(c, d) else 1.0 - xi[d]
-                        for d in range(dim)
-                    ]))
-                    for c in range(self.m.nb_nodes)
-                ]
-                gauss.append((w, N))
-            self._gw = np.array([g[0] for g in gauss])   # (gauss,)
-            self._gN = np.array([g[1] for g in gauss])   # (gauss, corners)
-
-    # -- P1: closed form via h_k ---------------------------------------------
-    def _p1_value_and_corner_grad(self, views):
-        # h_k from the power sums p_j = sum_i a_i^j (Newton's identity for the
-        # complete homogeneous symmetric polynomials, k h_k = sum_j p_j
-        # h_{k-j}) and the gradient from dh_k/da_i = sum_{j<k} a_i^j
-        # h_{k-1-j}, evaluated by Horner. This needs O(nodes) full-grid array
-        # operations instead of the O(35 * nodes) of a naive multiset
-        # enumeration -- about an order of magnitude faster in 3D.
-        m = self.m
-        f = 0.0
-        grads = [0.0] * m.nb_nodes
-        C2, C3, C4 = self._Ck[2], self._Ck[3], self._Ck[4]
-        for nodes, frac in _P1_SIMPLICES[m.dim]:
-            V = frac * m.vol_pixel
-            a = [views[i] for i in nodes]
-            a2 = [x * x for x in a]
-            p1 = sum(a)
-            p2 = sum(a2)
-            p3 = sum(x2 * x for x2, x in zip(a2, a))
-            p4 = sum(x2 * x2 for x2 in a2)
-            h1 = p1
-            h2 = (p1 * h1 + p2) / 2.0
-            h3 = (p1 * h2 + p2 * h1 + p3) / 3.0
-            h4 = (p1 * h3 + p2 * h2 + p3 * h1 + p4) / 4.0
-            f = f + V * (C2 * h2 - 2.0 * C3 * h3 + C4 * h4)
-            for j, ai in enumerate(a):
-                dh2 = h1 + ai
-                dh3 = h2 + ai * dh2
-                dh4 = h3 + ai * dh3
-                grads[nodes[j]] = grads[nodes[j]] + V * (
-                    C2 * dh2 - 2.0 * C3 * dh3 + C4 * dh4)
-        return f, grads
-
-    # -- Q1: exact Gauss quadrature --------------------------------------------
-    def _q1_value_and_corner_grad(self, views):
-        # All Gauss points evaluated along one stacked leading axis (a single
-        # tensordot instead of a Python loop over 3^dim points).
-        m = self.m
-        xp = m.h._xp
-        A = xp.stack([xp.asarray(v) for v in views])   # (corners, *grid)
-        rho_g = xp.tensordot(xp.asarray(self._gN), A, axes=(1, 0))  # (gauss, *grid)
-        Wg = rho_g**2 * (1.0 - rho_g) ** 2
-        dWg = 2.0 * rho_g * (1.0 - rho_g) * (1.0 - 2.0 * rho_g)
-        wv = self._gw * m.vol_pixel                     # (gauss,)
-        f = xp.tensordot(xp.asarray(wv), Wg, axes=(0, 0))
-        gc = xp.tensordot(xp.asarray((self._gN * wv[:, None]).T), dWg,
-                          axes=(1, 0))                  # (corners, *grid)
-        return f, [gc[c] for c in range(m.nb_nodes)]
+        self.h = nodal_map.h
+        element = (muGrid.FEMElement.p1 if self.m.element_name == "p1"
+                   else muGrid.FEMElement.q1)
+        op_cls = (muGrid.NodalMomentOperator2D if self.m.dim == 2
+                  else muGrid.NodalMomentOperator3D)
+        self.op = op_cls(list(self.h.grid_spacing), element)
+        # Scratch: the nodal input (ghosts filled per call) and the operator's
+        # two multi-component outputs. Three scalar-field-sized buffers in
+        # total, replacing the transient 27-fold grid copies.
+        self._rho = self.h.scalar_field("to_dwell_rho")
+        self._moments = self.h.fc.real_field(
+            "to_dwell_moments", (self.NB_MOMENTS,), dtype=self.h.dtype)
+        self._grads = self.h.fc.real_field(
+            "to_dwell_moment_grads", (self.NB_MOMENTS,), dtype=self.h.dtype)
 
     def value_and_gradient(self, rho):
-        """Return ``(\\int W dx, d/drho)`` for a nodal density array; the value
-        is MPI-reduced, the gradient is the local nodal slice."""
-        m = self.m
-        views = m.corner_values(rho)
-        if m.element_name == "p1":
-            f_field, grads = self._p1_value_and_corner_grad(views)
-        else:
-            f_field, grads = self._q1_value_and_corner_grad(views)
-        f = m.h.comm.sum(float(np.sum(m.h.to_host(f_field))))
-        grad = m.scatter(grads)
-        return f, grad
+        """Return ``(int W dx, d/drho)`` for a nodal density array; the value
+        is MPI-reduced, the gradient is the local nodal slice.
+
+        The kernel gives each thread its own node, so it writes the nodal
+        gradient directly -- no scatter and no ghost reduction here.
+        """
+        h = self.h
+        self._rho.p[...] = h.to_device(np.asarray(rho, dtype=h.dtype))
+        h.engine.communicate_ghosts(self._rho)
+        self.op.compute(self._rho, self._moments, self._grads)
+        c = self.W_COEFFS
+        m = h.to_host(self._moments.p).reshape((self.NB_MOMENTS, -1))
+        g = h.to_host(self._grads.p).reshape((self.NB_MOMENTS, -1))
+        f = h.comm.sum(float(c @ m.sum(axis=1)))
+        return f, (c @ g).reshape(np.shape(rho))
