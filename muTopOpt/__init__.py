@@ -55,6 +55,7 @@ from .regularization import (
     PhaseFieldRegularization,
     fe_laplacian_stencil,
 )
+from .version import git_revision, mugrid_version, mutopopt_version, version_string
 
 __all__ = [
     "Homogenization",
@@ -74,4 +75,8 @@ __all__ = [
     "fe_laplacian_stencil",
     "effective_stiffness",
     "isotropic_moduli_2d",
+    "git_revision",
+    "mugrid_version",
+    "mutopopt_version",
+    "version_string",
 ]
