@@ -44,6 +44,11 @@ from muTopOpt.optimize import (
     optimize_bounded_lbfgs,
 )
 from muTopOpt.restart import INITIAL_DENSITY_KINDS, restart_density
+from muTopOpt.version import (
+    mugrid_version,
+    mutopopt_version,
+    provenance_attributes,
+)
 
 
 class _HelpFormatter(
@@ -332,6 +337,12 @@ def main():
         cg_verbose=args.output_cg_iters,
         dtype=dtype,
     )
+    # Banner first, before the restart read: a run that dies in setup should
+    # still say which build it was. muGrid prints from every rank (its banner
+    # carries the per-rank decomposition); muTopOpt's is rank-independent.
+    print(mugrid_version(homog.comm))
+    if rank0:
+        print(mutopopt_version())
 
     # Target conductivity tensor: isotropic (scalar) or arbitrary (dim*dim values)
     if len(args.target_kappa) == 1:
@@ -406,7 +417,6 @@ def main():
                   zip(homog.engine.subdomain_locations, homog.nb_pixels))
         ].copy()
 
-    print(muGrid.version_string(communicator=homog.comm))
     if rank0:
         print(
             f"muTopOpt (conductivity): {dim}D  grid={tuple(args.nb_grid_pts)}  "
@@ -484,6 +494,9 @@ def main():
         )
         fio.write_global_attribute("precision", args.precision)
         fio.write_global_attribute("command_line", shlex.join(sys.argv))
+        # Which build produced the file (see simulate.py).
+        for name, value in provenance_attributes().items():
+            fio.write_global_attribute(name, value)
         maxlen = int(args.bfgs_maxiter) + 1
         max_frames = (maxlen // dump_every + 3) if dump_intermediate else 1
         fio.write_global_attribute("dump_every", [int(dump_every)])

@@ -54,6 +54,11 @@ from muTopOpt.optimize import (
     optimize_trust_region,
 )
 from muTopOpt.restart import INITIAL_DENSITY_KINDS, restart_density
+from muTopOpt.version import (
+    mugrid_version,
+    mutopopt_version,
+    provenance_attributes,
+)
 
 
 class _HelpFormatter(
@@ -459,6 +464,13 @@ def main():
         device=args.device,
         dtype=dtype,
     )
+    # Banner first, before the target checks and the restart read: a run that
+    # dies in setup should still say which build it was. muGrid prints from
+    # every rank (its banner carries the per-rank decomposition); muTopOpt's is
+    # rank-independent, so rank 0 prints it alone.
+    print(mugrid_version(homog.comm, homog.device))
+    if rank0:
+        print(mutopopt_version())
     if (args.target_E is None) != (args.target_nu is None):
         p.error("--target-E and --target-nu must be given together")
     if args.target_E is not None:
@@ -551,7 +563,6 @@ def main():
                   zip(homog.engine.subdomain_locations, homog.nb_pixels))
         ].copy()
 
-    print(muGrid.version_string(communicator=homog.comm, device=homog.device))
     if rank0:
         print(
             f"muTopOpt: {dim}D  grid={tuple(args.nb_grid_pts)}  "
@@ -641,6 +652,11 @@ def main():
         # with its final value here (no placeholder/update). `sys.argv` is
         # identical across ranks, so writing from all ranks is consistent.
         fio.write_global_attribute("command_line", shlex.join(sys.argv))
+        # Which build produced the file. `command_line` says what was asked
+        # for; these say what ran it, which is what distinguishes two otherwise
+        # identical runs whose numbers differ.
+        for name, value in provenance_attributes().items():
+            fio.write_global_attribute(name, value)
         # Placeholders, sized to the maximum they can reach (the optimizer runs
         # at most args.bfgs_maxiter iterations, hence at most that many history
         # entries and dumped frames). Real values are written after the run.
