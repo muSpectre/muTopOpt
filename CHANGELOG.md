@@ -40,8 +40,9 @@ Scale
 No stiffness tensor and no strain or stress field is ever stored: the operator,
 the preconditioner and the sensitivity are all matrix-free and fused, and all
 fields share one ghosted, MPI-decomposed, optionally device-resident layout.
-A 512³ design in single precision fits in about 55 GiB on one GPU and runs
-entirely on device.
+A 512³ design in single precision fits on a single 128 GB unified-memory
+accelerator -- measured above 60 GiB resident during the first L-BFGS
+iterations of an MI300A run -- and runs entirely on device.
 
 Requirements
 
