@@ -112,7 +112,7 @@ def main():
         type=float,
         default=None,
         help="phase-field interface width, in physical length units "
-        "(default: two grid spacings)",
+        "(default: one grid spacing)",
     )
     p.add_argument(
         "--reg-weight",
@@ -510,9 +510,11 @@ def main():
 
     target_K, target_G = effective_moduli([lc.target_stress for lc in cases])
     target_E, target_nu = E_nu_from_K_G(target_K, target_G)
-    # The interface width defaults to two grid spacings: wide enough that the
-    # regularization can move interfaces (merge/remove features) instead of
-    # freezing the initial topology, narrow enough for crisp designs.
+    # The interface width defaults to one grid spacing: narrow enough for crisp
+    # designs, wide enough that the regularization can still move interfaces
+    # (merge/remove features) instead of freezing the initial topology -- and
+    # comfortably clear of the lattice-pinning regime (see
+    # test/test_interface_pinning.py).
     eta = max(homog.grid_spacing) if args.eta is None else args.eta
     Reg = (
         NodalPhaseFieldRegularization
