@@ -667,7 +667,13 @@ def main():
         fio.write_global_attribute("dump_every", [int(dump_every)])
         fio.write_global_attribute("converged", [0])
         fio.write_global_attribute("optimizer_message", " " * _MSG_LEN)
+        # Number of *accepted* iterates -- the index the per-iteration
+        # histories and `frame_iterations` below share.
         fio.write_global_attribute("nb_iterations", [0])
+        # The optimizer's raw step count. For the trust region this also
+        # counts rejected trial steps, so it exceeds `nb_iterations`; the gap
+        # is work that produced no iterate.
+        fio.write_global_attribute("nb_optimizer_steps", [0])
         fio.write_global_attribute("final_objective", [0.0])
         fio.write_global_attribute("final_max_gradient", [0.0])
         fio.write_global_attribute("lbfgs_objective_history", [0.0] * maxlen)
@@ -783,12 +789,25 @@ def main():
         )
 
     converged = bool(info["success"])
+    # Two distinct counters exist and must not be conflated. `nb_accepted` is
+    # the number of accepted iterates -- what the per-iteration lines above,
+    # the histories and the dumped frames are all indexed by. `info["nit"]` is
+    # the optimizer's raw step count, which for the trust region also includes
+    # rejected trial steps. Report the accepted count, so the line below agrees
+    # with the last per-iteration line, and name the raw count separately when
+    # the two differ.
+    nb_accepted = len(hist["objective"])
+    nb_steps = int(info["nit"])
     if rank0:
         K, G = effective_moduli(problem.last["stresses"])
         E, nu = E_nu_from_K_G(K, G)
+        opt_label = "trust-region" if optimizer == "tr" else "optimizer"
+        steps_str = ("" if nb_steps == nb_accepted else
+                     f" ({nb_steps} {opt_label} steps incl. rejected)")
         print(
             f"done: {info['message']}  f={info['objective']:.6e}  "
-            f"iters={info['nit']}  K={K:.4g} (target {target_K:.4g})  "
+            f"iters={nb_accepted}{steps_str}  "
+            f"K={K:.4g} (target {target_K:.4g})  "
             f"G={G:.4g} (target {target_G:.4g})  "
             f"E={E:.4g} (target {target_E:.4g})  "
             f"nu={nu:.4g} (target {target_nu:.4g})"
@@ -805,7 +824,12 @@ def main():
         # Always include the final iterate as the last frame (unless it was
         # already the most recent one dumped, i.e. its iteration is a multiple
         # of --dump-every).
-        final_it = int(info["nit"])
+        # Label the final frame with the accepted-iterate index, the same
+        # counter `write_frame` uses for the intermediate dumps -- labelling it
+        # with the raw step count instead made `frame_iterations` mix two
+        # counters, and made this duplicate-check miss (so the last iterate was
+        # written twice whenever it had already been dumped).
+        final_it = nb_accepted
         if not frame_iters or frame_iters[-1] != final_it:
             write_frame(final_it, rho)
 
@@ -828,7 +852,8 @@ def main():
 
         upd("converged", [int(converged)])
         upd("optimizer_message", str(info["message"])[:_MSG_LEN])
-        upd("nb_iterations", [int(info["nit"])])
+        upd("nb_iterations", [nb_accepted])
+        upd("nb_optimizer_steps", [nb_steps])
         upd("final_objective", [float(info["objective"])])
         upd("final_max_gradient", [float(info["max_grad"])])
         if hist["objective"]:
