@@ -502,7 +502,11 @@ def main():
         fio.write_global_attribute("dump_every", [int(dump_every)])
         fio.write_global_attribute("converged", [0])
         fio.write_global_attribute("optimizer_message", " " * _MSG_LEN)
+        # Accepted iterates (the index the histories and `frame_iterations`
+        # share) and the optimizer's raw step count, which for the trust
+        # region also counts rejected trial steps.
         fio.write_global_attribute("nb_iterations", [0])
+        fio.write_global_attribute("nb_optimizer_steps", [0])
         fio.write_global_attribute("final_objective", [0.0])
         fio.write_global_attribute("final_max_gradient", [0.0])
         fio.write_global_attribute("lbfgs_objective_history", [0.0] * maxlen)
@@ -642,8 +646,11 @@ def main():
             )
 
     if args.output is not None:
-        # Always include the final iterate as the last frame
-        final_it = int(info["nit"])
+        # Always include the final iterate as the last frame, labelled with
+        # the accepted-iterate index that `write_frame` uses for the
+        # intermediate dumps (the raw step count mixes two counters and makes
+        # the duplicate-check below miss).
+        final_it = len(hist["objective"])
         if not frame_iters or frame_iters[-1] != final_it:
             write_frame(final_it, rho)
 
@@ -653,7 +660,8 @@ def main():
 
         upd("converged", [int(converged)])
         upd("optimizer_message", str(info["message"])[:_MSG_LEN])
-        upd("nb_iterations", [int(info["nit"])])
+        upd("nb_iterations", [len(hist["objective"])])
+        upd("nb_optimizer_steps", [int(info["nit"])])
         upd("final_objective", [float(info["objective"])])
         upd("final_max_gradient", [float(info["max_grad"])])
         if hist["objective"]:

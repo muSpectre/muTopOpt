@@ -39,7 +39,7 @@ from muTopOpt.optimize import initial_density, optimize_lbfgs
 material = SimpMaterial(E_solid=1.0, nu=0.3, penalty=3.0, void_ratio=1e-3)
 homog    = Homogenization((64, 64), material)              # or (n, n, n) for 3D
 cases    = target_load_cases(2, isotropic_stiffness_tensor(2, K=0.1, G=0.05))
-reg      = PhaseFieldRegularization(homog, eta=1.0, well_weight=1e-3)
+reg      = PhaseFieldRegularization(homog, weight=1.0)
 problem  = StressTargetProblem(homog, cases, regularization=reg)
 
 rho0     = initial_density(homog.nb_pixels, kind="random", seed=0)
