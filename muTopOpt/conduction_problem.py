@@ -107,7 +107,8 @@ class FluxTargetProblem:
             q = h.homogenized_flux(u, lc.macro_gradient)
             fluxes.append(q)
             diff = q - lc.target_flux
-            f += lc.weight * float(np.sum(diff**2)) / norm
+            flux_diff = float(np.sum(diff**2)) / norm
+            f += lc.weight * flux_diff
 
             # Adjoint: S = df/d<q>; rhs = -(1/V) transpose(kappa * S);
             # solve K adj = rhs.
@@ -145,7 +146,9 @@ class FluxTargetProblem:
             gnorm = float(h.comm.max(local)) * self._gnorm_scale
             self.inner_tolerance.observe(gnorm)
 
-        self.last = {"objective": f, "fluxes": fluxes,
+        self.last = {"objective": f,
+                     "flux_diff": flux_diff,
+                     "fluxes": fluxes,
                      "cg_iters": cg_iters, "corrections": corrections,
                      "cg_rtol": rtol}
         return f, grad

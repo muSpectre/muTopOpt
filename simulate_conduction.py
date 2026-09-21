@@ -173,7 +173,13 @@ def main():
         help="L-BFGS convergence tolerance on the step size (relative change "
              "in the density iterate); 0 disables the criterion",
     )
-
+    p.add_argument(
+        "--bfgs-target_tol",
+        type=float,
+        default=0.0,
+        help="L-BFGS convergence tolerance on the size of flux difference target;"
+             " 0 disables the criterion",
+    )
     p.add_argument(
         "--output-cg-iters",
         action="store_true",
@@ -606,6 +612,15 @@ def main():
                 kappa_eff, formatter={'float_kind': lambda x: f"{x:.4f}"})
             # print(f"Optimized: kappa=\n{kappa_str} (anisotropic)")
 
+        if args.bfgs_target_tol is not None:
+            _csc_tol = args.bfgs_target_tol
+            if problem.last["flux_diff"] < _csc_tol:
+                print(problem.last["flux_diff"]
+                )
+                return True
+
+        return False
+
     rho, info = optimize_bounded_lbfgs(
         problem,
         rho0,
@@ -634,10 +649,7 @@ def main():
         kappa_str = np.array2string(
             kappa_eff, formatter={'float_kind': lambda x: f"{x:.4f}"})
         print(f"Optimized: kappa=\n{kappa_str} (anisotropic)")
-        homog_data_str = np.array2string(
-            homog_data, formatter={'float_kind': lambda x: f"{x:.4f}"})
-        print(f"Optimized: homog_data_str=\n{homog_data_str} (anisotropic)")
-
+        print(f"target: kappa_tensor=\n{kappa_target} (anisotropic)")
         if not converged:
             print(
                 f"WARNING: L-BFGS did NOT converge; the written density "
