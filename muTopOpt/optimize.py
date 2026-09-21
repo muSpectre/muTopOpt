@@ -221,10 +221,10 @@ def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
         for _ in range(int(smoothing)):
             for ax in range(rho.ndim):
                 rho = (
-                    rho
-                    + np.roll(rho, 1, axis=ax)
-                    + np.roll(rho, -1, axis=ax)
-                ) / 3.0
+                              rho
+                              + np.roll(rho, 1, axis=ax)
+                              + np.roll(rho, -1, axis=ax)
+                      ) / 3.0
         rho -= rho.mean()
         std = rho.std()
         if std > 0:
@@ -250,7 +250,7 @@ def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
         for ax in range(ndim):
             sigma_px = float(length) / grid_spacing[ax]
             f = np.fft.fftfreq(shape[ax])
-            g = np.exp(-2.0 * np.pi**2 * sigma_px**2 * f**2)
+            g = np.exp(-2.0 * np.pi ** 2 * sigma_px ** 2 * f ** 2)
             spec *= g.reshape([-1 if d == ax else 1 for d in range(ndim)])
         rho = np.fft.ifftn(spec).real
 
@@ -266,7 +266,9 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
                            ftol=0.0, xtol=0.0, bounds=(0.0, 1.0), maxcor=10,
                            callback=None, cg_tol_start=None, cg_tol_min=None,
                            cg_forcing_c=1.0, cg_forcing_exp=1.0,
-                           cg_stall_rel=1e-2, cg_stall_shrink=0.3):
+                           cg_stall_rel=1e-2, cg_stall_shrink=0.3,
+                           custom_stop_crit=None
+                           ):
     """Minimize ``problem`` from ``rho0`` with NuMPI's MPI-distributed,
     box-constrained L-BFGS. Returns ``(rho_opt, info)``.
 
@@ -327,7 +329,8 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
             inner_tol.advance()
         history.append(problem.last.get("objective"))
         if callback is not None:
-            callback(len(history), x, problem.last)
+            return callback(len(history), x, problem.last)
+        return False
 
     # NuMPI compares the raw per-variable gradient; gtol/max_grad are in
     # mesh-invariant ĝ units (see _gradient_scale).
@@ -336,7 +339,7 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         fun, np.asarray(rho0, dtype=float), jac=None,
         bounds_lo=bounds[0], bounds_hi=bounds[1],
         gtol=gtol * gscale, ftol=ftol, xtol=xtol, maxiter=maxiter,
-        maxcor=maxcor, comm=comm, callback=_cb,
+        maxcor=maxcor, comm=comm, callback=_cb
     )
     info = {
         "success": bool(res.success),
@@ -474,7 +477,8 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         hv_stats["hessp"] = 0
         history.append(problem.last.get("objective"))
         if callback is not None:
-            callback(len(history), x, problem.last)
+            return callback(len(history), x, problem.last)
+        return False
 
     # NuMPI compares the raw per-variable gradient; gtol/max_grad are in
     # mesh-invariant ĝ units (see _gradient_scale).
@@ -533,7 +537,8 @@ def optimize_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=1e-9,
             inner_tol.advance()
         history.append(problem.last.get("objective"))
         if callback is not None:
-            callback(len(history), xk.reshape(shape), problem.last)
+            return callback(len(history), xk.reshape(shape), problem.last)
+        return False
 
     # SciPy's pgtol compares the raw per-variable gradient; gtol is in
     # mesh-invariant ĝ units (see _gradient_scale).
