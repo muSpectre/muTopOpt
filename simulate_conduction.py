@@ -649,10 +649,7 @@ def main():
         kappa_str = np.array2string(
             kappa_eff, formatter={'float_kind': lambda x: f"{x:.4f}"})
         print(f"Optimized: kappa=\n{kappa_str} (anisotropic)")
-        homog_data_str = np.array2string(
-            homog_data, formatter={'float_kind': lambda x: f"{x:.4f}"})
-        print(f"Optimized: homog_data_str=\n{homog_data_str} (anisotropic)")
-
+        print(f"target: kappa_tensor=\n{kappa_target} (anisotropic)")
         if not converged:
             print(
                 f"WARNING: L-BFGS did NOT converge; the written density "
