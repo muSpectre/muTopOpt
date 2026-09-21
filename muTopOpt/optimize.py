@@ -267,7 +267,6 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
                            callback=None, cg_tol_start=None, cg_tol_min=None,
                            cg_forcing_c=1.0, cg_forcing_exp=1.0,
                            cg_stall_rel=1e-2, cg_stall_shrink=0.3,
-                           custom_stop_crit=None
                            ):
     """Minimize ``problem`` from ``rho0`` with NuMPI's MPI-distributed,
     box-constrained L-BFGS. Returns ``(rho_opt, info)``.
