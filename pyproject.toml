@@ -15,7 +15,10 @@ requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
     "numpy",
-    "muGrid>=1.3.0",
+    # 1.4.0 is the first release whose float32 reductions return double
+    # instead of narrowing to inf, and the first to export
+    # muGrid.Solvers.FLOAT32_RTOL_FLOOR, which muTopOpt.precision reuses.
+    "muGrid>=1.4.0",
     "NuMPI",
 ]
 
