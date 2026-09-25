@@ -23,6 +23,8 @@ with ``rho`` shaped like :attr:`Homogenization.nb_pixels`.
 
 import numpy as np
 
+from .precision import cg_rtol_floor
+
 
 def _gradient_scale(problem):
     """``V_e/V``: converts a *mesh-invariant* ``gtol`` -- measured on the
@@ -164,6 +166,16 @@ class AdaptiveInnerTolerance:
         return self.current
 
 
+def _problem_rtol_floor(problem):
+    """Smallest inner-CG rtol the problem's field precision can reach.
+
+    0.0 for a double-precision problem, and for anything that does not expose
+    a dtype, so every clamp below is a no-op there.
+    """
+    dtype = getattr(getattr(problem, "h", None), "dtype", None)
+    return 0.0 if dtype is None else cg_rtol_floor(dtype)
+
+
 def _make_inner_tolerance(problem, cg_tol_start, cg_tol_min, cg_forcing_c,
                           cg_forcing_exp, cg_stall_rel, cg_stall_shrink,
                           bounds):
@@ -173,12 +185,17 @@ def _make_inner_tolerance(problem, cg_tol_start, cg_tol_min, cg_forcing_c,
 
     ``cg_tol_min`` defaults to the homogenization's fixed ``cg_tol`` -- i.e.
     "start coarse at ``cg_tol_start`` and tighten down to the tolerance you
-    would otherwise have used throughout"."""
+    would otherwise have used throughout" -- and is raised to the floor the
+    problem's precision can actually reach. That clamp lives here rather than
+    in :class:`AdaptiveInnerTolerance`, which stays a pure, dtype-agnostic
+    controller."""
     if cg_tol_start is None:
         problem.inner_tolerance = None
         return None
     if cg_tol_min is None:
         cg_tol_min = getattr(problem.h, "cg_tol", 1e-8)
+    cg_tol_min = max(cg_tol_min, _problem_rtol_floor(problem))
+    cg_tol_start = max(cg_tol_start, cg_tol_min)
     controller = AdaptiveInnerTolerance(
         cg_tol_start, cg_tol_min, c=cg_forcing_c, alpha=cg_forcing_exp,
         stall_rel=cg_stall_rel, shrink=cg_stall_shrink, bounds=bounds,
@@ -421,6 +438,11 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
 
     if cg_tol_start is None:
         cg_tol_start = getattr(problem.h, "cg_tol", 1e-8)
+    # The trust-region default (1e-10) is four orders below what float32 can
+    # reach; without this the accuracy control tightens into a region where
+    # only the recursive residual improves.
+    cg_tol_min = max(cg_tol_min, _problem_rtol_floor(problem))
+    cg_tol_start = max(cg_tol_start, cg_tol_min)
     # Reuse AdaptiveInnerTolerance purely as the rtol holder the problem
     # already knows how to read (`.current`) -- the trust-region accuracy
     # control below, not the forcing-term/ratchet logic, drives it (advance()

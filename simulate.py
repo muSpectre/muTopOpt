@@ -425,18 +425,25 @@ def main():
             warnings.warn(
                 f"--cg-tol-min {cg_tol_min:.1e} is below the single-"
                 f"precision solve accuracy floor (~{rtol_floor:.0e}); the "
-                "true residual cannot reach it and CG may fail",
+                "true residual cannot reach it, so it will be raised to the "
+                "floor",
                 RuntimeWarning,
             )
     elif optimizer == "tr":
-        cg_tol_min = max(1e-10, rtol_floor)
+        cg_tol_min = 1e-10
     else:
-        cg_tol_min = max(min(args.cg_tol, bfgs_gtol / _KAPPA_EFF), rtol_floor)
+        cg_tol_min = min(args.cg_tol, bfgs_gtol / _KAPPA_EFF)
     if cg_tol_start is None and optimizer == "tr":
         # Adaptation disabled: pin the trust-region accuracy control at the
         # fixed --cg-tol (start == floor), i.e. a truly fixed tolerance.
         cg_tol_start = args.cg_tol
         cg_tol_min = args.cg_tol
+    # Apply the precision floor *last*, so no branch above can route around it
+    # -- which is exactly what the two assignments immediately above used to
+    # do, silently discarding the floor whenever adaptation was switched off.
+    cg_tol_min = max(cg_tol_min, rtol_floor)
+    if cg_tol_start is not None:
+        cg_tol_start = max(cg_tol_start, cg_tol_min)
 
     if muGrid.has_mpi:
         from mpi4py import MPI

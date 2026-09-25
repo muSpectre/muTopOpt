@@ -27,6 +27,7 @@ to constrain the effective stiffness, a 3D problem 6.
 from dataclasses import dataclass
 
 import numpy as np
+from muGrid import linalg
 
 
 @dataclass
@@ -235,8 +236,13 @@ class StressTargetProblem:
                 # the reported value is second-order accurate in the solve
                 # error and exactly the function whose ρ-derivative the
                 # gradient below is.
-                corr = -h.comm.sum(float(
-                    h._xp.sum(adj.p * self._res_u.p)))
+                # vecdot reduces the interior in double and needs no
+                # temporary; `xp.sum(adj.p * res.p)` built a full-size float32
+                # product array and summed it in float32, which at 512^3 costs
+                # both accuracy and ~dim*N*4 bytes. This value is the reported
+                # objective *and* feeds the trust region's accuracy control,
+                # so its error budget is the tightest in the package.
+                corr = -h.comm.sum(float(linalg.vecdot(adj, self._res_u)))
                 f += corr
                 corrections.append(corr)
 

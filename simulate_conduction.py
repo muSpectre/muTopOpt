@@ -29,6 +29,8 @@ import sys
 import time
 
 import muGrid
+import warnings
+
 import numpy as np
 
 from muTopOpt import (
@@ -39,6 +41,7 @@ from muTopOpt import (
     SimpConductivity,
 )
 from muTopOpt.loadcases_conduction import target_load_cases
+from muTopOpt.precision import cg_rtol_floor
 from muTopOpt.optimize import (
     initial_density,
     optimize_bounded_lbfgs,
@@ -308,7 +311,15 @@ def main():
             f"--init must be one of {', '.join(INITIAL_DENSITY_KINDS)} or an "
             f"existing NetCDF restart file; '{args.init}' is neither")
 
-    bfgs_gtol = args.bfgs_gtol if args.bfgs_gtol is not None else 2.5
+    # Precision-aware accuracy limits, matching simulate.py. In float32 the
+    # *true* residual b - Kx stagnates at |r|/|b| ~ 1.5e-6 (only the recursive
+    # CG residual keeps shrinking below that), so tolerances under ~1e-6 buy
+    # no accuracy, and the achievable gradient accuracy at that floor makes a
+    # tight gtol uncertifiable.
+    rtol_floor = cg_rtol_floor(
+        np.float32 if args.precision == "single" else np.float64)
+    bfgs_gtol = (args.bfgs_gtol if args.bfgs_gtol is not None
+                 else (25.0 if rtol_floor > 0.0 else 2.5))
 
     # Adaptive inner CG tolerance is on by default (<= 0 disables it).
     _KAPPA_EFF = 1e4
@@ -316,8 +327,16 @@ def main():
                     if args.cg_tol_start and args.cg_tol_start > 0 else None)
     if args.cg_tol_min is not None:
         cg_tol_min = args.cg_tol_min
+        if cg_tol_min < rtol_floor:
+            warnings.warn(
+                f"--cg-tol-min {cg_tol_min:.1e} is below the single-precision "
+                f"solve accuracy floor (~{rtol_floor:.0e}); the true residual "
+                "cannot reach it, so it will be raised to the floor",
+                RuntimeWarning,
+            )
     else:
-        cg_tol_min = max(min(args.cg_tol, bfgs_gtol / _KAPPA_EFF), 0.0)
+        cg_tol_min = min(args.cg_tol, bfgs_gtol / _KAPPA_EFF)
+    cg_tol_min = max(cg_tol_min, rtol_floor)
 
     if muGrid.has_mpi:
         from mpi4py import MPI

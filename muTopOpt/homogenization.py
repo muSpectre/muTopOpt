@@ -25,9 +25,12 @@ layout.
 
 import os
 
+import warnings
+
 import numpy as np
 
 import muGrid
+from muGrid import linalg
 from muGrid.Preconditioners import (
     make_green_jacobi_preconditioner,
     make_reference_stiffness_preconditioner,
@@ -35,6 +38,7 @@ from muGrid.Preconditioners import (
 from muGrid.Solvers import ConvergenceError, conjugate_gradients
 
 from .material import SimpMaterial
+from .precision import cg_rtol_floor
 
 # muGrid's ``conjugate_gradients`` gained an optional ``residual`` out-field
 # (the final r = b - Kx, needed for the adjoint-corrected objective) after
@@ -169,7 +173,7 @@ class Homogenization:
         domain_lengths=None,
         element="q1",
         preconditioner="green-jacobi",
-        cg_tol=1e-8,
+        cg_tol=None,
         cg_maxiter=2000,
         cg_verbose=False,
         device=None,
@@ -280,7 +284,16 @@ class Homogenization:
 
         self.preconditioner_kind = preconditioner
         self.timer = timer
-        self.cg_tol = cg_tol
+        # Smallest relative residual this precision can actually reach; 0.0
+        # in double, so everything below is a no-op there. See
+        # muTopOpt.precision.
+        self._rtol_floor = cg_rtol_floor(self.dtype)
+        self._rtol_clamp_warned = False
+        # Default is dtype-aware: 1e-8 is meaningless in float32, and a
+        # default the caller never chose should not produce a warning.
+        # An explicit value that cannot be reached does warn (_clamp_rtol).
+        self.cg_tol = (max(1e-8, self._rtol_floor) if cg_tol is None
+                       else self._clamp_rtol(cg_tol))
         self.cg_maxiter = cg_maxiter
         # Stagnation safeguard of the CG solves (see solve_rhs): a solve whose
         # residual has not improved by at least `cg_stagnation_rel` (relative)
@@ -407,6 +420,30 @@ class Homogenization:
         self.engine.communicate_ghosts(u)
         self.op.apply(u, self.lam, self.mu, Au)
 
+    def _clamp_rtol(self, rtol):
+        """Raise ``rtol`` to what this precision can actually reach, warning
+        once if it had to.
+
+        A float32 solve asked for 1e-8 cannot get there: it burns
+        ``cg_maxiter`` iterations and is then rescued by the stagnation guard,
+        with a worse iterate than the reachable tolerance would have produced.
+        The warning fires once per instance so a per-iteration solve loop does
+        not drown the log.
+        """
+        if rtol is None or rtol >= self._rtol_floor:
+            return rtol
+        if not self._rtol_clamp_warned:
+            self._rtol_clamp_warned = True
+            warnings.warn(
+                f"{type(self).__name__}: inner CG rtol={rtol:.1e} is below "
+                f"the {np.dtype(self.dtype).name} solve accuracy floor "
+                f"(~{self._rtol_floor:.0e}) and cannot be reached; using the "
+                "floor instead. Pass dtype=np.float64 for a tighter solve.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        return self._rtol_floor
+
     def solve_rhs(self, b, x, rtol=None, maxiter=None, rhs_scale=None,
                   residual=None, label=None, warm_start=False):
         """Solve ``K x = b`` in place; returns ``x``.
@@ -441,8 +478,14 @@ class Homogenization:
         trust-region model only needs a bounded Hessian-vector product."""
         if not warm_start:
             x.set_zero()
-        bp = b.p.ravel()
-        b_norm = np.sqrt(self.comm.sum(float(self._xp.dot(bp, bp))))
+        # muGrid's reductions run over the interior in double precision and
+        # return it. Reducing b.p.ravel() with xp.dot instead would (a) use
+        # BLAS sdot for a float32 field, whose error grows *linearly* in N --
+        # 4.6e-4 relative at 512^3 against 6.9e-8 at 64^3 -- and (b) silently
+        # materialise a full contiguous copy of the field, because .p is a
+        # strided view whenever the collection carries ghosts. It also makes
+        # b_norm bit-identical to the ||b|| the CG itself converges against.
+        b_norm = np.sqrt(self.comm.sum(float(linalg.norm_sq(b))))
         scale = rhs_scale if rhs_scale is not None else getattr(
             self, "_mat_scale", 1.0)
         verbose = self.cg_verbose and self.comm.rank == 0
@@ -476,8 +519,12 @@ class Homogenization:
             # if it beats a cold start (``|b - K x₀| < |b|``), else zero it.
             # One extra operator apply -- negligible against the CG it saves.
             self._hessp(x, self._Ku)
-            diff = bp - self._Ku.p.ravel()
-            warm_norm = np.sqrt(self.comm.sum(float(self._xp.dot(diff, diff))))
+            # _Ku <- K x - b, whose norm is |b - K x|; the fused axpy_norm_sq
+            # does the update and the reduction in one pass and needs no
+            # scratch field. _Ku is dead here -- every later use rewrites it
+            # via _hessp first.
+            warm_norm = np.sqrt(self.comm.sum(
+                float(linalg.axpy_norm_sq(-1.0, b, self._Ku))))
             if not (warm_norm < b_norm):
                 x.set_zero()
                 if verbose:
@@ -503,7 +550,12 @@ class Homogenization:
         # iteration budget and raises. ``guard['best']``/``guard['ref']`` are
         # squared norms; ``rel`` compares in the norm, hence the square.
         counter = {"n": 0}
-        rtol_eff = self.cg_tol if rtol is None else rtol
+        # Clamp at the point of consumption, not at one branch of one
+        # driver: every caller -- the fixed cg_tol, an adaptive controller's
+        # current value, a Hessian-vector solve's own rtol -- passes through
+        # here, so the float32 floor cannot be routed around. In double
+        # precision the floor is 0.0 and this is a no-op.
+        rtol_eff = self._clamp_rtol(self.cg_tol if rtol is None else rtol)
         stall = (1.0 - self.cg_stagnation_rel) ** 2
         diverge = self.cg_divergence_factor ** 2
         guard = {"best": np.inf, "best_iter": 0, "ref": np.inf, "ref_iter": 0,
@@ -566,9 +618,11 @@ class Homogenization:
             # True (non-recursive) residual of the returned iterate; the best
             # recursive rr can be far below it past the precision floor.
             self._hessp(x, self._Ku)
-            self._Ku.s[...] = b.s - self._Ku.s
-            rp = self._Ku.p.ravel()
-            true_norm = np.sqrt(self.comm.sum(float(self._xp.dot(rp, rp))))
+            # _Ku <- b - K x, the true residual of the salvaged iterate.
+            # axpby avoids the full-size temporary that `b.s - _Ku.s` builds,
+            # and norm_sq reduces it in double (see solve_rhs's b_norm).
+            linalg.axpby(1.0, b, -1.0, self._Ku)
+            true_norm = np.sqrt(self.comm.sum(float(linalg.norm_sq(self._Ku))))
             if not (true_norm < b_norm):
                 # Worse than doing nothing: the zero solution (residual b) is
                 # the safest answer for a rhs this close to round-off.
