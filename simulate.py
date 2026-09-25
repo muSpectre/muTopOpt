@@ -544,12 +544,14 @@ def main():
         if args.init == "filtered_random" and length is None:
             length = 3.0 * reg.eta
         rho0 = initial_density(
-            homog.nb_pixels,
+            tuple(args.nb_grid_pts),
             kind=args.init,
             volume_fraction=args.init_volume_fraction,
             seed=args.seed,
             length=length,
             grid_spacing=homog.grid_spacing,
+            subdomain_locations=homog.engine.subdomain_locations,
+            nb_subdomain_grid_pts=homog.nb_pixels,
         )
     else:
         # Restart from the last frame of a previous run (every rank reads the

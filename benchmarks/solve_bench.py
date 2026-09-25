@@ -114,9 +114,11 @@ def build(args, timer=None):
     # length 3*eta, eta = one grid spacing), so the material contrast the
     # preconditioner sees is representative rather than uniform.
     rho = initial_density(
-        homog.nb_pixels, kind="filtered_random", seed=args.seed,
+        homog.nb_grid_pts, kind="filtered_random", seed=args.seed,
         length=3.0 * float(homog.grid_spacing[0]),
         grid_spacing=homog.grid_spacing,
+        subdomain_locations=homog.engine.subdomain_locations,
+        nb_subdomain_grid_pts=homog.nb_pixels,
     )
     homog.set_density(rho)
     return homog

@@ -4,6 +4,13 @@ Change log for muTopOpt
 unreleased
 ----------
 
+- FIX: `simulate.py` and `benchmarks/solve_bench.py` start every rank count
+  from the same design. `initial_density` was handed the rank-local shape, so
+  each rank drew the same noise and filtered it periodically on its own
+  subdomain: a 2-rank run started from two copies of a half-size design, not
+  the serial one. `initial_density` now takes the global shape plus
+  `subdomain_locations` / `nb_subdomain_grid_pts` and returns this rank's
+  slice (which `simulate_conduction.py` already did by hand)
 - ENH: `--preconditioner hybrid` and `hybrid-jacobi` invert the reference
   stiffness with muGrid's `HybridFourierTridiagonalPreconditioner` (FFT in the
   rank-local axes, a tridiagonal solve in the distributed one) instead of a
