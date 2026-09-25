@@ -228,6 +228,13 @@ class Homogenization:
         self.domain_volume = float(np.prod(self.domain_lengths))
 
         self.device = _resolve_device(device, self.comm)
+        # cupy places arrays (and launches kernels) on its *current* device,
+        # device 0 unless told otherwise. With one GPU per rank that would put
+        # every cupy temporary of rank 1 on GPU 0, next to fields on GPU 1.
+        if self.device is not None and self.device.is_device:
+            import cupy
+
+            cupy.cuda.Device(self.device.device_id).use()
         # On a unified-memory APU, default to the managed allocator so device
         # fields can use the full HBM rather than the smaller coarse-grained
         # window (see _enable_managed_device_allocator). On a *discrete* GPU

@@ -4,6 +4,9 @@ Change log for muTopOpt
 unreleased
 ----------
 
+- FIX: `Homogenization` makes the rank's GPU cupy's current device. cupy
+  otherwise defaults to device 0, so with one GPU per rank every cupy
+  temporary of rank 1 landed on GPU 0 next to fields on GPU 1
 - FIX: The inner CG's norms come from muGrid's `linalg.norm_sq` / `vecdot` /
   `axpy_norm_sq` instead of `xp.dot` on the raw field buffer. BLAS `sdot`
   accumulates a float32 field in float32, so its error grows *linearly* in the
