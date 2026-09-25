@@ -205,8 +205,18 @@ def _make_inner_tolerance(problem, cg_tol_start, cg_tol_min, cg_forcing_c,
 
 
 def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
-                    smoothing=2, length=None, grid_spacing=None, contrast=0.5):
+                    smoothing=2, length=None, grid_spacing=None, contrast=0.5,
+                    subdomain_locations=None, nb_subdomain_grid_pts=None):
     """Build an initial element-wise density.
+
+    ``shape`` is the *global* grid. Under MPI pass the rank's
+    ``subdomain_locations`` and ``nb_subdomain_grid_pts`` (e.g.
+    ``homog.engine.subdomain_locations`` and ``homog.nb_pixels``): the field is
+    then generated on the whole grid, identically on every rank, and only this
+    rank's slice is returned -- so a parallel run starts from exactly the design
+    a serial run does. Passing the *local* shape as ``shape`` instead would draw
+    and filter an independent field per subdomain, making the starting design
+    depend on the number of ranks.
 
     ``kind='uniform'`` fills with ``volume_fraction``.
 
@@ -229,6 +239,20 @@ def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
     eta`` -- the regularization then *sharpens the blob boundaries* rather
     than dissolving the blobs.
     """
+    if (subdomain_locations is None) != (nb_subdomain_grid_pts is None):
+        raise ValueError("pass both subdomain_locations and "
+                         "nb_subdomain_grid_pts, or neither")
+    rho = _global_initial_density(shape, kind, volume_fraction, seed,
+                                  smoothing, length, grid_spacing, contrast)
+    if subdomain_locations is None:
+        return rho
+    return rho[tuple(slice(int(lo), int(lo) + int(n)) for lo, n in
+                     zip(subdomain_locations, nb_subdomain_grid_pts))].copy()
+
+
+def _global_initial_density(shape, kind, volume_fraction, seed, smoothing,
+                            length, grid_spacing, contrast):
+    """The initial density on the full grid ``shape``; see initial_density."""
     if kind == "uniform":
         return np.full(shape, float(volume_fraction))
     if kind == "random":

@@ -297,11 +297,16 @@ def main():
     )
     p.add_argument(
         "--preconditioner",
-        choices=["green-jacobi", "green"],
+        choices=["green-jacobi", "green", "hybrid-jacobi", "hybrid"],
         default="green-jacobi",
         help="inner-solve preconditioner: 'green-jacobi' (J-FFT, "
-        "reference stiffness times a per-pixel Jacobi scaling) "
-        "or 'green' (plain reference-stiffness Green operator)",
+        "reference stiffness times a per-pixel Jacobi scaling), "
+        "'green' (plain reference-stiffness Green operator), or "
+        "'hybrid-jacobi' / 'hybrid', the same two with the reference "
+        "stiffness inverted by muGrid's HybridFourierTridiagonal"
+        "Preconditioner: FFT in the rank-local axes and a tridiagonal "
+        "solve in the distributed one, so no all-to-all. Same iterations; "
+        "slower on one GPU, faster from ~128^3 on two",
     )
     p.add_argument(
         "--element",
@@ -539,12 +544,14 @@ def main():
         if args.init == "filtered_random" and length is None:
             length = 3.0 * reg.eta
         rho0 = initial_density(
-            homog.nb_pixels,
+            tuple(args.nb_grid_pts),
             kind=args.init,
             volume_fraction=args.init_volume_fraction,
             seed=args.seed,
             length=length,
             grid_spacing=homog.grid_spacing,
+            subdomain_locations=homog.engine.subdomain_locations,
+            nb_subdomain_grid_pts=homog.nb_pixels,
         )
     else:
         # Restart from the last frame of a previous run (every rank reads the
