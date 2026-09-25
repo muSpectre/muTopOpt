@@ -4,6 +4,14 @@ Change log for muTopOpt
 unreleased
 ----------
 
+- ENH: `--preconditioner hybrid` and `hybrid-jacobi` invert the reference
+  stiffness with muGrid's `HybridFourierTridiagonalPreconditioner` (FFT in the
+  rank-local axes, a tridiagonal solve in the distributed one) instead of a
+  distributed FFT, alone or inside the same J-FFT Jacobi scaling. Same
+  operator, same CG iterations; on two GPUs 3-11% faster per CG iteration than
+  `green-jacobi` from 128^3 in float32, slower on one GPU
+- ENH: `benchmarks/solve_bench.py` runs under `mpirun` (it used to build a
+  serial communicator on every rank) and records `nb_ranks` in its CSV
 - FIX: `Homogenization` makes the rank's GPU cupy's current device. cupy
   otherwise defaults to device 0, so with one GPU per rank every cupy
   temporary of rank 1 landed on GPU 0 next to fields on GPU 1

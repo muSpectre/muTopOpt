@@ -39,6 +39,7 @@ import csv
 import os
 import platform
 import re
+import sys
 import time
 
 import muGrid
@@ -50,7 +51,7 @@ from muTopOpt.optimize import initial_density
 #: Fields written by ``--csv``, in order.
 CSV_COLUMNS = (
     "timestamp", "host", "gpu", "mugrid_version", "mugrid_commit",
-    "mugrid_dirty", "device", "precision", "dim", "n", "nb_pixels",
+    "mugrid_dirty", "device", "nb_ranks", "precision", "dim", "n", "nb_pixels",
     "preconditioner", "element", "rtol", "solves", "iters_per_solve",
     "ms_per_solve", "ms_per_cg_iter",
 )
@@ -86,6 +87,17 @@ def provenance(homog):
     }
 
 
+def _communicator():
+    """MPI communicator under a parallel launch, the serial one otherwise."""
+    try:
+        from mpi4py import MPI
+    except ImportError:
+        return muGrid.Communicator()
+    if MPI.COMM_WORLD.size == 1:
+        return muGrid.Communicator()
+    return muGrid.Communicator(MPI.COMM_WORLD)
+
+
 def build(args, timer=None):
     """Construct the homogenization problem and apply a fixed design."""
     dtype = {"single": np.float32, "double": np.float64}[args.precision]
@@ -94,7 +106,7 @@ def build(args, timer=None):
         penalty=args.penalty, void_ratio=args.void_ratio,
     )
     homog = Homogenization(
-        (args.n,) * args.dim, material,
+        (args.n,) * args.dim, material, comm=_communicator(),
         element=args.element, preconditioner=args.preconditioner,
         device=args.device, dtype=dtype, timer=timer,
     )
@@ -176,7 +188,7 @@ def main():
                    choices=("single", "double"),
                    help="solver precision (default: single)")
     p.add_argument("--preconditioner", default="green-jacobi",
-                   choices=("green-jacobi", "green"))
+                   choices=("green-jacobi", "green", "hybrid-jacobi", "hybrid"))
     p.add_argument("--element", default="p1", choices=("p1", "q1"))
     p.add_argument("--rtol", type=float, default=1e-2,
                    help="inner CG relative tolerance. The default matches the "
@@ -216,8 +228,12 @@ def main():
         timer = Timer()
     homog = build(args, timer=timer)
     strains = unit_strains(args.dim)
+    root = homog.comm.rank == 0
+    if not root:
+        # Every rank takes part in the solves; only rank 0 reports.
+        sys.stdout = open(os.devnull, "w")
 
-    print(f"n={args.n}^{args.dim}  device={args.device}  "
+    print(f"n={args.n}^{args.dim}  ranks={homog.comm.size}  device={args.device}  "
           f"precision={args.precision}  preconditioner={args.preconditioner}  "
           f"element={args.element}  rtol={args.rtol:g}", flush=True)
 
@@ -234,6 +250,7 @@ def main():
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             **provenance(homog),
             "device": args.device,
+            "nb_ranks": homog.comm.size,
             "precision": args.precision,
             "dim": args.dim,
             "n": args.n,
@@ -253,10 +270,10 @@ def main():
               f"min {min(vals):.3f}  median {np.median(vals):.3f}  "
               f"max {max(vals):.3f}")
 
-    if timer is not None:
+    if timer is not None and root:
         timer.print_summary(title="wall time per CG phase")
 
-    if args.csv:
+    if args.csv and root:
         new = not os.path.exists(args.csv)
         if not new:
             with open(args.csv, newline="") as fh:
