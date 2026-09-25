@@ -4,7 +4,7 @@ Change log for muTopOpt
 unreleased
 ----------
 
-- FIX: The inner CG's norms come from muGrid's `linalg.norm_sq` / `vecdot` /
+- BUG: The inner CG's norms come from muGrid's `linalg.norm_sq` / `vecdot` /
   `axpy_norm_sq` instead of `xp.dot` on the raw field buffer. BLAS `sdot`
   accumulates a float32 field in float32, so its error grows *linearly* in the
   number of entries -- measured 4.2e-9 at 32^3 but 5.5e-6 at 128^3 and ~4.6e-4
@@ -16,11 +16,11 @@ unreleased
   additionally makes `b_norm` bit-identical to the `||b||` the CG itself
   converges against, instead of dividing a double-accumulated residual by a
   float32-accumulated norm
-- FIX: The consistent-objective correction `-λᵀr` likewise uses
+- BUG: The consistent-objective correction `-λᵀr` likewise uses
   `linalg.vecdot` rather than summing a full-size float32 product array. This
   value is the reported objective *and* feeds the trust region's accuracy
   control, so it carries the tightest error budget in the package
-- FIX: Inner-CG tolerances are clamped to what the field precision can reach
+- BUG: Inner-CG tolerances are clamped to what the field precision can reach
   (1e-6 in float32, where eps is 1.19e-7 and the true residual `b - Kx`
   stagnates while only the recursive residual keeps shrinking). The floor is
   applied at every point a tolerance is *consumed* -- `solve_rhs`, the adaptive
