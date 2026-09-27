@@ -23,6 +23,7 @@ from muTopOpt.loadcases import (
     unit_strains,
 )
 from muTopOpt.optimize import initial_density, optimize_bounded_lbfgs
+from muTopOpt.regularization import C_W
 
 
 @pytest.mark.parametrize("element", ["p1", "q1"])
@@ -100,7 +101,9 @@ def test_optimizer_recovers_reachable_effective_stiffness(comm):
     targets = [h.homogenized_stress(h.solve_macro(E, u), E) for E in strains]
     cases = [LoadCase(E, t, 1.0) for E, t in zip(strains, targets)]
 
-    reg = PhaseFieldRegularization(h, weight=1e-2)
+    # Same penalty as weight=1e-2 before the 1/(c_W V^((D-1)/D))
+    # normalization of the regularization (unit cell: factor c_W = 1/3).
+    reg = PhaseFieldRegularization(h, weight=1e-2 * C_W)
     problem = StressTargetProblem(h, cases, regularization=reg)
     rho0 = initial_density(h.nb_pixels, kind="random", seed=99,
                            volume_fraction=0.5)

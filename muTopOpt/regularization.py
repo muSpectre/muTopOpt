@@ -7,19 +7,28 @@
 Phase-field regularization of the density.
 
 Following Bourdin/phase-field topology optimization, the density is regularized
-by penalizing interfacial area with a Modica-Mortola functional,
+by penalizing interfacial area with a normalized Modica-Mortola functional,
 
-    f_reg(rho) = weight * [ eta * ∫ |∇rho|^2 dx  +  (1/eta) * ∫ rho^2 (1-rho)^2 dx ].
+    f_reg(rho) = weight / (c_W * V^((D-1)/D))
+                 * [ eta * ∫ |∇rho|^2 dx  +  (1/eta) * ∫ W(rho) dx ],
 
-The gradient penalty smooths the design and removes mesh dependence; the
-double-well ``W(rho) = rho^2 (1 - rho)^2`` (prefactor ``1/eta``) drives rho
-toward {0, 1}. In the Modica-Mortola normalization this functional
-Gamma-converges to (a constant times) the interfacial perimeter as ``eta -> 0``,
-and ``eta`` **is** the interface width, in the *physical length units of the
-unit cell*. It defaults to one grid spacing; choosing it much larger than a few
-grid spacings makes the gradient penalty dominate and the design collapses to a
-constant density. ``weight`` is the overall strength of the regularization
-relative to the (normalized) stress objective.
+    c_W = 2 ∫_0^1 sqrt(W(s)) ds,
+
+with the double-well ``W(rho) = rho^2 (1 - rho)^2``, for which ``c_W = 1/3``
+(:data:`C_W`), and ``V`` the volume of the unit cell. The gradient penalty
+smooths the design and removes mesh dependence; the double-well (prefactor
+``1/eta``) drives rho toward {0, 1}. As ``eta -> 0`` the bracket
+Gamma-converges to ``c_W`` times the interfacial area (Modica-Mortola), so
+``f_reg / weight`` converges to the interfacial area measured in units of
+``L^(D-1)``, with ``L = V^(1/D)`` the linear size of the cell
+(:func:`perimeter_prefactor`). It is dimensionless, and the optimized design
+does not depend on the absolute size of the cell as long as ``eta / L`` is
+held fixed. ``eta`` **is** the interface width, in the *physical length units
+of the unit cell*: the equilibrium profile is the logistic
+``rho(x) = 1 / (1 + exp(-x / eta))``. It defaults to one grid spacing; choosing
+it much larger than a few grid spacings makes the gradient penalty dominate and
+the design collapses to a constant density. ``weight`` is the penalty per unit
+relative interfacial area, in units of the (normalized) stress objective.
 
 Two variants of the gradient penalty are provided:
 
@@ -41,6 +50,22 @@ import numpy as np
 
 import muGrid
 
+#: Interfacial energy per unit area of the quartic double well
+#: ``W(rho) = rho^2 (1 - rho)^2`` in the Modica-Mortola functional
+#: ``∫ [eta |∇rho|^2 + W(rho) / eta] dx``:
+#: ``c_W = 2 ∫_0^1 sqrt(W(s)) ds = 2 ∫_0^1 s (1 - s) ds = 1/3``.
+C_W = 1.0 / 3.0
+
+
+def perimeter_prefactor(homogenization):
+    """``1 / (c_W V^((D-1)/D))``: the factor that turns the raw Modica-Mortola
+    functional into the interfacial area in units of ``L^(D-1)``, with ``V``
+    the cell volume (``homogenization.domain_volume``) and ``L = V^(1/D)`` its
+    linear size."""
+    dim = homogenization.dim
+    V = homogenization.domain_volume
+    return 1.0 / (C_W * V ** ((dim - 1) / dim))
+
 
 class PhaseFieldRegularization:
     def __init__(self, homogenization, eta=None, weight=1.0):
@@ -49,9 +74,12 @@ class PhaseFieldRegularization:
         # eta IS the interface width (Modica-Mortola normalization); it
         # defaults to one grid spacing.
         self.eta = h0 if eta is None else float(eta)
-        # Overall strength of the regularization relative to the (normalized)
-        # stress objective.
+        # Penalty per unit relative interfacial area, in units of the
+        # (normalized) stress objective.
         self.weight = float(weight)
+        # 1 / (c_W V^((D-1)/D)): raw Modica-Mortola bracket -> relative
+        # interfacial area.
+        self.prefactor = perimeter_prefactor(self.h)
 
         if not np.allclose(self.h.grid_spacing, h0):
             # The isotropic FD Laplacian assumes equal spacing; warn rather than
@@ -70,6 +98,11 @@ class PhaseFieldRegularization:
         self._rho = self.h.scalar_field("to_reg_rho")
         self._lap = self.h.scalar_field("to_reg_lap")
 
+    @property
+    def scale(self):
+        """``weight / (c_W V^((D-1)/D))``, applied to the raw functional."""
+        return self.weight * self.prefactor
+
     def value_and_gradient(self, rho):
         """Return (f_reg, df_reg/drho) for an element-wise density array."""
         rho = np.asarray(rho)
@@ -83,7 +116,8 @@ class PhaseFieldRegularization:
             float(np.sum(rho**2 * (1.0 - rho) ** 2))
         ) * self.vol_pixel
 
-        # Modica-Mortola: f_reg = weight * [ eta * ∫|∇rho|^2 + (1/eta) * ∫ W ]
+        # Raw Modica-Mortola bracket eta * ∫|∇rho|^2 + (1/eta) * ∫ W; the
+        # normalization weight / (c_W V^((D-1)/D)) is applied by `scale`.
         f = self.eta * grad_pen + dwell / self.eta
 
         # d/drho [rho^2 (1-rho)^2] = 2 rho (1 - rho)(1 - 2 rho)
@@ -92,7 +126,8 @@ class PhaseFieldRegularization:
             self.eta * 2.0 * lap * self.vol_pixel
             + dwell_drho * self.vol_pixel / self.eta
         )
-        return self.weight * f, self.weight * g
+        scale = self.scale
+        return scale * f, scale * g
 
     def hessian_vector_product(self, rho, v):
         """Return ``H_reg v`` for a density direction ``v`` (exact).
@@ -114,7 +149,7 @@ class PhaseFieldRegularization:
             self.eta * 2.0 * lap_v * self.vol_pixel
             + d2well * v * self.vol_pixel / self.eta
         )
-        return self.weight * hv
+        return self.scale * hv
 
 
 def fe_laplacian_stencil(dim, grid_spacing, element):
@@ -171,7 +206,8 @@ class NodalPhaseFieldRegularization:
 
     Same functional as :class:`PhaseFieldRegularization`,
 
-        f_reg = weight * [ eta * ∫|∇rho|^2 + (1/eta) * ∫ rho^2 (1 - rho)^2 ],
+        f_reg = weight / (c_W V^((D-1)/D))
+                * [ eta * ∫|∇rho|^2 + (1/eta) * ∫ rho^2 (1 - rho)^2 ],
 
     but the density is a *nodal* finite-element field and the gradient penalty
     is the element-consistent H¹ seminorm ``eta * rhoᵀ L rho`` with the fused
@@ -201,7 +237,11 @@ class NodalPhaseFieldRegularization:
         # eta IS the interface width (Modica-Mortola normalization); it
         # defaults to one grid spacing.
         self.eta = (self.h.grid_spacing[0] if eta is None else float(eta))
+        # Penalty per unit relative interfacial area.
         self.weight = float(weight)
+        # 1 / (c_W V^((D-1)/D)): raw Modica-Mortola bracket -> relative
+        # interfacial area.
+        self.prefactor = perimeter_prefactor(self.h)
         if dwell not in ("consistent", "lumped"):
             raise ValueError(f"unknown double-well quadrature '{dwell}'")
         self.dwell_kind = dwell
@@ -222,6 +262,11 @@ class NodalPhaseFieldRegularization:
             self._dwell = ConsistentDoubleWell(NodalElementMap(self.h))
         else:
             self._dwell = None
+
+    @property
+    def scale(self):
+        """``weight / (c_W V^((D-1)/D))``, applied to the raw functional."""
+        return self.weight * self.prefactor
 
     def value_and_gradient(self, rho):
         """Return (f_reg, df_reg/drho) for a nodal density array."""
@@ -247,10 +292,12 @@ class NodalPhaseFieldRegularization:
                 2.0 * rho * (1.0 - rho) * (1.0 - 2.0 * rho) * self.vol_pixel
             )
 
-        # Modica-Mortola: f_reg = weight * [ eta * ∫|∇rho|^2 + (1/eta) * ∫ W ]
+        # Raw Modica-Mortola bracket eta * ∫|∇rho|^2 + (1/eta) * ∫ W; the
+        # normalization weight / (c_W V^((D-1)/D)) is applied by `scale`.
         f = self.eta * grad_pen + dwell / self.eta
         g = self.eta * 2.0 * Lrho + dwell_grad / self.eta
-        return self.weight * f, self.weight * g
+        scale = self.scale
+        return scale * f, scale * g
 
     def hessian_vector_product(self, rho, v):
         """Return ``H_reg v`` for a nodal density direction ``v``.
@@ -274,4 +321,4 @@ class NodalPhaseFieldRegularization:
             self.eta * 2.0 * Lv
             + d2well * v * self.vol_pixel / self.eta
         )
-        return self.weight * hv
+        return self.scale * hv

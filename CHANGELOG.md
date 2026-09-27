@@ -4,6 +4,15 @@ Change log for muTopOpt
 unreleased
 ----------
 
+- API: The phase-field regularization is normalized by `1 / (c_W V^((D-1)/D))`
+  with `c_W = 2 ∫ sqrt(W) = 1/3` for the quartic double well and `V` the cell
+  volume, so that `f_reg / weight` is the interfacial area in units of
+  `L^(D-1)` (`L = V^(1/D)`) and `weight` (`--reg-weight`) is the penalty per
+  unit *relative* interfacial area, independent of the absolute cell size and
+  comparable between 2D and 3D. Previously `f_reg / weight` was `c_W` times
+  the absolute interfacial area. To reproduce an earlier run multiply its
+  `weight` by `c_W V^((D-1)/D)`, i.e. by `1/3` on the unit cell
+  (`muTopOpt.regularization.C_W`, `perimeter_prefactor`)
 - BUG: `simulate.py` and `benchmarks/solve_bench.py` start every rank count
   from the same design. `initial_density` was handed the rank-local shape, so
   each rank drew the same noise and filtered it periodically on its own

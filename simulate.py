@@ -118,7 +118,10 @@ def main():
         "--reg-weight",
         type=float,
         default=1.0,
-        help="overall strength of the phase-field regularization",
+        help="phase-field regularization weight: penalty per unit interfacial "
+        "area, measured in units of L^(D-1) with L the linear cell size "
+        "(the Modica-Mortola functional is normalized by 1/(c_W V^((D-1)/D)), "
+        "c_W = 1/3 for the quartic double well)",
     )
     p.add_argument(
         "--init-volume-fraction",
