@@ -1,8 +1,8 @@
 Change log for muTopOpt
 =======================
 
-unreleased
-----------
+v1.1.0 (05Oct26)
+----------------
 
 - ENH: `simulate.py` writes the elastic response to the NetCDF output. Per
   frame: `homogenized_stress` (one `dim x dim` stress per load case, the

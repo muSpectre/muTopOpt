@@ -13,7 +13,7 @@ optimization step — are solved by muGrid's matrix-free, GPU-capable, J-FFT
 (Green–Jacobi) preconditioned conjugate gradient.
 
 See
-* J-FFT: https://arxiv.org/abs/2508.02613
+* J-FFT: https://doi.org/10.1016/j.cma.2026.119269
 * Topology optimization: https://arxiv.org/abs/2107.04123
 
 ## Install
