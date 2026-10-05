@@ -136,6 +136,12 @@ class AdaptiveInnerTolerance:
         if self._g_first is None:
             self._g_first = self._latest_gnorm
 
+    @property
+    def latest_gnorm(self):
+        """Box-KKT gradient norm of the most recent evaluation (mesh-invariant
+        ĝ units), or ``None`` before the first :meth:`observe`."""
+        return self._latest_gnorm
+
     def advance(self):
         """Retune :attr:`current` from the last observed gradient norm.
 
