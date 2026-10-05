@@ -4,6 +4,26 @@ Change log for muTopOpt
 unreleased
 ----------
 
+- ENH: `simulate.py` writes the elastic response to the NetCDF output. Per
+  frame: `homogenized_stress` (one `dim x dim` stress per load case, the
+  response to `applied_deformation_gradient`) and the isotropic-equivalent
+  `effective_K`, `effective_G`, `effective_E` and `effective_nu` (NaN for
+  frame 0, which is stored before the first evaluation). Global attributes:
+  `target_K`, `target_G`, `target_E`, `target_nu` (both parameterizations,
+  whichever was given), and per-iteration `effective_{K,G,E,nu}_history`
+- BUG: The run-state attributes (`converged`, `optimizer_message`,
+  `nb_iterations`, `final_objective`, `final_max_gradient`, the per-iteration
+  histories, `frame_iterations`) were only filled in after the optimizer
+  returned, so a run killed before that (e.g. at the walltime) left only the
+  placeholders, all zeros. With `--dump-every N` they are now checkpointed
+  after every dumped frame: `optimizer_message` reads
+  `RUNNING (checkpoint at iteration N)`, the histories are valid up to
+  `nb_iterations` and padded with NaN/-1 beyond it, and `nb_optimizer_steps`
+  is -1 until the optimizer returns. The placeholders are NaN/-1 rather
+  than 0, so they cannot be mistaken for values
+- BUG: The final frame and the `done:` summary use the stresses of the last
+  *accepted* iterate, not `problem.last`, which can be a rejected
+  trust-region trial
 - API: The phase-field regularization is normalized by `1 / (c_W V^((D-1)/D))`
   with `c_W = 2 ∫ sqrt(W) = 1/3` for the quartic double well and `V` the cell
   volume, so that `f_reg / weight` is the interfacial area in units of
