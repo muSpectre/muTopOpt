@@ -118,7 +118,10 @@ def main():
         "--reg-weight",
         type=float,
         default=1.,
-        help="overall strength of the phase-field regularization",
+        help="phase-field regularization weight: penalty per unit interfacial "
+        "area, measured in units of L^(D-1) with L the linear cell size "
+        "(the Modica-Mortola functional is normalized by 1/(c_W V^((D-1)/D)), "
+        "c_W = 1/3 for the quartic double well)",
     )
     p.add_argument(
         "--load-weight",
@@ -411,21 +414,18 @@ def main():
         length = args.init_length
         if args.init == "filtered_random" and length is None:
             length = 3.0 * reg.eta
-        # Generate the initial density on the full global grid so that MPI-parallel
-        # runs start from exactly the same field as a serial run (the local
-        # subdomain for each rank is just a slice of that global field).
-        rho0_global = initial_density(
+        # Generated on the full global grid, so MPI-parallel runs start from
+        # exactly the same field as a serial run; each rank keeps its slice.
+        rho0 = initial_density(
             tuple(args.nb_grid_pts),
             kind=args.init,
             volume_fraction=args.init_volume_fraction,
             seed=args.seed,
             length=length,
             grid_spacing=homog.grid_spacing,
+            subdomain_locations=homog.engine.subdomain_locations,
+            nb_subdomain_grid_pts=homog.nb_pixels,
         )
-        rho0 = rho0_global[
-            tuple(slice(lo, lo + n) for lo, n in
-                  zip(homog.engine.subdomain_locations, homog.nb_pixels))
-        ].copy()
     else:
         # Restart from a previous run
         rho0_global, restart_meta = restart_density(

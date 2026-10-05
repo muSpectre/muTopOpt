@@ -32,6 +32,8 @@ import numpy as np
 import muGrid
 from muGrid import linalg
 from muGrid.Preconditioners import (
+    GreenJacobiPreconditioner,
+    HybridFourierTridiagonalPreconditioner,
     make_green_jacobi_preconditioner,
     make_reference_stiffness_preconditioner,
 )
@@ -228,6 +230,13 @@ class Homogenization:
         self.domain_volume = float(np.prod(self.domain_lengths))
 
         self.device = _resolve_device(device, self.comm)
+        # cupy places arrays (and launches kernels) on its *current* device,
+        # device 0 unless told otherwise. With one GPU per rank that would put
+        # every cupy temporary of rank 1 on GPU 0, next to fields on GPU 1.
+        if self.device is not None and self.device.is_device:
+            import cupy
+
+            cupy.cuda.Device(self.device.device_id).use()
         # On a unified-memory APU, default to the managed allocator so device
         # fields can use the full HBM rather than the smaller coarse-grained
         # window (see _enable_managed_device_allocator). On a *discrete* GPU
@@ -406,11 +415,39 @@ class Homogenization:
                     self.engine, apply_ref, self.dim, dtype=self.dtype,
                     timer=self.timer,
                 )
+            elif self.preconditioner_kind in ("hybrid", "hybrid-jacobi"):
+                # The same reference operator as 'green', inverted exactly by
+                # FFT in the rank-local axes and a tridiagonal solve in the
+                # distributed one -- no all-to-all. The engine's real-space
+                # split is the slab ([1, ..., P]) it needs.
+                green = HybridFourierTridiagonalPreconditioner(
+                    self.engine, self.grid_spacing, lam_ref, mu_ref,
+                    communicator=self.comm, element=self.element,
+                    timer=self.timer, dtype=self.dtype,
+                )
+                if self.preconditioner_kind == "hybrid":
+                    self._prec = green
+                else:
+                    diagonal = self.engine.real_space_field(
+                        "to_hybrid_jacobi_diagonal", components=(self.dim,),
+                        dtype=self.dtype)
+                    self.op.assemble_diagonal(self.lam, self.mu, diagonal)
+                    prec = GreenJacobiPreconditioner(
+                        green, diagonal, timer=self.timer,
+                        name="hybrid-jacobi", communicator=self.comm,
+                    )
+
+                    def refresh():
+                        self.op.assemble_diagonal(self.lam, self.mu, diagonal)
+                        prec.update_diagonal(diagonal)
+
+                    prec.refresh = refresh
+                    self._prec = prec
             else:
                 raise ValueError(
                     f"unknown preconditioner '{self.preconditioner_kind}'"
                 )
-        elif self.preconditioner_kind == "green-jacobi":
+        elif self.preconditioner_kind in ("green-jacobi", "hybrid-jacobi"):
             # Reuse the (reference) Green part; refresh only the Jacobi diagonal
             # from the updated material.
             self._prec.refresh()

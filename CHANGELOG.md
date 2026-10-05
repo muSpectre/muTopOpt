@@ -11,7 +11,7 @@ unreleased
   frame 0, which is stored before the first evaluation). Global attributes:
   `target_K`, `target_G`, `target_E`, `target_nu` (both parameterizations,
   whichever was given), and per-iteration `effective_{K,G,E,nu}_history`
-- FIX: The run-state attributes (`converged`, `optimizer_message`,
+- BUG: The run-state attributes (`converged`, `optimizer_message`,
   `nb_iterations`, `final_objective`, `final_max_gradient`, the per-iteration
   histories, `frame_iterations`) were only filled in after the optimizer
   returned, so a run killed before that (e.g. at the walltime) left only the
@@ -21,11 +21,37 @@ unreleased
   `nb_iterations` and padded with NaN/-1 beyond it, and `nb_optimizer_steps`
   is -1 until the optimizer returns. The placeholders are NaN/-1 rather
   than 0, so they cannot be mistaken for values
-- FIX: The final frame and the `done:` summary use the stresses of the last
+- BUG: The final frame and the `done:` summary use the stresses of the last
   *accepted* iterate, not `problem.last`, which can be a rejected
   trust-region trial
-
-- FIX: The inner CG's norms come from muGrid's `linalg.norm_sq` / `vecdot` /
+- API: The phase-field regularization is normalized by `1 / (c_W V^((D-1)/D))`
+  with `c_W = 2 ∫ sqrt(W) = 1/3` for the quartic double well and `V` the cell
+  volume, so that `f_reg / weight` is the interfacial area in units of
+  `L^(D-1)` (`L = V^(1/D)`) and `weight` (`--reg-weight`) is the penalty per
+  unit *relative* interfacial area, independent of the absolute cell size and
+  comparable between 2D and 3D. Previously `f_reg / weight` was `c_W` times
+  the absolute interfacial area. To reproduce an earlier run multiply its
+  `weight` by `c_W V^((D-1)/D)`, i.e. by `1/3` on the unit cell
+  (`muTopOpt.regularization.C_W`, `perimeter_prefactor`)
+- BUG: `simulate.py` and `benchmarks/solve_bench.py` start every rank count
+  from the same design. `initial_density` was handed the rank-local shape, so
+  each rank drew the same noise and filtered it periodically on its own
+  subdomain: a 2-rank run started from two copies of a half-size design, not
+  the serial one. `initial_density` now takes the global shape plus
+  `subdomain_locations` / `nb_subdomain_grid_pts` and returns this rank's
+  slice (which `simulate_conduction.py` already did by hand)
+- ENH: `--preconditioner hybrid` and `hybrid-jacobi` invert the reference
+  stiffness with muGrid's `HybridFourierTridiagonalPreconditioner` (FFT in the
+  rank-local axes, a tridiagonal solve in the distributed one) instead of a
+  distributed FFT, alone or inside the same J-FFT Jacobi scaling. Same
+  operator, same CG iterations; on two GPUs 3-11% faster per CG iteration than
+  `green-jacobi` from 128^3 in float32, slower on one GPU
+- ENH: `benchmarks/solve_bench.py` runs under `mpirun` (it used to build a
+  serial communicator on every rank) and records `nb_ranks` in its CSV
+- BUG: `Homogenization` makes the rank's GPU cupy's current device. cupy
+  otherwise defaults to device 0, so with one GPU per rank every cupy
+  temporary of rank 1 landed on GPU 0 next to fields on GPU 1
+- BUG: The inner CG's norms come from muGrid's `linalg.norm_sq` / `vecdot` /
   `axpy_norm_sq` instead of `xp.dot` on the raw field buffer. BLAS `sdot`
   accumulates a float32 field in float32, so its error grows *linearly* in the
   number of entries -- measured 4.2e-9 at 32^3 but 5.5e-6 at 128^3 and ~4.6e-4
@@ -37,11 +63,11 @@ unreleased
   additionally makes `b_norm` bit-identical to the `||b||` the CG itself
   converges against, instead of dividing a double-accumulated residual by a
   float32-accumulated norm
-- FIX: The consistent-objective correction `-λᵀr` likewise uses
+- BUG: The consistent-objective correction `-λᵀr` likewise uses
   `linalg.vecdot` rather than summing a full-size float32 product array. This
   value is the reported objective *and* feeds the trust region's accuracy
   control, so it carries the tightest error budget in the package
-- FIX: Inner-CG tolerances are clamped to what the field precision can reach
+- BUG: Inner-CG tolerances are clamped to what the field precision can reach
   (1e-6 in float32, where eps is 1.19e-7 and the true residual `b - Kx`
   stagnates while only the recursive residual keeps shrinking). The floor is
   applied at every point a tolerance is *consumed* -- `solve_rhs`, the adaptive

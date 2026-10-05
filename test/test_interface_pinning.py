@@ -24,15 +24,18 @@ curve. Measured here, relative barrier ``dE/E`` over one pixel of translation:
 ``eta = h`` is ~6 orders below the interface energy. Two driving forces set the
 scale it has to be compared against, both in energy per unit volume:
 
-* curvature, ``sigma/R`` with ``sigma = 1/3`` the Modica-Mortola interface
-  energy per unit area -- between 0.3 (a feature as wide as the cell) and ~20
-  (a two-pixel feature) on a 64^2 grid;
+* curvature, ``sigma/R`` with ``sigma = 1`` the normalized interface energy
+  per unit area (the functional is divided by ``c_W L^(D-1)``, see
+  :mod:`muTopOpt.regularization`, so on the unit cell one unit of interface
+  costs one unit of energy) -- between 1 (a feature as wide as the cell) and
+  ~60 (a two-pixel feature) on a 64^2 grid;
 * the gradient tolerance the optimizer stops at. ``--bfgs-gtol`` is measured on
   the mesh-invariant volume-fraction derivative ``(V/V_e) df/drho``, which for
   a unit cell is exactly this quantity, and defaults to 2.5.
 
-The critical depinning force at ``eta = h`` is ``g_c ~ 2e-4`` (measured
-separately by bisection, and scaling like ``1/h``), so the lattice barrier sits
+The critical depinning force at ``eta = h`` is ``g_c ~ 6e-4`` (measured
+separately by bisection for the un-normalized functional as ``2e-4`` and
+rescaled by ``1/c_W = 3``; it scales like ``1/h``), so the lattice barrier sits
 3-4 orders of magnitude below the weakest force in play -- including at the
 very end of a run, which is the tightest point. At ``eta = h/2`` it does not,
 which :func:`test_under_resolved_interface_is_pinned` pins down, so that this
@@ -73,9 +76,15 @@ X1, X2 = 0.375, 0.625
 # digits already at 9; 17 and 33 give the same answer.
 NB_SHIFTS = 9
 
-#: Modica-Mortola energy of one interface per unit area,
-#: ``int[eta rho'^2 + W/eta] = 2 int_0^1 sqrt(W) drho = 1/3``.
-SIGMA = 1.0 / 3.0
+#: Energy of one flat interface per unit area *after* the normalization of
+#: :mod:`muTopOpt.regularization`: the raw Modica-Mortola energy
+#: ``int[eta rho'^2 + W/eta] = 2 int_0^1 sqrt(W) drho = c_W = 1/3`` divided by
+#: ``c_W L^(D-1)``, i.e. ``1 / L`` in 2D with ``L = sqrt(V)`` the linear cell
+#: size. Two interfaces of length ``NY * H`` in a cell of volume ``NY * H``
+#: therefore carry ``2 * NY * H / sqrt(NY * H)``.
+def _expected_slab_energy(hom):
+    L = hom.domain_volume ** 0.5
+    return 2.0 * (NY * H) / L
 
 #: Relative translation barrier ``dE/E``: upper bounds for resolved interfaces,
 #: and a *lower* bound at eta = h/2, where pinning is real.
@@ -152,12 +161,13 @@ def _relative_barrier(reg, eta):
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_fixture_reproduces_continuum_interface_energy(comm, element, variant):
     """Guard on the fixture itself: the slab must carry the analytic interface
-    energy ``2 * sigma`` per unit length. A malformed profile (the easy mistake
+    energy, two interfaces of length ``NY * H`` in units of the cell size
+    (see :func:`_expected_slab_energy`). A malformed profile (the easy mistake
     is a non-periodic one) inflates this by orders of magnitude, and would make
     every barrier number below meaningless."""
     eta = 1.0 * H
     reg = _regularization(element, variant, eta, comm)
-    expected = 2.0 * SIGMA * (NY * H)  # two interfaces, cell height NY*H
+    expected = _expected_slab_energy(_homogenization(element, comm))
     energy = _energy_vs_shift(reg, eta).mean()
     assert energy == pytest.approx(expected, rel=0.05)
 
