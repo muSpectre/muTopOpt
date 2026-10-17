@@ -24,10 +24,27 @@ Typical use::
     reg = PhaseFieldRegularization(homog)  # eta defaults to one grid spacing
     problem = StressTargetProblem(homog, cases, regularization=reg)
     rho, info = optimize_bounded_lbfgs(problem, initial_density(homog.nb_pixels))
+
+Heat conduction (scalar diffusion) is available alongside elasticity, with
+the same optimizer drivers and phase-field regularization::
+
+    from muTopOpt import SimpConductivity, HomogenizationConductivity, FluxTargetProblem
+    from muTopOpt.loadcases_conduction import (
+        isotropic_conductivity_tensor, target_load_cases as target_flux_cases)
+    from muTopOpt.optimize import initial_density, optimize_bounded_lbfgs
+
+    material = SimpConductivity(kappa_solid=1.0)
+    homog = HomogenizationConductivity((64, 64), material)
+    cases = target_flux_cases(2, isotropic_conductivity_tensor(2, kappa=0.1))
+    reg = PhaseFieldRegularization(homog)
+    problem = FluxTargetProblem(homog, cases, regularization=reg)
+    rho, info = optimize_bounded_lbfgs(problem, initial_density(homog.nb_pixels))
 """
 
-__version__ = "0.0.1"
+__version__ = "1.0.0"
 
+from .conduction import HomogenizationConductivity, SimpConductivity
+from .conduction_problem import FluxLoadCase, FluxTargetProblem
 from .homogenization import Homogenization
 from .material import SimpMaterial, E_nu_from_lame, lame_from_E_nu
 from .nodal import ConsistentDoubleWell, NodalElementMap
@@ -39,6 +56,7 @@ from .regularization import (
     fe_laplacian_stencil,
 )
 from .timing import timer
+from .version import git_revision, mugrid_version, mutopopt_version, version_string
 
 __all__ = [
     "Homogenization",
@@ -47,6 +65,10 @@ __all__ = [
     "E_nu_from_lame",
     "LoadCase",
     "StressTargetProblem",
+    "HomogenizationConductivity",
+    "SimpConductivity",
+    "FluxLoadCase",
+    "FluxTargetProblem",
     "PhaseFieldRegularization",
     "NodalPhaseFieldRegularization",
     "NodalElementMap",
@@ -55,4 +77,8 @@ __all__ = [
     "effective_stiffness",
     "isotropic_moduli_2d",
     "timer",
+    "git_revision",
+    "mugrid_version",
+    "mutopopt_version",
+    "version_string",
 ]

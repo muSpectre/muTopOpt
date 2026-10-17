@@ -73,3 +73,46 @@ def test_single_matches_double(comm):
         stresses[dt] = h.homogenized_stress(u, cases[0].macro_strain)
     assert np.allclose(stresses[np.float32], stresses[np.float64],
                        rtol=1e-3, atol=1e-6)
+
+
+@pytest.mark.parametrize("nb_grid_pts", [(64, 64), (128, 128)])
+def test_float32_field_reduction_does_not_degrade_with_size(nb_grid_pts):
+    """The solve's norms must come from muGrid's double-accumulating
+    reductions, not from BLAS ``sdot`` on the raw float32 buffer.
+
+    ``xp.dot`` on a float32 array accumulates in float32, so its error grows
+    *linearly* in the number of entries: measured 4.2e-9 at 32^3 but 5.5e-6 at
+    128^3, and ~4.6e-4 at 512^3 -- the only quantity in the whole solve whose
+    accuracy degrades with resolution this way. ``linalg.norm_sq`` accumulates
+    (and returns) in double and stays at ~1e-14 throughout. It also avoids the
+    full-size contiguous copy that ``.p.ravel()`` makes whenever the
+    collection carries ghosts.
+
+    This test pins the *relationship*, not an absolute error: whatever
+    ``solve_rhs`` uses for ``|b|`` must track the double-precision reference
+    far more closely than the naive float32 dot does.
+    """
+    import muGrid
+    from muGrid import linalg
+
+    ghosts = (1,) * len(nb_grid_pts)
+    fc = muGrid.GlobalFieldCollection(
+        nb_grid_pts, nb_ghosts_left=ghosts, nb_ghosts_right=ghosts
+    )
+    f = fc.real_field("f", (len(nb_grid_pts),), dtype=np.float32)
+    rng = np.random.default_rng(0)
+    f.p[...] = rng.standard_normal(f.p.shape).astype(np.float32)
+
+    host = np.asarray(f.p).astype(np.float64).ravel()
+    exact = float(np.dot(host, host))
+
+    flat = f.p.ravel()
+    naive_err = abs(float(np.dot(flat, flat)) - exact) / exact
+    reduced_err = abs(float(linalg.norm_sq(f)) - exact) / exact
+
+    assert reduced_err < 1e-12, f"norm_sq relative error {reduced_err:.2e}"
+    # Comfortably true in practice (7+ orders at 128^2); assert the margin
+    # loosely so the test is about the mechanism, not the RNG draw.
+    assert reduced_err < naive_err / 100.0, (
+        f"norm_sq {reduced_err:.2e} vs sdot {naive_err:.2e}"
+    )

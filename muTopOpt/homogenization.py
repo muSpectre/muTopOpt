@@ -25,16 +25,22 @@ layout.
 
 import os
 
+import warnings
+
 import numpy as np
 
 import muGrid
+from muGrid import linalg
 from muGrid.Preconditioners import (
+    GreenJacobiPreconditioner,
+    HybridFourierTridiagonalPreconditioner,
     make_green_jacobi_preconditioner,
     make_reference_stiffness_preconditioner,
 )
 from muGrid.Solvers import ConvergenceError, conjugate_gradients
 
 from .material import SimpMaterial
+from .precision import cg_rtol_floor
 from .timing import timer
 
 # muGrid's ``conjugate_gradients`` gained an optional ``residual`` out-field
@@ -107,6 +113,23 @@ def _resolve_device(device, comm=None):
     return muGrid.Device.from_string(device)
 
 
+def _device_has_unified_memory():
+    """True when the GPU physically shares memory with the host (an APU such as
+    MI300A), so managed allocations cost nothing to access from either side.
+
+    ``integrated`` is the portable flag for this in both CUDA and HIP; on a
+    discrete card it is 0 and managed memory forces page migration on every
+    access. Returns False when the device cannot be queried.
+    """
+    try:
+        import cupy
+
+        props = cupy.cuda.runtime.getDeviceProperties(0)
+    except Exception:
+        return False
+    return bool(props.get("integrated", 0))
+
+
 # Process-global guard: the managed allocator, and muGrid's routing to it, must
 # be installed exactly once per process. Re-registering muGrid's allocator while
 # device fields are alive would drop the keepalive of their buffers and free
@@ -153,12 +176,13 @@ class Homogenization:
         domain_lengths=None,
         element="q1",
         preconditioner="green-jacobi",
-        cg_tol=1e-8,
+        cg_tol=None,
         cg_maxiter=2000,
         cg_verbose=False,
         device=None,
         dtype=np.float64,
         managed_memory=None,
+        timer=None,
     ):
         """``dtype`` (``np.float64`` default, or ``np.float32``) is the
         precision of all grid fields and hence of the forward/adjoint solves,
@@ -173,7 +197,16 @@ class Homogenization:
         512^3 in double precision) use the full package. ``None`` (default)
         enables it automatically whenever a GPU device is selected; pass
         ``False`` (or set ``MUTOPOPT_MANAGED=0``) to force the default
-        allocator. Ignored on CPU."""
+        allocator. Ignored on CPU.
+
+        ``timer`` (a ``muTimer.Timer``) is handed to the CG solver and the
+        preconditioner so a benchmark can read back where the *wall* time of a
+        solve goes. On a GPU the phases are host-side: the operator and
+        preconditioner regions measure only the cost of queueing their kernels,
+        and the wait for that work lands in the next region that reads a
+        reduction back to the host. That is the intended reading -- the gap
+        between these numbers and the GPU-busy time from a kernel trace is the
+        pipeline bubble."""
         self.dim = len(nb_grid_pts)
         if self.dim not in (2, 3):
             raise ValueError("nb_grid_pts must be 2- or 3-dimensional")
@@ -198,13 +231,27 @@ class Homogenization:
         self.domain_volume = float(np.prod(self.domain_lengths))
 
         self.device = _resolve_device(device, self.comm)
-        # On a GPU, default to the managed (unified) allocator so device fields
-        # can use the full HBM of a unified-memory APU rather than the smaller
-        # coarse-grained window (see _enable_managed_device_allocator). Must be
-        # installed before the engine allocates any device field. Opt out with
-        # managed_memory=False or MUTOPOPT_MANAGED=0.
+        # cupy places arrays (and launches kernels) on its *current* device,
+        # device 0 unless told otherwise. With one GPU per rank that would put
+        # every cupy temporary of rank 1 on GPU 0, next to fields on GPU 1.
+        if self.device is not None and self.device.is_device:
+            import cupy
+
+            cupy.cuda.Device(self.device.device_id).use()
+        # On a unified-memory APU, default to the managed allocator so device
+        # fields can use the full HBM rather than the smaller coarse-grained
+        # window (see _enable_managed_device_allocator). On a *discrete* GPU
+        # managed memory is a large pessimization instead: host and device do
+        # not share physical memory, so every page the solver touches migrates
+        # over PCIe. Measured on an RTX PRO 500 (discrete): 9x slower per CG
+        # iteration at 64^3, and 96^3 failed to make progress at all. Default
+        # from the device itself, and let the caller override either way with
+        # managed_memory=True/False or MUTOPOPT_MANAGED=1/0.
+        # Must be installed before the engine allocates any device field.
         if managed_memory is None:
-            managed_memory = os.environ.get("MUTOPOPT_MANAGED", "1") != "0"
+            env = os.environ.get("MUTOPOPT_MANAGED")
+            managed_memory = (env != "0") if env is not None \
+                else _device_has_unified_memory()
         self.managed_memory = False
         if self.device is not None and managed_memory:
             self.managed_memory = _enable_managed_device_allocator()
@@ -246,7 +293,17 @@ class Homogenization:
             self._xp = np
 
         self.preconditioner_kind = preconditioner
-        self.cg_tol = cg_tol
+        self.timer = timer
+        # Smallest relative residual this precision can actually reach; 0.0
+        # in double, so everything below is a no-op there. See
+        # muTopOpt.precision.
+        self._rtol_floor = cg_rtol_floor(self.dtype)
+        self._rtol_clamp_warned = False
+        # Default is dtype-aware: 1e-8 is meaningless in float32, and a
+        # default the caller never chose should not produce a warning.
+        # An explicit value that cannot be reached does warn (_clamp_rtol).
+        self.cg_tol = (max(1e-8, self._rtol_floor) if cg_tol is None
+                       else self._clamp_rtol(cg_tol))
         self.cg_maxiter = cg_maxiter
         # Stagnation safeguard of the CG solves (see solve_rhs): a solve whose
         # residual has not improved by at least `cg_stagnation_rel` (relative)
@@ -350,7 +407,7 @@ class Homogenization:
                 self._prec = make_green_jacobi_preconditioner(
                     self.engine, self.op, self.lam, self.mu, self.dim,
                     reference_lambda=lam_ref, reference_mu=mu_ref,
-                    dtype=self.dtype,
+                    dtype=self.dtype, timer=self.timer,
                 )
             elif self.preconditioner_kind == "green":
 
@@ -359,13 +416,42 @@ class Homogenization:
                     self.op.apply_uniform(u, lam_ref, mu_ref, f)
 
                 self._prec = make_reference_stiffness_preconditioner(
-                    self.engine, apply_ref, self.dim, dtype=self.dtype
+                    self.engine, apply_ref, self.dim, dtype=self.dtype,
+                    timer=self.timer,
                 )
+            elif self.preconditioner_kind in ("hybrid", "hybrid-jacobi"):
+                # The same reference operator as 'green', inverted exactly by
+                # FFT in the rank-local axes and a tridiagonal solve in the
+                # distributed one -- no all-to-all. The engine's real-space
+                # split is the slab ([1, ..., P]) it needs.
+                green = HybridFourierTridiagonalPreconditioner(
+                    self.engine, self.grid_spacing, lam_ref, mu_ref,
+                    communicator=self.comm, element=self.element,
+                    timer=self.timer, dtype=self.dtype,
+                )
+                if self.preconditioner_kind == "hybrid":
+                    self._prec = green
+                else:
+                    diagonal = self.engine.real_space_field(
+                        "to_hybrid_jacobi_diagonal", components=(self.dim,),
+                        dtype=self.dtype)
+                    self.op.assemble_diagonal(self.lam, self.mu, diagonal)
+                    prec = GreenJacobiPreconditioner(
+                        green, diagonal, timer=self.timer,
+                        name="hybrid-jacobi", communicator=self.comm,
+                    )
+
+                    def refresh():
+                        self.op.assemble_diagonal(self.lam, self.mu, diagonal)
+                        prec.update_diagonal(diagonal)
+
+                    prec.refresh = refresh
+                    self._prec = prec
             else:
                 raise ValueError(
                     f"unknown preconditioner '{self.preconditioner_kind}'"
                 )
-        elif self.preconditioner_kind == "green-jacobi":
+        elif self.preconditioner_kind in ("green-jacobi", "hybrid-jacobi"):
             # Reuse the (reference) Green part; refresh only the Jacobi diagonal
             # from the updated material.
             self._prec.refresh()
@@ -374,6 +460,30 @@ class Homogenization:
     def _hessp(self, u, Au):
         self.engine.communicate_ghosts(u)
         self.op.apply(u, self.lam, self.mu, Au)
+
+    def _clamp_rtol(self, rtol):
+        """Raise ``rtol`` to what this precision can actually reach, warning
+        once if it had to.
+
+        A float32 solve asked for 1e-8 cannot get there: it burns
+        ``cg_maxiter`` iterations and is then rescued by the stagnation guard,
+        with a worse iterate than the reachable tolerance would have produced.
+        The warning fires once per instance so a per-iteration solve loop does
+        not drown the log.
+        """
+        if rtol is None or rtol >= self._rtol_floor:
+            return rtol
+        if not self._rtol_clamp_warned:
+            self._rtol_clamp_warned = True
+            warnings.warn(
+                f"{type(self).__name__}: inner CG rtol={rtol:.1e} is below "
+                f"the {np.dtype(self.dtype).name} solve accuracy floor "
+                f"(~{self._rtol_floor:.0e}) and cannot be reached; using the "
+                "floor instead. Pass dtype=np.float64 for a tighter solve.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        return self._rtol_floor
 
     def solve_rhs(self, b, x, rtol=None, maxiter=None, rhs_scale=None,
                   residual=None, label=None, warm_start=False):
@@ -409,8 +519,14 @@ class Homogenization:
         trust-region model only needs a bounded Hessian-vector product."""
         if not warm_start:
             x.set_zero()
-        bp = b.p.ravel()
-        b_norm = np.sqrt(self.comm.sum(float(self._xp.dot(bp, bp))))
+        # muGrid's reductions run over the interior in double precision and
+        # return it. Reducing b.p.ravel() with xp.dot instead would (a) use
+        # BLAS sdot for a float32 field, whose error grows *linearly* in N --
+        # 4.6e-4 relative at 512^3 against 6.9e-8 at 64^3 -- and (b) silently
+        # materialise a full contiguous copy of the field, because .p is a
+        # strided view whenever the collection carries ghosts. It also makes
+        # b_norm bit-identical to the ||b|| the CG itself converges against.
+        b_norm = np.sqrt(self.comm.sum(float(linalg.norm_sq(b))))
         scale = rhs_scale if rhs_scale is not None else getattr(
             self, "_mat_scale", 1.0)
         verbose = self.cg_verbose and self.comm.rank == 0
@@ -444,8 +560,12 @@ class Homogenization:
             # if it beats a cold start (``|b - K x₀| < |b|``), else zero it.
             # One extra operator apply -- negligible against the CG it saves.
             self._hessp(x, self._Ku)
-            diff = bp - self._Ku.p.ravel()
-            warm_norm = np.sqrt(self.comm.sum(float(self._xp.dot(diff, diff))))
+            # _Ku <- K x - b, whose norm is |b - K x|; the fused axpy_norm_sq
+            # does the update and the reduction in one pass and needs no
+            # scratch field. _Ku is dead here -- every later use rewrites it
+            # via _hessp first.
+            warm_norm = np.sqrt(self.comm.sum(
+                float(linalg.axpy_norm_sq(-1.0, b, self._Ku))))
             if not (warm_norm < b_norm):
                 x.set_zero()
                 if verbose:
@@ -471,7 +591,12 @@ class Homogenization:
         # iteration budget and raises. ``guard['best']``/``guard['ref']`` are
         # squared norms; ``rel`` compares in the norm, hence the square.
         counter = {"n": 0}
-        rtol_eff = self.cg_tol if rtol is None else rtol
+        # Clamp at the point of consumption, not at one branch of one
+        # driver: every caller -- the fixed cg_tol, an adaptive controller's
+        # current value, a Hessian-vector solve's own rtol -- passes through
+        # here, so the float32 floor cannot be routed around. In double
+        # precision the floor is 0.0 and this is a no-op.
+        rtol_eff = self._clamp_rtol(self.cg_tol if rtol is None else rtol)
         stall = (1.0 - self.cg_stagnation_rel) ** 2
         diverge = self.cg_divergence_factor ** 2
         guard = {"best": np.inf, "best_iter": 0, "ref": np.inf, "ref_iter": 0,
@@ -488,7 +613,10 @@ class Homogenization:
             if rr < guard["best"]:
                 guard["best"] = rr
                 guard["best_iter"] = iteration
-                self._x_best.s[...] = x.s
+                # Full-buffer device copy. The `.s[...] = .s` form goes
+                # through a strided (ghost-excluded) view, which is ~7x
+                # slower and ran on most CG iterations.
+                muGrid.linalg.copy(x, self._x_best)
                 guard["saved"] = True
             elif cold_start and guard["best_iter"] == 0 and (
                     iteration >= self.cg_no_progress_patience
@@ -511,7 +639,7 @@ class Homogenization:
             conjugate_gradients(
                 self.comm, self.fc, b, x,
                 hessp=self._hessp, prec=self._prec,
-                rtol=rtol_eff,
+                rtol=rtol_eff, timer=self.timer,
                 maxiter=self.cg_maxiter if maxiter is None else maxiter,
                 callback=_count,
                 **cg_kwargs,
@@ -527,13 +655,15 @@ class Homogenization:
             # raised ConvergenceError kills the run.
             if not guard["saved"]:
                 raise  # NaN before the first callback; nothing to salvage
-            x.s[...] = self._x_best.s
+            muGrid.linalg.copy(self._x_best, x)
             # True (non-recursive) residual of the returned iterate; the best
             # recursive rr can be far below it past the precision floor.
             self._hessp(x, self._Ku)
-            self._Ku.s[...] = b.s - self._Ku.s
-            rp = self._Ku.p.ravel()
-            true_norm = np.sqrt(self.comm.sum(float(self._xp.dot(rp, rp))))
+            # _Ku <- b - K x, the true residual of the salvaged iterate.
+            # axpby avoids the full-size temporary that `b.s - _Ku.s` builds,
+            # and norm_sq reduces it in double (see solve_rhs's b_norm).
+            linalg.axpby(1.0, b, -1.0, self._Ku)
+            true_norm = np.sqrt(self.comm.sum(float(linalg.norm_sq(self._Ku))))
             if not (true_norm < b_norm):
                 # Worse than doing nothing: the zero solution (residual b) is
                 # the safest answer for a rhs this close to round-off.

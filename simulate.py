@@ -56,6 +56,11 @@ from muTopOpt.optimize import (
 )
 from muTopOpt.restart import INITIAL_DENSITY_KINDS, restart_density
 from muTopOpt.timing import timer
+from muTopOpt.version import (
+    mugrid_version,
+    mutopopt_version,
+    provenance_attributes,
+)
 
 
 class _HelpFormatter(
@@ -109,13 +114,16 @@ def main():
         type=float,
         default=None,
         help="phase-field interface width, in physical length units "
-        "(default: two grid spacings)",
+        "(default: one grid spacing)",
     )
     p.add_argument(
         "--reg-weight",
         type=float,
         default=1.0,
-        help="overall strength of the phase-field regularization",
+        help="phase-field regularization weight: penalty per unit interfacial "
+        "area, measured in units of L^(D-1) with L the linear cell size "
+        "(the Modica-Mortola functional is normalized by 1/(c_W V^((D-1)/D)), "
+        "c_W = 1/3 for the quartic double well)",
     )
     p.add_argument(
         "--init-volume-fraction",
@@ -187,6 +195,15 @@ def main():
         help="relative CG tolerance of the two extra solves per "
         "Hessian-vector product (may be loose: the Hessian only shapes "
         "the trust-region model)",
+    )
+    p.add_argument(
+        "--hv-warm-start",
+        action="store_true",
+        help="warm-start each Hessian-vector solve from the same load case's "
+        "previous product, keeping 2 extra vector fields per load case (the "
+        "largest block of device memory the optimizer holds at scale). "
+        "Measured to save only 2-4%% of inner CG iterations and no wall time, "
+        "so it is off by default",
     )
     p.add_argument(
         "--output-cg-iters",
@@ -285,11 +302,16 @@ def main():
     )
     p.add_argument(
         "--preconditioner",
-        choices=["green-jacobi", "green"],
+        choices=["green-jacobi", "green", "hybrid-jacobi", "hybrid"],
         default="green-jacobi",
         help="inner-solve preconditioner: 'green-jacobi' (J-FFT, "
-        "reference stiffness times a per-pixel Jacobi scaling) "
-        "or 'green' (plain reference-stiffness Green operator)",
+        "reference stiffness times a per-pixel Jacobi scaling), "
+        "'green' (plain reference-stiffness Green operator), or "
+        "'hybrid-jacobi' / 'hybrid', the same two with the reference "
+        "stiffness inverted by muGrid's HybridFourierTridiagonal"
+        "Preconditioner: FFT in the rank-local axes and a tridiagonal "
+        "solve in the distributed one, so no all-to-all. Same iterations; "
+        "slower on one GPU, faster from ~128^3 on two",
     )
     p.add_argument(
         "--element",
@@ -413,18 +435,25 @@ def main():
             warnings.warn(
                 f"--cg-tol-min {cg_tol_min:.1e} is below the single-"
                 f"precision solve accuracy floor (~{rtol_floor:.0e}); the "
-                "true residual cannot reach it and CG may fail",
+                "true residual cannot reach it, so it will be raised to the "
+                "floor",
                 RuntimeWarning,
             )
     elif optimizer == "tr":
-        cg_tol_min = max(1e-10, rtol_floor)
+        cg_tol_min = 1e-10
     else:
-        cg_tol_min = max(min(args.cg_tol, bfgs_gtol / _KAPPA_EFF), rtol_floor)
+        cg_tol_min = min(args.cg_tol, bfgs_gtol / _KAPPA_EFF)
     if cg_tol_start is None and optimizer == "tr":
         # Adaptation disabled: pin the trust-region accuracy control at the
         # fixed --cg-tol (start == floor), i.e. a truly fixed tolerance.
         cg_tol_start = args.cg_tol
         cg_tol_min = args.cg_tol
+    # Apply the precision floor *last*, so no branch above can route around it
+    # -- which is exactly what the two assignments immediately above used to
+    # do, silently discarding the floor whenever adaptation was switched off.
+    cg_tol_min = max(cg_tol_min, rtol_floor)
+    if cg_tol_start is not None:
+        cg_tol_start = max(cg_tol_start, cg_tol_min)
 
     if muGrid.has_mpi:
         from mpi4py import MPI
@@ -453,6 +482,13 @@ def main():
             device=args.device,
             dtype=dtype,
         )
+    # Banner first, before the target checks and the restart read: a run that
+    # dies in setup should still say which build it was. muGrid prints from
+    # every rank (its banner carries the per-rank decomposition); muTopOpt's is
+    # rank-independent, so rank 0 prints it alone.
+    print(mugrid_version(homog.comm, homog.device))
+    if rank0:
+        print(mutopopt_version())
     if (args.target_E is None) != (args.target_nu is None):
         p.error("--target-E and --target-nu must be given together")
     if args.target_E is not None:
@@ -492,9 +528,22 @@ def main():
 
     target_K, target_G = effective_moduli([lc.target_stress for lc in cases])
     target_E, target_nu = E_nu_from_K_G(target_K, target_G)
-    # The interface width defaults to two grid spacings: wide enough that the
-    # regularization can move interfaces (merge/remove features) instead of
-    # freezing the initial topology, narrow enough for crisp designs.
+
+    # All four effective moduli of a homogenized stress response, in the order
+    # they are reported and written to the output.
+    _MODULI = ("K", "G", "E", "nu")
+
+    def moduli_of(stresses):
+        K, G = effective_moduli(stresses)
+        E, nu = E_nu_from_K_G(K, G)
+        return {"K": K, "G": G, "E": E, "nu": nu}
+
+    targets = {"K": target_K, "G": target_G, "E": target_E, "nu": target_nu}
+    # The interface width defaults to one grid spacing: narrow enough for crisp
+    # designs, wide enough that the regularization can still move interfaces
+    # (merge/remove features) instead of freezing the initial topology -- and
+    # comfortably clear of the lattice-pinning regime (see
+    # test/test_interface_pinning.py).
     eta = max(homog.grid_spacing) if args.eta is None else args.eta
     Reg = (
         NodalPhaseFieldRegularization
@@ -505,7 +554,8 @@ def main():
         reg = Reg(homog, eta=eta, weight=args.reg_weight)
         problem = StressTargetProblem(homog, cases, regularization=reg,
                                       design=args.density,
-                                      hessian=(optimizer == "tr"))
+                                      hessian=(optimizer == "tr"),
+                                      hv_warm_start=args.hv_warm_start)
 
     if args.init in INITIAL_DENSITY_KINDS:
         length = args.init_length
@@ -513,12 +563,14 @@ def main():
             length = 3.0 * reg.eta
         with timer("initial density"):
             rho0 = initial_density(
-                homog.nb_pixels,
+                tuple(args.nb_grid_pts),
                 kind=args.init,
                 volume_fraction=args.init_volume_fraction,
                 seed=args.seed,
                 length=length,
                 grid_spacing=homog.grid_spacing,
+                subdomain_locations=homog.engine.subdomain_locations,
+                nb_subdomain_grid_pts=homog.nb_pixels,
             )
     else:
         # Restart from the last frame of a previous run (every rank reads the
@@ -547,7 +599,6 @@ def main():
                   zip(homog.engine.subdomain_locations, homog.nb_pixels))
         ].copy()
 
-    print(muGrid.version_string(communicator=homog.comm, device=homog.device))
     if rank0:
         print(
             f"muTopOpt: {dim}D  grid={tuple(args.nb_grid_pts)}  "
@@ -578,7 +629,11 @@ def main():
     # reductions so every rank holds the same series (safe to write below).
     n_global = comm.sum(float(rho0.size))
     hist = {"objective": [], "volume_fraction": [], "cg_iters": [],
-            "hv_cg_iters": []}
+            "hv_cg_iters": [], **{m: [] for m in _MODULI}}
+    # Homogenized stresses of the most recent *accepted* iterate. problem.last
+    # may instead hold a rejected trust-region trial or a line-search probe, so
+    # the final frame and summary use this.
+    accepted_stresses = [None]
 
     # `--dump-every N` (N>0) streams the initial density (iteration 0) and every
     # N-th iterate to the output file as successive frames; the final iterate is
@@ -587,9 +642,12 @@ def main():
     # NetCDF file is opened before the optimizer runs. muGrid freezes the header
     # on the first frame, so all global attributes must be declared now; the
     # ones only known at the end (final state, per-iteration histories,
-    # frame_iterations) are declared at their maximum size with placeholders and
-    # overwritten in place afterwards -- update_global_attribute() may shrink an
-    # attribute but never grow it.
+    # frame_iterations) are declared at their maximum size with placeholders.
+    # They are refreshed after every dumped frame (padded back to that maximum
+    # size), so a run killed before it finishes, e.g. at the walltime, still
+    # leaves a consistent record up to its last frame. The run shrinks them to
+    # their true length only at the end: update_global_attribute() may shrink
+    # an attribute but never grow it again.
     dump_every = args.dump_every
     dump_intermediate = (
         args.output is not None and dump_every is not None and dump_every > 0
@@ -597,6 +655,8 @@ def main():
     fio = None
     field = None
     fdg_view = None  # numpy view of the per-frame applied-deformation-gradient
+    stress_view = None  # numpy view of the per-frame homogenized stresses
+    moduli_views = {}  # numpy views of the per-frame effective moduli
     frame_fields = ["density"]  # fields/variables written on every frame
     frame_iters = []  # L-BFGS iteration index of each frame actually written
     _MSG_LEN = 256  # fixed reservation for the optimizer message string
@@ -619,6 +679,23 @@ def main():
         )
         fdg_view[...] = applied_deformation_gradient
         frame_fields.append("applied_deformation_gradient")
+        # The homogenized stress of every load case for the frame's density,
+        # i.e. the response to applied_deformation_gradient (enough to rebuild
+        # the effective stiffness), and the isotropic-equivalent moduli derived
+        # from it, in the same convention as the target_* attributes below.
+        # They are NaN for frame 0: the initial density is stored before the
+        # optimizer has evaluated it.
+        stress_view = fio.register_frame_variable(
+            "homogenized_stress", [len(cases), dim, dim], np.float64)
+        frame_fields.append("homogenized_stress")
+        for m in _MODULI:
+            moduli_views[m] = fio.register_frame_variable(
+                f"effective_{m}", [], np.float64)
+            frame_fields.append(f"effective_{m}")
+        # Target moduli. Both parameterizations are stored, whichever was
+        # given on the command line.
+        for m in _MODULI:
+            fio.write_global_attribute(f"target_{m}", [float(targets[m])])
         # Physical cell size (per-file constant): a global attribute is correct.
         fio.write_global_attribute(
             "domain_lengths", [float(x) for x in homog.domain_lengths]
@@ -637,23 +714,41 @@ def main():
         # with its final value here (no placeholder/update). `sys.argv` is
         # identical across ranks, so writing from all ranks is consistent.
         fio.write_global_attribute("command_line", shlex.join(sys.argv))
+        # Which build produced the file. `command_line` says what was asked
+        # for; these say what ran it, which is what distinguishes two otherwise
+        # identical runs whose numbers differ.
+        for name, value in provenance_attributes().items():
+            fio.write_global_attribute(name, value)
         # Placeholders, sized to the maximum they can reach (the optimizer runs
         # at most args.bfgs_maxiter iterations, hence at most that many history
-        # entries and dumped frames). Real values are written after the run.
+        # entries and dumped frames). Entries not yet reached are NaN (float)
+        # or -1 (integer) while the run is in progress.
         maxlen = int(args.bfgs_maxiter) + 1
         max_frames = (maxlen // dump_every + 3) if dump_intermediate else 1
+        nan = float("nan")
         fio.write_global_attribute("dump_every", [int(dump_every)])
         fio.write_global_attribute("converged", [0])
         fio.write_global_attribute("optimizer_message", " " * _MSG_LEN)
+        # Number of *accepted* iterates -- the index the per-iteration
+        # histories and `frame_iterations` below share.
         fio.write_global_attribute("nb_iterations", [0])
-        fio.write_global_attribute("final_objective", [0.0])
-        fio.write_global_attribute("final_max_gradient", [0.0])
-        fio.write_global_attribute("lbfgs_objective_history", [0.0] * maxlen)
-        fio.write_global_attribute("lbfgs_volume_fraction_history", [0.0] * maxlen)
-        fio.write_global_attribute("lbfgs_cg_iters_history", [0] * maxlen)
+        # The optimizer's raw step count. For the trust region this also
+        # counts rejected trial steps, so it exceeds `nb_iterations`; the gap
+        # is work that produced no iterate. Only known once the optimizer
+        # returns, so -1 while the run is in progress.
+        fio.write_global_attribute("nb_optimizer_steps", [-1])
+        fio.write_global_attribute("final_objective", [nan])
+        fio.write_global_attribute("final_max_gradient", [nan])
+        fio.write_global_attribute("lbfgs_objective_history", [nan] * maxlen)
+        fio.write_global_attribute("lbfgs_volume_fraction_history", [nan] * maxlen)
+        fio.write_global_attribute("lbfgs_cg_iters_history", [-1] * maxlen)
         # Per-iteration Hessian-vector-product CG iterations (trust region;
         # all zero for L-BFGS) -- the dominant, otherwise-unrecorded cost.
-        fio.write_global_attribute("hv_cg_iters_history", [0] * maxlen)
+        fio.write_global_attribute("hv_cg_iters_history", [-1] * maxlen)
+        # Per-iteration effective moduli of the accepted iterate (compare to
+        # the target_* attributes).
+        for m in _MODULI:
+            fio.write_global_attribute(f"effective_{m}_history", [nan] * maxlen)
         fio.write_global_attribute("frame_iterations", [-1] * max_frames)
 
     # Flush each frame to disk as it is written, so the output can be
@@ -664,15 +759,78 @@ def main():
     # --no-flush.
     flush_frames = (not args.no_flush) and hasattr(fio, "sync")
 
-    def write_frame(it, rho):
-        """Stream one density iterate (and the applied deformation gradient) to
-        the output as a new frame."""
+    def write_frame(it, rho, stresses=None):
+        """Stream one density iterate, the applied deformation gradient and
+        the iterate's homogenized stresses and effective moduli (NaN if
+        `stresses` is None) to the output as a new frame."""
         with timer("file output"):
             field.p[...] = homog.to_device(rho)
+            if stresses is None:
+                stress_view[...] = np.nan
+                for m in _MODULI:
+                    moduli_views[m][...] = np.nan
+            else:
+                stress_view[...] = np.stack(stresses)
+                for m, value in moduli_of(stresses).items():
+                    moduli_views[m][...] = value
             fio.append_frame().write(frame_fields)
             if flush_frames:
                 fio.sync()
             frame_iters.append(int(it))
+
+    def write_run_state(info=None):
+        """Write the run-state attributes declared as placeholders above.
+
+        With `info=None` this is a checkpoint of a run still in progress: the
+        values reflect the last accepted iterate, and the per-iteration arrays
+        are padded back to their reserved length so later checkpoints can
+        still grow them. With the optimizer's final `info` the attributes get
+        their final values and their true length. Every value is globally
+        consistent across ranks (the histories are built from global
+        reductions, and NuMPI's optimizers return the same result on every
+        rank), so updating from all ranks is safe."""
+        final = info is not None
+
+        def upd(name, value):
+            fio.update_global_attribute(name, name, value)
+
+        def series(values, length, fill):
+            values = list(values)
+            return values if final else values + [fill] * (length - len(values))
+
+        nb_accepted = len(hist["objective"])
+        if final:
+            upd("converged", [int(bool(info["success"]))])
+            upd("optimizer_message", str(info["message"])[:_MSG_LEN])
+            upd("nb_optimizer_steps", [int(info["nit"])])
+            upd("final_objective", [float(info["objective"])])
+            upd("final_max_gradient", [float(info["max_grad"])])
+        else:
+            # Same length as the reservation, so the final message can still
+            # be written.
+            upd("optimizer_message",
+                f"RUNNING (checkpoint at iteration {nb_accepted})"
+                .ljust(_MSG_LEN)[:_MSG_LEN])
+            upd("final_objective",
+                [hist["objective"][-1] if hist["objective"] else nan])
+            controller = getattr(problem, "inner_tolerance", None)
+            gnorm = (controller.latest_gnorm if controller is not None
+                     else None)
+            upd("final_max_gradient",
+                [float(gnorm) if gnorm is not None else nan])
+        upd("nb_iterations", [nb_accepted])
+        # On the final write an empty history keeps its placeholder: an
+        # attribute cannot be shrunk to zero length.
+        if nb_accepted or not final:
+            upd("lbfgs_objective_history",
+                series(hist["objective"], maxlen, nan))
+            upd("lbfgs_volume_fraction_history",
+                series(hist["volume_fraction"], maxlen, nan))
+            upd("lbfgs_cg_iters_history", series(hist["cg_iters"], maxlen, -1))
+            upd("hv_cg_iters_history", series(hist["hv_cg_iters"], maxlen, -1))
+            for m in _MODULI:
+                upd(f"effective_{m}_history", series(hist[m], maxlen, nan))
+        upd("frame_iterations", series(frame_iters, max_frames, -1))
 
     # Initial configuration as frame 0 (only when dumping intermediate steps).
     if dump_intermediate:
@@ -706,16 +864,24 @@ def main():
         hist["volume_fraction"].append(vf)
         hist["cg_iters"].append(cg_total)
         hist["hv_cg_iters"].append(hv_cg)
+        accepted_stresses[0] = [np.array(s, copy=True)
+                                for s in last["stresses"]]
+        moduli = moduli_of(accepted_stresses[0])
+        for m in _MODULI:
+            hist[m].append(moduli[m])
         if dump_intermediate and it % dump_every == 0:
-            write_frame(it, rho)
+            write_frame(it, rho, accepted_stresses[0])
+            with timer("file output"):
+                write_run_state()
+                if flush_frames:
+                    fio.sync()
         if rank0:
             # Per-CG-iteration residuals are reported live during the solves
             # themselves (--output-cg-iters); here we always summarize the
             # outer step, the current effective moduli against their targets,
             # and the inner CG iterations it took (the same totals also go to
             # the NetCDF history above).
-            K, G = effective_moduli(last["stresses"])
-            E, nu = E_nu_from_K_G(K, G)
+            K, G, E, nu = (moduli[m] for m in _MODULI)
             rtol = last.get("cg_rtol")
             rtol_str = f"  cg-rtol={rtol:.1e}" if rtol is not None else ""
             # Solves that hit their finite-precision floor and returned a
@@ -772,12 +938,27 @@ def main():
         )
 
     converged = bool(info["success"])
+    # Two distinct counters exist and must not be conflated. `nb_accepted` is
+    # the number of accepted iterates -- what the per-iteration lines above,
+    # the histories and the dumped frames are all indexed by. `info["nit"]` is
+    # the optimizer's raw step count, which for the trust region also includes
+    # rejected trial steps. Report the accepted count, so the line below agrees
+    # with the last per-iteration line, and name the raw count separately when
+    # the two differ.
+    nb_accepted = len(hist["objective"])
+    nb_steps = int(info["nit"])
+    final_stresses = (accepted_stresses[0] if accepted_stresses[0] is not None
+                      else problem.last["stresses"])
     if rank0:
-        K, G = effective_moduli(problem.last["stresses"])
+        K, G = effective_moduli(final_stresses)
         E, nu = E_nu_from_K_G(K, G)
+        opt_label = "trust-region" if optimizer == "tr" else "optimizer"
+        steps_str = ("" if nb_steps == nb_accepted else
+                     f" ({nb_steps} {opt_label} steps incl. rejected)")
         print(
             f"done: {info['message']}  f={info['objective']:.6e}  "
-            f"iters={info['nit']}  K={K:.4g} (target {target_K:.4g})  "
+            f"iters={nb_accepted}{steps_str}  "
+            f"K={K:.4g} (target {target_K:.4g})  "
             f"G={G:.4g} (target {target_G:.4g})  "
             f"E={E:.4g} (target {target_E:.4g})  "
             f"nu={nu:.4g} (target {target_nu:.4g})"
@@ -794,39 +975,27 @@ def main():
         # Always include the final iterate as the last frame (unless it was
         # already the most recent one dumped, i.e. its iteration is a multiple
         # of --dump-every).
-        final_it = int(info["nit"])
+        # Label the final frame with the accepted-iterate index, the same
+        # counter `write_frame` uses for the intermediate dumps -- labelling it
+        # with the raw step count instead made `frame_iterations` mix two
+        # counters, and made this duplicate-check miss (so the last iterate was
+        # written twice whenever it had already been dumped).
+        final_it = nb_accepted
         if not frame_iters or frame_iters[-1] != final_it:
-            write_frame(final_it, rho)
+            write_frame(final_it, rho, final_stresses)
 
-        # Overwrite the placeholders declared before the frames with the real
-        # values now that the run has finished. Every value is globally
-        # consistent across ranks (NuMPI's l_bfgs_bounded returns the same
-        # result on every rank), so updating from all ranks is safe. Each update
-        # is same-or-smaller than its placeholder, which muGrid permits (the
-        # frozen header cannot grow).
+        # Give the placeholders declared before the frames their final values
+        # and true length. Each update is same-or-smaller than its placeholder,
+        # which muGrid permits (the frozen header cannot grow).
         #
         # `converged` is the machine-readable flag (1 = the optimizer met its
         # tolerances, 0 = it stopped early, e.g. at maxiter); the remaining
         # attributes give the reason, the final optimizer state, and the
-        # per-iteration L-BFGS histories (one value per outer iteration, for
-        # later plotting). `frame_iterations` records the L-BFGS iteration each
-        # frame holds (0 = initial configuration), so a reader can map frames to
-        # iterates.
-        def upd(name, value):
-            fio.update_global_attribute(name, name, value)
-
+        # per-iteration histories (one value per outer iteration, for later
+        # plotting). `frame_iterations` records the iteration each frame holds
+        # (0 = initial configuration), so a reader can map frames to iterates.
         with timer("file output"):
-            upd("converged", [int(converged)])
-            upd("optimizer_message", str(info["message"])[:_MSG_LEN])
-            upd("nb_iterations", [int(info["nit"])])
-            upd("final_objective", [float(info["objective"])])
-            upd("final_max_gradient", [float(info["max_grad"])])
-            if hist["objective"]:
-                upd("lbfgs_objective_history", hist["objective"])
-                upd("lbfgs_volume_fraction_history", hist["volume_fraction"])
-                upd("lbfgs_cg_iters_history", hist["cg_iters"])
-                upd("hv_cg_iters_history", hist["hv_cg_iters"])
-            upd("frame_iterations", frame_iters)
+            write_run_state(info)
             fio.close()
         if rank0:
             print(

@@ -15,9 +15,10 @@ requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
     "numpy",
-    # >= 0.112.0 for the dtype-threaded preconditioner factories, which let a
-    # float32 Homogenization run the whole solve in single precision.
-    "muGrid>=0.112.0",
+    # 1.4.0 is the first release whose float32 reductions return double
+    # instead of narrowing to inf, and the first to export
+    # muGrid.Solvers.FLOAT32_RTOL_FLOOR, which muTopOpt.precision reuses.
+    "muGrid>=1.4.0",
     "muTimer",
     "NuMPI",
 ]

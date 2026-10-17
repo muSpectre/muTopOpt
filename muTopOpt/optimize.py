@@ -23,6 +23,8 @@ with ``rho`` shaped like :attr:`Homogenization.nb_pixels`.
 
 import numpy as np
 
+from .precision import cg_rtol_floor
+
 
 def _gradient_scale(problem):
     """``V_e/V``: converts a *mesh-invariant* ``gtol`` -- measured on the
@@ -134,6 +136,12 @@ class AdaptiveInnerTolerance:
         if self._g_first is None:
             self._g_first = self._latest_gnorm
 
+    @property
+    def latest_gnorm(self):
+        """Box-KKT gradient norm of the most recent evaluation (mesh-invariant
+        ĝ units), or ``None`` before the first :meth:`observe`."""
+        return self._latest_gnorm
+
     def advance(self):
         """Retune :attr:`current` from the last observed gradient norm.
 
@@ -164,6 +172,16 @@ class AdaptiveInnerTolerance:
         return self.current
 
 
+def _problem_rtol_floor(problem):
+    """Smallest inner-CG rtol the problem's field precision can reach.
+
+    0.0 for a double-precision problem, and for anything that does not expose
+    a dtype, so every clamp below is a no-op there.
+    """
+    dtype = getattr(getattr(problem, "h", None), "dtype", None)
+    return 0.0 if dtype is None else cg_rtol_floor(dtype)
+
+
 def _make_inner_tolerance(problem, cg_tol_start, cg_tol_min, cg_forcing_c,
                           cg_forcing_exp, cg_stall_rel, cg_stall_shrink,
                           bounds):
@@ -173,12 +191,17 @@ def _make_inner_tolerance(problem, cg_tol_start, cg_tol_min, cg_forcing_c,
 
     ``cg_tol_min`` defaults to the homogenization's fixed ``cg_tol`` -- i.e.
     "start coarse at ``cg_tol_start`` and tighten down to the tolerance you
-    would otherwise have used throughout"."""
+    would otherwise have used throughout" -- and is raised to the floor the
+    problem's precision can actually reach. That clamp lives here rather than
+    in :class:`AdaptiveInnerTolerance`, which stays a pure, dtype-agnostic
+    controller."""
     if cg_tol_start is None:
         problem.inner_tolerance = None
         return None
     if cg_tol_min is None:
         cg_tol_min = getattr(problem.h, "cg_tol", 1e-8)
+    cg_tol_min = max(cg_tol_min, _problem_rtol_floor(problem))
+    cg_tol_start = max(cg_tol_start, cg_tol_min)
     controller = AdaptiveInnerTolerance(
         cg_tol_start, cg_tol_min, c=cg_forcing_c, alpha=cg_forcing_exp,
         stall_rel=cg_stall_rel, shrink=cg_stall_shrink, bounds=bounds,
@@ -188,8 +211,18 @@ def _make_inner_tolerance(problem, cg_tol_start, cg_tol_min, cg_forcing_c,
 
 
 def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
-                    smoothing=2, length=None, grid_spacing=None, contrast=0.5):
+                    smoothing=2, length=None, grid_spacing=None, contrast=0.5,
+                    subdomain_locations=None, nb_subdomain_grid_pts=None):
     """Build an initial element-wise density.
+
+    ``shape`` is the *global* grid. Under MPI pass the rank's
+    ``subdomain_locations`` and ``nb_subdomain_grid_pts`` (e.g.
+    ``homog.engine.subdomain_locations`` and ``homog.nb_pixels``): the field is
+    then generated on the whole grid, identically on every rank, and only this
+    rank's slice is returned -- so a parallel run starts from exactly the design
+    a serial run does. Passing the *local* shape as ``shape`` instead would draw
+    and filter an independent field per subdomain, making the starting design
+    depend on the number of ranks.
 
     ``kind='uniform'`` fills with ``volume_fraction``.
 
@@ -212,6 +245,20 @@ def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
     eta`` -- the regularization then *sharpens the blob boundaries* rather
     than dissolving the blobs.
     """
+    if (subdomain_locations is None) != (nb_subdomain_grid_pts is None):
+        raise ValueError("pass both subdomain_locations and "
+                         "nb_subdomain_grid_pts, or neither")
+    rho = _global_initial_density(shape, kind, volume_fraction, seed,
+                                  smoothing, length, grid_spacing, contrast)
+    if subdomain_locations is None:
+        return rho
+    return rho[tuple(slice(int(lo), int(lo) + int(n)) for lo, n in
+                     zip(subdomain_locations, nb_subdomain_grid_pts))].copy()
+
+
+def _global_initial_density(shape, kind, volume_fraction, seed, smoothing,
+                            length, grid_spacing, contrast):
+    """The initial density on the full grid ``shape``; see initial_density."""
     if kind == "uniform":
         return np.full(shape, float(volume_fraction))
     if kind == "random":
@@ -221,10 +268,10 @@ def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
         for _ in range(int(smoothing)):
             for ax in range(rho.ndim):
                 rho = (
-                    rho
-                    + np.roll(rho, 1, axis=ax)
-                    + np.roll(rho, -1, axis=ax)
-                ) / 3.0
+                              rho
+                              + np.roll(rho, 1, axis=ax)
+                              + np.roll(rho, -1, axis=ax)
+                      ) / 3.0
         rho -= rho.mean()
         std = rho.std()
         if std > 0:
@@ -250,7 +297,7 @@ def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
         for ax in range(ndim):
             sigma_px = float(length) / grid_spacing[ax]
             f = np.fft.fftfreq(shape[ax])
-            g = np.exp(-2.0 * np.pi**2 * sigma_px**2 * f**2)
+            g = np.exp(-2.0 * np.pi ** 2 * sigma_px ** 2 * f ** 2)
             spec *= g.reshape([-1 if d == ax else 1 for d in range(ndim)])
         rho = np.fft.ifftn(spec).real
 
@@ -266,7 +313,8 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
                            ftol=0.0, xtol=0.0, bounds=(0.0, 1.0), maxcor=10,
                            callback=None, cg_tol_start=None, cg_tol_min=None,
                            cg_forcing_c=1.0, cg_forcing_exp=1.0,
-                           cg_stall_rel=1e-2, cg_stall_shrink=0.3):
+                           cg_stall_rel=1e-2, cg_stall_shrink=0.3,
+                           ):
     """Minimize ``problem`` from ``rho0`` with NuMPI's MPI-distributed,
     box-constrained L-BFGS. Returns ``(rho_opt, info)``.
 
@@ -327,7 +375,8 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
             inner_tol.advance()
         history.append(problem.last.get("objective"))
         if callback is not None:
-            callback(len(history), x, problem.last)
+            return callback(len(history), x, problem.last)
+        return False
 
     # NuMPI compares the raw per-variable gradient; gtol/max_grad are in
     # mesh-invariant ĝ units (see _gradient_scale).
@@ -336,7 +385,7 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         fun, np.asarray(rho0, dtype=float), jac=None,
         bounds_lo=bounds[0], bounds_hi=bounds[1],
         gtol=gtol * gscale, ftol=ftol, xtol=xtol, maxiter=maxiter,
-        maxcor=maxcor, comm=comm, callback=_cb,
+        maxcor=maxcor, comm=comm, callback=_cb
     )
     info = {
         "success": bool(res.success),
@@ -419,6 +468,11 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
 
     if cg_tol_start is None:
         cg_tol_start = getattr(problem.h, "cg_tol", 1e-8)
+    # The trust-region default (1e-10) is four orders below what float32 can
+    # reach; without this the accuracy control tightens into a region where
+    # only the recursive residual improves.
+    cg_tol_min = max(cg_tol_min, _problem_rtol_floor(problem))
+    cg_tol_start = max(cg_tol_start, cg_tol_min)
     # Reuse AdaptiveInnerTolerance purely as the rtol holder the problem
     # already knows how to read (`.current`) -- the trust-region accuracy
     # control below, not the forcing-term/ratchet logic, drives it (advance()
@@ -474,7 +528,8 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         hv_stats["hessp"] = 0
         history.append(problem.last.get("objective"))
         if callback is not None:
-            callback(len(history), x, problem.last)
+            return callback(len(history), x, problem.last)
+        return False
 
     # NuMPI compares the raw per-variable gradient; gtol/max_grad are in
     # mesh-invariant ĝ units (see _gradient_scale).
@@ -533,7 +588,8 @@ def optimize_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=1e-9,
             inner_tol.advance()
         history.append(problem.last.get("objective"))
         if callback is not None:
-            callback(len(history), xk.reshape(shape), problem.last)
+            return callback(len(history), xk.reshape(shape), problem.last)
+        return False
 
     # SciPy's pgtol compares the raw per-variable gradient; gtol is in
     # mesh-invariant ĝ units (see _gradient_scale).
