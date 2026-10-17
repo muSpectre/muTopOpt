@@ -1,5 +1,5 @@
 [build-system]
-requires = ["flit_core >=3.2,<4"]
+requires = ["flit_core >=3.12,<4"]
 build-backend = "flit_core.buildapi"
 
 [project]
@@ -10,7 +10,8 @@ authors = [
 ]
 description = "FFT-accelerated FE topology optimization of mechanical metamaterials, built on muGrid"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
@@ -30,3 +31,6 @@ mpi = ["mpi4py"]
 
 [tool.flit.module]
 name = "muTopOpt"
+
+[tool.flit.sdist]
+include = ["simulate.py", "simulate_conduction.py"]

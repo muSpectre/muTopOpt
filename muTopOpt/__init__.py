@@ -41,7 +41,7 @@ the same optimizer drivers and phase-field regularization::
     rho, info = optimize_bounded_lbfgs(problem, initial_density(homog.nb_pixels))
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .conduction import HomogenizationConductivity, SimpConductivity
 from .conduction_problem import FluxLoadCase, FluxTargetProblem
