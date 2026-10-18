@@ -1,6 +1,14 @@
 Change log for muTopOpt
 =======================
 
+v1.2.0 (not yet released)
+-------------------------
+
+- BUG: `PhaseFieldRegularization` mis-scaled the gradient penalty on
+  anisotropic voxels: it built its Laplacian with `grid_spacing[0]` on every
+  axis (and warned). With muGrid >= 1.5.0 it passes the spacing of every axis
+  to `muGrid.LaplaceOperator`; with an older muGrid the warning stays
+
 v1.1.0 (05Oct26)
 ----------------
 

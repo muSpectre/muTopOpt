@@ -33,8 +33,9 @@ relative interfacial area, in units of the (normalized) stress objective.
 Two variants of the gradient penalty are provided:
 
 * :class:`PhaseFieldRegularization` (element-wise density) discretizes it with a
-  finite-difference Laplacian on the pixel grid (:class:`muGrid.LaplaceOperator`;
-  assumes cubic voxels).
+  finite-difference Laplacian on the pixel grid (:class:`muGrid.LaplaceOperator`
+  with the grid spacing of every axis; with a muGrid before 1.5.0, whose
+  Laplacian has a single scale, it assumes cubic voxels and warns otherwise).
 * :class:`NodalPhaseFieldRegularization` (nodal FE density) uses the
   element-consistent H¹ seminorm ``rhoᵀ L rho`` with the scalar FE-Laplacian
   ``L = Bᵀ W B`` of the mechanics element (P1 or Q1). ``L`` is a constant
@@ -67,6 +68,18 @@ def perimeter_prefactor(homogenization):
     return 1.0 / (C_W * V ** ((dim - 1) / dim))
 
 
+def _laplace_takes_grid_spacing():
+    """Whether this muGrid's ``LaplaceOperator`` accepts a per-axis
+    ``grid_spacing`` (added in muGrid 1.5.0)."""
+    import inspect
+
+    try:
+        return "grid_spacing" in inspect.signature(
+            muGrid.LaplaceOperator.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 class PhaseFieldRegularization:
     def __init__(self, homogenization, eta=None, weight=1.0):
         self.h = homogenization
@@ -81,18 +94,25 @@ class PhaseFieldRegularization:
         # interfacial area.
         self.prefactor = perimeter_prefactor(self.h)
 
-        if not np.allclose(self.h.grid_spacing, h0):
-            # The isotropic FD Laplacian assumes equal spacing; warn rather than
-            # silently mis-scale the gradient penalty.
-            import warnings
+        # -Δ (positive definite) as a finite-difference stencil, with the
+        # grid spacing of every axis: muGrid's LaplaceOperator takes it from
+        # 1.5.0 on; before, it had one scale for all axes.
+        grid_spacing = [float(h) for h in self.h.grid_spacing]
+        if _laplace_takes_grid_spacing():
+            self.laplace = muGrid.LaplaceOperator(
+                self.h.dim, -1.0, grid_spacing=grid_spacing)
+        else:
+            if not np.allclose(grid_spacing, h0):
+                import warnings
 
-            warnings.warn(
-                "PhaseFieldRegularization assumes cubic voxels; using "
-                "grid_spacing[0] for the Laplacian.",
-                RuntimeWarning,
-            )
-        # -Δ (positive definite) as a finite-difference stencil.
-        self.laplace = muGrid.LaplaceOperator(self.h.dim, -1.0 / h0**2)
+                warnings.warn(
+                    "PhaseFieldRegularization needs muGrid >= 1.5.0 for "
+                    "anisotropic voxels; this muGrid's LaplaceOperator has a "
+                    "single scale, so grid_spacing[0] is used on every axis "
+                    "and the gradient penalty is mis-scaled.",
+                    RuntimeWarning,
+                )
+            self.laplace = muGrid.LaplaceOperator(self.h.dim, -1.0 / h0**2)
         self.vol_pixel = float(np.prod(self.h.grid_spacing))
 
         self._rho = self.h.scalar_field("to_reg_rho")
