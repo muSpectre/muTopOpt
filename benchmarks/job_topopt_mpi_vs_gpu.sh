@@ -48,9 +48,21 @@ ITERS="${ITERS:-20}"                             # capped L-BFGS outer iteration
 RANKS="${RANKS:-${SLURM_NTASKS:-92}}"            # CPU MPI ranks for the MPI run
 GPU_RANKS="${GPU_RANKS:-${SLURM_GPUS_ON_NODE:-4}}"   # GPUs for the multi-GPU run
 PRECISION="${PRECISION:-double}"                 # field/solve precision: single|double
-COMMON=(-n "$SIZE" "$SIZE" "$SIZE" --target-K 0.1 --target-G 0.05 \
-        --bfgs-maxiter "$ITERS" --seed 0 --init filtered_random \
-        --precision "$PRECISION")
+# One control file per device; everything else at simulate.py's defaults.
+control() {  # control DEVICE FILE
+    cat > "$2" <<JSON
+{
+  "grid": {"nb_grid_pts": [$SIZE, $SIZE, $SIZE]},
+  "target": {"bulk_modulus": 0.1, "shear_modulus": 0.05},
+  "initial_density": {"source": "filtered_random", "seed": 0},
+  "optimizer": {"max_iterations": $ITERS},
+  "compute": {"device": "$1", "precision": "$PRECISION"},
+  "output": {"file": "topopt_$1.nc"}
+}
+JSON
+}
+control cpu topopt_cpu.json
+control gpu topopt_gpu.json
 
 echo "=== muTopOpt benchmark: MPI ($RANKS CPU ranks) vs 1x GPU vs ${GPU_RANKS}x GPU ==="
 echo "grid=${SIZE}^3  iters=$ITERS  precision=$PRECISION  $(date)"
@@ -59,7 +71,7 @@ echo
 # --- Full-node MPI (CPU) --------------------------------------------------- #
 echo ">>> [1/3] MPI on $RANKS CPU ranks (device=cpu)"
 t0=$SECONDS
-mpirun -np "$RANKS" python3 simulate.py "${COMMON[@]}" --device cpu
+mpirun -np "$RANKS" python3 simulate.py topopt_cpu.json
 t_mpi=$(( SECONDS - t0 ))
 echo ">>> MPI wall time: ${t_mpi}s"
 echo
@@ -67,7 +79,7 @@ echo
 # --- Single GPU ------------------------------------------------------------ #
 echo ">>> [2/3] Single GPU (device=gpu)"
 t0=$SECONDS
-python3 simulate.py "${COMMON[@]}" --device gpu
+python3 simulate.py topopt_gpu.json
 t_gpu=$(( SECONDS - t0 ))
 echo ">>> GPU wall time: ${t_gpu}s"
 echo
@@ -76,7 +88,7 @@ echo
 # One rank per GPU; UCX_TLS=^rocm_ipc (set in _env.sh) is required here.
 echo ">>> [3/3] ${GPU_RANKS} GPUs via MPI (device=gpu)"
 t0=$SECONDS
-mpirun -np "$GPU_RANKS" python3 simulate.py "${COMMON[@]}" --device gpu
+mpirun -np "$GPU_RANKS" python3 simulate.py topopt_gpu.json
 t_gpu4=$(( SECONDS - t0 ))
 echo ">>> ${GPU_RANKS}x GPU wall time: ${t_gpu4}s"
 echo

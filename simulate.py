@@ -5,20 +5,25 @@
 # MIT License (see LICENSE)
 #
 """
-Command-line driver for muTopOpt elasticity: optimize the density of a
-periodic unit cell, in 2D or 3D, so that its homogenized stiffness matches a
-target isotropic stiffness. The target is given either as bulk and shear
-moduli (``--target-K``/``--target-G``) or as Young's modulus and Poisson's
-ratio (``--target-E``/``--target-nu``).
+Elasticity driver of muTopOpt: optimize the density of a periodic unit cell,
+in 2D or 3D, so that its homogenized stiffness matches a target isotropic
+stiffness, given either as bulk and shear moduli (``target.bulk_modulus``,
+``target.shear_modulus``) or as Young's modulus and Poisson's ratio
+(``target.young_modulus``, ``target.poisson_ratio``).
+
+A run is described by a JSON control file; ``--write-defaults FILE`` writes
+one with every key at its default, ready to edit, together with its JSON
+Schema. Keys the file does not set take their defaults; ``null`` means the
+value is determined automatically (the help of each key says how).
 
 Mathematical setup
 ------------------
 The design is a density rho in [0, 1] -- a nodal finite-element field by
-default (``--density nodal``), or one value per pixel (``--density
-element``) -- mapped to per-pixel Lame parameters by SIMP with exponent p
-(``--penalty``). Each of the d(d+1)/2 load cases G applies a macro strain E_G
-of magnitude 0.01 along one direction of the symmetric strain space; the
-periodic displacement fluctuation solves the FE equilibrium
+default (``discretization.density``), or one value per pixel -- mapped to
+per-pixel Lame parameters by SIMP with exponent p
+(``material.simp_exponent``). Each of the d(d+1)/2 load cases G applies a
+macro strain E_G of magnitude 0.01 along one direction of the symmetric
+strain space; the periodic displacement fluctuation solves the FE equilibrium
 
     K(rho) u_G = -B^T C(rho) : E_G
 
@@ -28,34 +33,39 @@ with the target stress C* : E_G:
     f(rho) = sum_G |<sigma_G> - C*:E_G|^2 / |C*:E_G|^2 + f_reg(rho),
 
 where f_reg is the Modica-Mortola phase-field regularization with interface
-width ``--eta`` (default one grid spacing) and weight ``--reg-weight``. The
-gradient comes from the discrete adjoint (one extra solve per load case).
-The outer optimizer (``--optimizer``) is either NuMPI's bound-constrained
-trust-region Newton-CG with exact Hessian-vector products (chosen by
-``auto`` when the installed NuMPI provides it) or NuMPI's projected L-BFGS;
-both run MPI-distributed on the same domain decomposition as the fields. The
-inner CG tolerance adapts from ``--cg-tol-start`` down to ``--cg-tol-min``
-(see muTopOpt.optimize). The run starts from a filtered random field
-(``--init``) or from the last frame of a previous output file, which is
-Fourier-resampled if its grid differs from ``-n``.
+width ``regularization.interface_width`` and weight
+``regularization.weight``. The gradient comes from the discrete adjoint (one
+extra solve per load case). The outer optimizer (``optimizer.method``) is
+either NuMPI's bound-constrained trust-region Newton-CG with exact
+Hessian-vector products or NuMPI's projected L-BFGS; both run MPI-distributed
+on the same domain decomposition as the fields. The inner CG tolerance adapts
+from ``inner_solver.adaptive.initial_tolerance`` down to its minimum (see
+muTopOpt.optimize). The run starts from a generated field
+(``initial_density.source``) or from the last frame of a previous output
+file, which is Fourier-resampled if its grid differs.
 
 The solves and the sensitivity run on the host or, with a GPU build of
-muGrid and ``--device gpu``, on the device; the outer optimizer always runs
-on the host. With ``--output`` the density (and per-frame homogenized
-stresses and effective moduli) is written to a NetCDF file through muGrid,
-readable with muGrid's FileIONetCDF and usable as ``--init`` for a restart.
+muGrid and ``compute.device`` = "gpu", on the device; the outer optimizer
+always runs on the host. The density, per-frame homogenized stresses and
+effective moduli are written to the NetCDF file ``output.file`` through
+muGrid, together with the resolved control file; it can be used as
+``initial_density.source`` of a later run.
 
 Examples
 --------
-    python simulate.py -n 64 64            --target-K 0.1 --target-G 0.05
-    python simulate.py -n 64 64            --target-E 0.2 --target-nu -0.3
-    python simulate.py -n 96 96 96 --bfgs-maxiter 300 --eta 0.02
-    python simulate.py -n 64 64 64 --device gpu --precision single
-    mpirun -np 4 python simulate.py -n 128 128 128 --output design.nc
-    python simulate.py -n 256 256 256 --init design.nc   # restart, resampled
+    python simulate.py --write-defaults run.json   # then edit run.json
+    python simulate.py run.json
+    mpirun -np 4 python simulate.py run.json
+
+A minimal control file only sets what differs from the defaults, e.g.
+
+    {"grid": {"nb_grid_pts": [128, 128, 128]},
+     "target": {"young_modulus": 0.2, "poisson_ratio": -0.3},
+     "compute": {"device": "gpu", "precision": "single"}}
 """
 
 import argparse
+import json
 import os
 import shlex
 import sys
@@ -73,6 +83,14 @@ from muTopOpt import (
     StressTargetProblem,
 )
 from muTopOpt.bounds import target_feasibility
+from muTopOpt.control import (
+    ControlError,
+    defaults,
+    describe,
+    dumps,
+    json_schema,
+)
+from muTopOpt.control import load as load_control
 from muTopOpt.loadcases import (
     isotropic_stiffness_from_E_nu,
     isotropic_stiffness_tensor,
@@ -92,332 +110,114 @@ from muTopOpt.version import (
 )
 
 
-class _HelpFormatter(
-    argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter
-):
-    """Keep the raw docstring layout *and* append each option's default."""
+#: File name of the JSON Schema that --write-defaults writes next to the
+#: control file and that the control file's "$schema" key points to.
+SCHEMA_FILE = "simulate.schema.json"
+
+
+def _settings(control):
+    """The run settings of a validated control object, under the names the
+    driver uses internally."""
+    c = control
+    tr = c["optimizer"]["trust_region"]
+    adaptive = c["inner_solver"]["adaptive"]
+    method = c["optimizer"]["method"]
+    return argparse.Namespace(
+        nb_grid_pts=c["grid"]["nb_grid_pts"],
+        domain_lengths=c["grid"]["domain_lengths"],
+        element=c["discretization"]["element"],
+        density=c["discretization"]["density"],
+        solid_E=c["material"]["young_modulus"],
+        solid_nu=c["material"]["poisson_ratio"],
+        penalty=c["material"]["simp_exponent"],
+        void_ratio=c["material"]["void_ratio"],
+        target_K=c["target"]["bulk_modulus"],
+        target_G=c["target"]["shear_modulus"],
+        target_E=c["target"]["young_modulus"],
+        target_nu=c["target"]["poisson_ratio"],
+        eta=c["regularization"]["interface_width"],
+        reg_weight=c["regularization"]["weight"],
+        init=c["initial_density"]["source"],
+        init_volume_fraction=c["initial_density"]["volume_fraction"],
+        init_length=c["initial_density"]["correlation_length"],
+        seed=c["initial_density"]["seed"],
+        optimizer={None: "auto", "trust_region": "tr",
+                   "lbfgs": "lbfgs"}[method],
+        bfgs_maxiter=c["optimizer"]["max_iterations"],
+        bfgs_gtol=c["optimizer"]["gradient_tolerance"],
+        bfgs_xtol=c["optimizer"]["step_tolerance"],
+        tr_delta0=tr["initial_radius"],
+        tr_delta_max=tr["max_radius"],
+        tr_eta=tr["acceptance_threshold"],
+        hv_cg_tol=tr["hessian_tolerance"],
+        hv_warm_start=tr["hessian_warm_start"],
+        cg_tol=c["inner_solver"]["tolerance"],
+        cg_maxiter=c["inner_solver"]["max_iterations"],
+        preconditioner=c["inner_solver"]["preconditioner"],
+        output_cg_iters=c["inner_solver"]["print_iterations"],
+        cg_tol_start=(adaptive["initial_tolerance"] if adaptive["enabled"]
+                      else 0.0),
+        cg_tol_min=adaptive["minimum_tolerance"],
+        cg_forcing_exp=adaptive["forcing_exponent"],
+        cg_stall_shrink=adaptive["stall_shrink"],
+        cg_stall_rel=adaptive["stall_relative_decrease"],
+        device=c["compute"]["device"],
+        precision=c["compute"]["precision"],
+        output=c["output"]["file"],
+        dump_every=(c["output"]["dump_every"] if c["output"]["dump_every"] > 0
+                    else -1),
+        no_flush=not c["output"]["flush_frames"],
+    )
+
+
+def _write_defaults(path):
+    """Write the default control file and its JSON Schema next to it."""
+    schema_path = os.path.join(os.path.dirname(os.path.abspath(path)),
+                               SCHEMA_FILE)
+    control = {"$schema": SCHEMA_FILE, **defaults()}
+    with open(path, "w") as f:
+        f.write(dumps(control))
+    with open(schema_path, "w") as f:
+        f.write(json.dumps(json_schema(), indent=2) + "\n")
+    print(f"wrote {path} (all keys at their defaults) and {schema_path}")
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=_HelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="Keys of the control file, with their defaults:\n"
+        + describe(),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
-        "-n",
-        "--nb-grid-pts",
-        type=int,
-        nargs="+",
-        required=True,
-        help="grid points per axis (2 or 3 values)",
-    )
+        "control", nargs="?", metavar="CONTROL.json",
+        help="JSON control file; keys it does not set take their defaults")
     p.add_argument(
-        "--domain-lengths",
-        type=float,
-        nargs="+",
-        default=None,
-        help="physical edge length of the unit cell per axis (2 or 3 values, "
-        "matching -n); default: unit length on every axis",
-    )
-    p.add_argument("--solid-E", type=float, default=1.0, help="solid Young's modulus")
-    p.add_argument("--solid-nu", type=float, default=0.3, help="solid Poisson's ratio")
-    p.add_argument("--penalty", type=float, default=2.0, help="SIMP exponent p")
-    p.add_argument(
-        "--void-ratio",
-        type=float,
-        default=1e-3,
-        help="void/solid stiffness ratio (default: 1e-3). Must be positive: "
-        "with 0 the stiffness of void pixels vanishes and the system is "
-        "only positive semidefinite",
-    )
-    p.add_argument("--target-K", type=float, default=0.1, help="target bulk modulus")
-    p.add_argument("--target-G", type=float, default=0.05, help="target shear modulus")
-    p.add_argument(
-        "--target-E",
-        type=float,
-        default=None,
-        help="target Young's modulus (alternative to --target-K/--target-G; "
-        "requires --target-nu)",
-    )
-    p.add_argument(
-        "--target-nu",
-        type=float,
-        default=None,
-        help="target Poisson's ratio (alternative to --target-K/--target-G; "
-        "requires --target-E)",
-    )
-    p.add_argument(
-        "--eta",
-        type=float,
-        default=None,
-        help="phase-field interface width, in physical length units "
-        "(default: one grid spacing)",
-    )
-    p.add_argument(
-        "--reg-weight",
-        type=float,
-        default=1.0,
-        help="phase-field regularization weight: penalty per unit interfacial "
-        "area, measured in units of L^(D-1) with L the linear cell size "
-        "(the Modica-Mortola functional is normalized by 1/(c_W V^((D-1)/D)), "
-        "c_W = 1/3 for the quartic double well)",
-    )
-    p.add_argument(
-        "--init-volume-fraction",
-        type=float,
-        default=0.5,
-        help="volume fraction of the initial density field",
-    )
-    p.add_argument(
-        "--init",
-        default="filtered_random",
-        metavar="KIND_OR_FILE",
-        help="initial density field: 'uniform' (constant), 'random' "
-        "(noise lightly smoothed by two box-filter sweeps), "
-        "'filtered_random' (noise smoothed to a correlation "
-        "length; least prone to locking the initial topology), or the NetCDF "
-        "output of a previous run to restart from its last frame (Fourier-"
-        "resampled if the stored grid does not match -n)",
-    )
-    p.add_argument(
-        "--init-length",
-        type=float,
-        default=None,
-        help="correlation length for --init filtered_random (default: 3*eta)",
-    )
-    p.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="random seed for the --init random/filtered_random density field",
-    )
-    p.add_argument(
-        "--optimizer",
-        choices=["auto", "lbfgs", "tr"],
-        default="auto",
-        help="outer optimizer: 'tr' (trust-region Newton-CG with exact "
-        "second-order-adjoint Hessian-vector products; robust against "
-        "loose inner CG tolerances, at ~2 extra solves per load case "
-        "per Hessian product; needs NuMPI with tr_newton_bounded), "
-        "'lbfgs' (bound-constrained L-BFGS), or 'auto' (tr when the "
-        "installed NuMPI supports it, else lbfgs)",
-    )
-    p.add_argument(
-        "--bfgs-maxiter",
-        type=int,
-        default=200,
-        help="maximum number of outer optimizer iterations (L-BFGS or TR)",
-    )
-    p.add_argument(
-        "--tr-delta0",
-        type=float,
-        default=0.05,
-        help="initial trust-region radius, in RMS density change per pixel",
-    )
-    p.add_argument(
-        "--tr-delta-max",
-        type=float,
-        default=0.5,
-        help="maximum trust-region radius, in RMS density change per pixel",
-    )
-    p.add_argument(
-        "--tr-eta",
-        type=float,
-        default=0.1,
-        help="trust-region step acceptance threshold on ared/pred",
-    )
-    p.add_argument(
-        "--hv-cg-tol",
-        type=float,
-        default=1e-3,
-        help="relative CG tolerance of the two extra solves per "
-        "Hessian-vector product (may be loose: the Hessian only shapes "
-        "the trust-region model)",
-    )
-    p.add_argument(
-        "--hv-warm-start",
-        action="store_true",
-        help="warm-start each Hessian-vector solve from the same load case's "
-        "previous product, keeping 2 extra vector fields per load case (the "
-        "largest block of device memory the optimizer holds at scale). "
-        "Measured to save only 2-4%% of inner CG iterations and no wall time, "
-        "so it is off by default",
-    )
-    p.add_argument(
-        "--output-cg-iters",
-        action="store_true",
-        help="print one line per inner CG iteration (residual and "
-        "relative residual) for every forward/adjoint solve, "
-        "so the CG convergence can be watched live",
-    )
-    p.add_argument(
-        "--bfgs-gtol",
-        type=float,
-        default=None,
-        help="convergence tolerance on the projected gradient (L-BFGS and "
-        "TR), measured on the mesh-invariant volume-fraction derivative "
-        "(V/V_pixel)*df/drho -- the same value means the same physical "
-        "stationarity at every resolution (typical initial designs start "
-        "at ~100 in these units). Default: 2.5 in double precision, 25 in "
-        "single precision (the float32 solve accuracy floor makes a "
-        "tighter gradient tolerance uncertifiable)",
-    )
-    p.add_argument(
-        "--bfgs-xtol",
-        type=float,
-        default=0.0,
-        help="L-BFGS convergence tolerance on the step size (maximum absolute "
-        "change of the density between iterates); 0 disables the criterion",
-    )
-    p.add_argument(
-        "--cg-tol",
-        type=float,
-        default=1e-4,
-        help="inner CG relative tolerance; loose values are safe "
-        "because the objective is adjoint-corrected "
-        "(Lagrangian) and thus second-order accurate in the "
-        "solve error",
-    )
-    p.add_argument(
-        "--cg-maxiter",
-        type=int,
-        default=2000,
-        help="maximum number of inner CG iterations per solve "
-        "(the solve stops here even if --cg-tol is not met)",
-    )
-    p.add_argument(
-        "--cg-tol-start",
-        type=float,
-        default=1e-2,
-        help="adaptive inner CG tolerance (ON by default): solves start at "
-        "this (coarse) relative tolerance and tighten automatically -- "
-        "for the trust-region optimizer driven by the computable "
-        "|f_err| <= eta_f*pred accuracy condition, for L-BFGS by an "
-        "Eisenstat-Walker forcing term with a stagnation ratchet. Pass "
-        "0 (or negative) to disable adaptation and use the fixed "
-        "--cg-tol throughout",
-    )
-    p.add_argument(
-        "--cg-tol-min",
-        type=float,
-        default=None,
-        help="floor for the adaptive inner tolerance. Default for L-BFGS: "
-        "--bfgs-gtol/1e4, capped at --cg-tol (the mesh-invariant "
-        "gradient error stays below ~1e3 x the CG tolerance -- measured "
-        "at 32^3/64^3 with a 10x margin -- so this floor lets L-BFGS "
-        "certify convergence at --bfgs-gtol); 1e-10 for the trust-region "
-        "optimizer (its accuracy control only tightens as far as the "
-        "predicted reduction requires). In single precision the "
-        "default floor is clamped to 1e-6: below that the true "
-        "residual b-Kx of a float32 solve stagnates (only the "
-        "recursive CG residual keeps shrinking) and CG may fail "
-        "outright",
-    )
-    p.add_argument(
-        "--cg-forcing-exp",
-        type=float,
-        default=1.0,
-        help="exponent alpha in the relative forcing term "
-        "rtol = rtol_start * (||g_free||/||g_0||)**alpha (default 1.0; "
-        "alpha=1 gives rtol=O(||g||) and fast local convergence)",
-    )
-    p.add_argument(
-        "--cg-stall-shrink",
-        type=float,
-        default=0.3,
-        help="stagnation ratchet for the adaptive tolerance: when the "
-        "projected gradient stops decreasing, the inner tolerance is "
-        "multiplied by this factor (default 0.3) toward --cg-tol-min, so a "
-        "noise-limited plateau cannot stall the run",
-    )
-    p.add_argument(
-        "--cg-stall-rel",
-        type=float,
-        default=1e-2,
-        help="minimum relative decrease in the projected gradient counted as "
-        "progress (default 0.01); an iterate that does not beat the best "
-        "gradient by this much triggers the --cg-stall-shrink ratchet",
-    )
-    p.add_argument(
-        "--preconditioner",
-        choices=["green-jacobi", "green", "hybrid-jacobi", "hybrid"],
-        default="green-jacobi",
-        help="inner-solve preconditioner: 'green-jacobi' (J-FFT, "
-        "reference stiffness times a per-pixel Jacobi scaling), "
-        "'green' (plain reference-stiffness Green operator), or "
-        "'hybrid-jacobi' / 'hybrid', the same two with the reference "
-        "stiffness inverted by muGrid's HybridFourierTridiagonal"
-        "Preconditioner: FFT in the rank-local axes and a tridiagonal "
-        "solve in the distributed one, so no all-to-all. Same iterations; "
-        "slower on one GPU, faster from ~128^3 on two",
-    )
-    p.add_argument(
-        "--element",
-        choices=["p1", "q1"],
-        default="q1",
-        help="finite element (P1 simplices or Q1 hex/quad)",
-    )
-    p.add_argument(
-        "--device",
-        default="cpu",
-        metavar="DEVICE",
-        help="run the forward/adjoint solves and sensitivity on the "
-        "host ('cpu') or on the accelerator ('gpu', or the platform-"
-        "specific 'rocm'/'cuda'); the L-BFGS optimizer always runs on "
-        "the host. Append ':N' to pin a specific device by id (e.g. "
-        "'rocm:0', 'cuda:1') instead of the default per-rank placement",
-    )
-    p.add_argument(
-        "--precision",
-        choices=["single", "double"],
-        default="double",
-        help="scalar precision of the on-grid fields and the "
-        "FFT-accelerated solves (the FFT engine dispatches on the "
-        "field dtype); the host L-BFGS optimizer stays double",
-    )
-    p.add_argument(
-        "--density",
-        choices=["element", "nodal"],
-        default="nodal",
-        help="density discretization: 'nodal' (nodal FE field, "
-        "SIMP on the element average of the interpolant, fully "
-        "consistent Galerkin phase-field regularization) or "
-        "'element' (per-pixel density, FD Laplacian penalty)",
-    )
-    p.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="NetCDF file to write the optimized density to",
-    )
-    p.add_argument(
-        "--dump-every",
-        type=int,
-        default=-1,
-        help="dump intermediate L-BFGS iterates to the NetCDF output "
-        "as successive frames: with N>0 the initial "
-        "configuration and every N-th iterate (N, 2N, ...) are "
-        "written, and the final iterate is always included; -1 "
-        "(default) writes only the final density as a single "
-        "frame",
-    )
-    p.add_argument(
-        "--no-flush",
-        action="store_true",
-        help="do not flush each frame to disk as it is written. By default "
-        "every frame is synced (muGrid FileIONetCDF.sync) so the output can "
-        "be inspected mid-run; the classic/NetCDF-4 backend otherwise "
-        "buffers frames until the file is closed (PnetCDF commits on its "
-        "own). Needs a muGrid that provides sync(); ignored otherwise",
-    )
-    args = p.parse_args()
+        "--write-defaults", metavar="FILE",
+        help=f"write a control file with every key at its default (and the "
+        f"JSON Schema {SCHEMA_FILE} next to it), then exit")
+    cli = p.parse_args()
+    if cli.write_defaults is not None:
+        if muGrid.Communicator().rank == 0:
+            _write_defaults(cli.write_defaults)
+        return
+    if cli.control is None:
+        p.error("a control file is required; create one with "
+                "--write-defaults FILE")
+    try:
+        control = load_control(cli.control)
+    except (ControlError, OSError) as err:
+        p.error(str(err))
+    args = _settings(control)
 
     dim = len(args.nb_grid_pts)
-    if dim not in (2, 3):
-        p.error("-n takes 2 or 3 values")
     if args.domain_lengths is not None and len(args.domain_lengths) != dim:
-        p.error(f"--domain-lengths must have {dim} values (one per axis)")
+        p.error(f"grid.domain_lengths must have {dim} values, one per entry "
+                "of grid.nb_grid_pts")
     if args.init not in INITIAL_DENSITY_KINDS and not os.path.exists(args.init):
         p.error(
-            f"--init must be one of {', '.join(INITIAL_DENSITY_KINDS)} or an "
-            f"existing NetCDF restart file; '{args.init}' is neither")
+            f"initial_density.source must be one of "
+            f"{', '.join(INITIAL_DENSITY_KINDS)} or an existing NetCDF "
+            f"restart file; '{args.init}' is neither")
 
     # Resolve 'auto': the trust-region Newton-CG is the robust default (its
     # acceptance test cannot drown in inner-solve noise the way a line search
@@ -452,15 +252,16 @@ def main():
     bfgs_gtol = (args.bfgs_gtol if args.bfgs_gtol is not None
                  else (25.0 if single else 2.5))
 
-    # Adaptive inner CG tolerance is on by default (<= 0 disables it: fixed
-    # --cg-tol throughout). The floor defaults per optimizer: L-BFGS needs the
-    # final gradient error below the gradient tolerance to certify
-    # convergence -- in the mesh-invariant ĝ units the error is bounded by
-    # ~1e3 x the CG tolerance (measured at 32^3/64^3 on the initial iterate;
-    # _KAPPA_EFF below includes a 10x margin for late high-contrast designs),
-    # so the floor is bfgs_gtol/_KAPPA_EFF, capped at the fixed --cg-tol. The
-    # trust-region accuracy control only tightens as far as the predicted
-    # reduction requires, so it just gets ample room.
+    # Adaptive inner CG tolerance is on by default (disabled: the fixed
+    # inner_solver.tolerance throughout). The floor defaults per optimizer:
+    # L-BFGS needs the final gradient error below the gradient tolerance to
+    # certify convergence -- in the mesh-invariant ĝ units the error is
+    # bounded by ~1e3 x the CG tolerance (measured at 32^3/64^3 on the
+    # initial iterate; _KAPPA_EFF below includes a 10x margin for late
+    # high-contrast designs), so the floor is bfgs_gtol/_KAPPA_EFF, capped at
+    # the fixed inner_solver.tolerance. The trust-region accuracy control only
+    # tightens as far as the predicted reduction requires, so it just gets
+    # ample room.
     _KAPPA_EFF = 1e4  # mesh-invariant gradient error per unit CG rtol
     cg_tol_start = (args.cg_tol_start
                     if args.cg_tol_start and args.cg_tol_start > 0 else None)
@@ -470,7 +271,8 @@ def main():
             import warnings
 
             warnings.warn(
-                f"--cg-tol-min {cg_tol_min:.1e} is below the single-"
+                f"inner_solver.adaptive.minimum_tolerance {cg_tol_min:.1e} "
+                "is below the single-"
                 f"precision solve accuracy floor (~{rtol_floor:.0e}); the "
                 "true residual cannot reach it, so it will be raised to the "
                 "floor",
@@ -482,7 +284,7 @@ def main():
         cg_tol_min = min(args.cg_tol, bfgs_gtol / _KAPPA_EFF)
     if cg_tol_start is None and optimizer == "tr":
         # Adaptation disabled: pin the trust-region accuracy control at the
-        # fixed --cg-tol (start == floor), i.e. a truly fixed tolerance.
+        # fixed inner_solver.tolerance (start == floor), i.e. a truly fixed tolerance.
         cg_tol_start = args.cg_tol
         cg_tol_min = args.cg_tol
     # Apply the precision floor *last*, after every branch above has set
@@ -532,8 +334,6 @@ def main():
                 line += "; set " + " ".join(
                     f"{k}={v}" for k, v in homog.mugrid_environment.items())
             print(line)
-    if (args.target_E is None) != (args.target_nu is None):
-        p.error("--target-E and --target-nu must be given together")
     if args.target_E is not None:
         target = isotropic_stiffness_from_E_nu(dim, args.target_E, args.target_nu)
     else:
@@ -565,7 +365,7 @@ def main():
 
     # Young's modulus and Poisson's ratio equivalent to (K, G) in the same
     # convention (K = lambda + 2 mu / dim, G = mu; plane-strain in 2D, so these
-    # are the true 3D constants, matching --target-E/--target-nu).
+    # are the true 3D constants, matching target.young_modulus/poisson_ratio).
     def E_nu_from_K_G(K, G):
         return E_nu_from_lame(K - 2.0 * G / dim, G)
 
@@ -678,7 +478,7 @@ def main():
     # the final frame and summary use this.
     accepted_stresses = [None]
 
-    # `--dump-every N` (N>0) streams the initial density (iteration 0) and every
+    # `output.dump_every N` (N>0) streams the initial density (iteration 0) and every
     # N-th iterate to the output file as successive frames; the final iterate is
     # always added. Frames are written *directly* as they are produced (never
     # buffered in memory, which would overflow for large 3D grids), so the
@@ -746,7 +546,7 @@ def main():
         # Grid shape and scalar precision of the stored density. Both are
         # needed to *read* the file back (muGrid must register a field of the
         # stored shape and dtype before it can read, and its Python API cannot
-        # inquire them from the file), so `--init <file>` restarts rely on
+        # inquire them from the file), so restarts from such a file rely on
         # these; see muTopOpt.restart.
         fio.write_global_attribute(
             "nb_grid_pts", [int(n) for n in args.nb_grid_pts]
@@ -760,6 +560,10 @@ def main():
         # with its final value here (no placeholder/update). `sys.argv` is
         # identical across ranks, so writing from all ranks is consistent.
         fio.write_global_attribute("command_line", shlex.join(sys.argv))
+        # The complete control (file values plus defaults), so the file alone
+        # reproduces the run: save this attribute as a .json and pass it to
+        # simulate.py.
+        fio.write_global_attribute("control", dumps(control))
         # Which build produced the file. `command_line` says what was asked
         # for; these say what ran it, which is what distinguishes two otherwise
         # identical runs whose numbers differ.
@@ -802,7 +606,7 @@ def main():
     # PnetCDF backend commits collective writes on its own; the classic /
     # NetCDF-4 backend otherwise buffers frames until close(). sync() needs a
     # recent enough muGrid (feature-detected on the instance); disabled with
-    # --no-flush.
+    # output.flush_frames.
     flush_frames = (not args.no_flush) and hasattr(fio, "sync")
 
     def write_frame(it, rho, stresses=None):
@@ -923,7 +727,7 @@ def main():
                     fio.sync()
         if rank0:
             # Per-CG-iteration residuals are reported live during the solves
-            # themselves (--output-cg-iters); here we always summarize the
+            # themselves (inner_solver.print_iterations); here we always summarize the
             # outer step, the current effective moduli against their targets,
             # and the inner CG iterations it took (the same totals also go to
             # the NetCDF history above).
@@ -1020,7 +824,7 @@ def main():
     if args.output is not None:
         # Always include the final iterate as the last frame (unless it was
         # already the most recent one dumped, i.e. its iteration is a multiple
-        # of --dump-every).
+        # of output.dump_every).
         # The final frame is labelled with the accepted-iterate index, the
         # same counter `write_frame` uses for the intermediate dumps: then
         # `frame_iterations` holds a single counter, and the duplicate check

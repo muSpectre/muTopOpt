@@ -45,7 +45,7 @@ pip install -e ".[test,scipy]"      # add ,mpi for mpi4py
 
 ### GPU memory
 
-With `--device gpu`, muTopOpt allocates everything on the GPU either as plain
+With `compute.device` set to `"gpu"`, muTopOpt allocates everything on the GPU either as plain
 device memory (`hipMalloc`/`cudaMalloc`) or as managed memory
 (`hipMallocManaged`/`cudaMallocManaged`), and picks one automatically:
 
@@ -91,15 +91,39 @@ rho, info = optimize_lbfgs(problem, rho0, maxiter=200)
 
 ### Command line
 
+`simulate.py` (elasticity) reads a JSON control file. Write one with every key
+at its default, edit it, and run it:
+
 ```bash
-python simulate.py -n 64 64        --target-K 0.1  --target-G 0.05 --bfgs-maxiter 200
-python simulate.py -n 96 96 96     --target-K 0.1  --target-G 0.05 --eta 0.02 --output cell.nc
-# --eta is in the length units of the cell (unit length by default), so
-# 0.02 is about two grid spacings at n = 96.
-# Restart from a previous run's output; a coarse design seeds a finer grid
-# (the density is Fourier-interpolated when the grids differ)
-python simulate.py -n 128 128 128  --target-K 0.1  --target-G 0.05 --init cell.nc
+python simulate.py --write-defaults run.json   # also writes simulate.schema.json
+python simulate.py run.json
+mpirun -np 4 python simulate.py run.json
+python simulate.py --help                      # every key, its default and meaning
 ```
+
+A control file only needs the keys that differ from the defaults; `null`
+means the value is determined automatically, as each key's help describes.
+Unknown keys are rejected. For example, a 96³ run that restarts from a
+previous output (the density is Fourier-interpolated when the grids differ):
+
+```json
+{
+  "grid": {"nb_grid_pts": [96, 96, 96]},
+  "target": {"bulk_modulus": 0.1, "shear_modulus": 0.05},
+  "regularization": {"interface_width": 0.02},
+  "initial_density": {"source": "cell.nc"},
+  "output": {"file": "cell96.nc"}
+}
+```
+
+`regularization.interface_width` is in the length units of the cell (unit
+length by default), so 0.02 is about two grid spacings at 96 points. The
+editor can check a file against `simulate.schema.json` (its `"$schema"`
+key points there). Every output file stores the complete control it was run
+with in its `control` attribute, so a run can be reproduced from its output.
+
+The conduction driver `simulate_conduction.py` keeps its command-line
+options (`python simulate_conduction.py --help`).
 
 ### Reading the log
 
@@ -119,15 +143,15 @@ printed iterations.
 
 A `cg-stalled=N` entry in an iterate line counts the inner solves of that
 outer step that hit their finite-precision residual floor before the
-requested tolerance (common in `--precision single`, where the achievable
+requested tolerance (common in single precision, where the achievable
 relative residual is ~$10^{-6}$ for a healthy right-hand side and far coarser
 for the near-round-off right-hand sides that Hessian-vector products can
 produce). Such a solve is cut short — on stagnation, divergence, or the
 iteration cap — and its best iterate is used (never worse than the zero
 solution, with the true residual $b - Kx$ recomputed) instead of aborting
 the run; the adjoint-corrected objective and the trust-region accuracy
-control account for the extra solve error. `--output-cg-iters` prints a
-detail line per cut-short solve.
+control account for the extra solve error. `inner_solver.print_iterations`
+prints a detail line per cut-short solve.
 
 ## License
 
