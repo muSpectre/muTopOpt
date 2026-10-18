@@ -1,6 +1,23 @@
 Change log for muTopOpt
 =======================
 
+v1.2.0 (not yet released)
+-------------------------
+
+- PERF: Managed device memory only where it pays off. It used to be chosen
+  on every unified-memory GPU (MI300A), which on Hunter made multi-GPU runs
+  several times slower: MPI is slow on managed buffers (256³ on 4 GPUs: the
+  FFT-preconditioned solve 5.4x, the hybrid one 1.8x), while on one GPU it
+  costs at most 4%. Now managed memory is used on an APU with a single rank;
+  plain device memory with more than one rank and on discrete GPUs, as
+  before. `MUTOPOPT_MANAGED` and `managed_memory=` still override. The choice
+  and its reason are printed at startup and stored as the `device_memory`
+  attribute of the output file
+- ENH: With plain device memory on an APU, `MUGRID_UNIFIED_MEMORY=0` and, on
+  Cray MPICH with `MPICH_GPU_SUPPORT_ENABLED=1`, `MUGRID_GPU_AWARE_MPI=1` are
+  set unless already set, so muGrid neither hands plain MI300A memory to MPI
+  as host memory (an error) nor reads it in place for NetCDF output
+
 v1.1.0 (05Oct26)
 ----------------
 

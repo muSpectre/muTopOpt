@@ -26,6 +26,31 @@ and you additionally need `cupy`.
 pip install -e ".[test]"
 ```
 
+### GPU memory
+
+With `--device gpu`, muTopOpt allocates everything on the GPU either as plain
+device memory (`hipMalloc`/`cudaMalloc`) or as managed memory
+(`hipMallocManaged`/`cudaMallocManaged`), and picks one automatically:
+
+| GPU | ranks | memory | why |
+|---|---|---|---|
+| discrete (NVIDIA, AMD MI200/MI300X, …) | any | plain | managed pages migrate between host and device on every access (9× slower per CG iteration, measured) |
+| unified-memory APU (AMD MI300A) | 1 | managed | reaches all 128 GB instead of the ~62.8 GiB plain window; kernels run at full speed (≤4% slower, measured) |
+| unified-memory APU (AMD MI300A) | > 1 | plain | MPI is several times slower on managed buffers (5.4× for the FFT preconditioner, 1.8× for the hybrid one at 256³ on 4 GPUs, measured) |
+
+The run prints its choice and the reason (`device memory: ...`) and records it
+in the output file (`device_memory` attribute). `MUTOPOPT_MANAGED=1` or `0`
+overrides it. The one case that needs this: a multi-rank run on MI300A whose
+fields on one rank exceed the plain window. Either use more ranks or set
+`MUTOPOPT_MANAGED=1` and accept the slower exchanges.
+
+With plain memory on MI300A, muTopOpt also sets `MUGRID_UNIFIED_MEMORY=0`,
+and on Cray MPICH with `MPICH_GPU_SUPPORT_ENABLED=1` also
+`MUGRID_GPU_AWARE_MPI=1`, unless they are already set. muGrid otherwise takes
+plain MI300A memory for host-readable, which it is not. The details and the
+measurements are in the notes above `_device_has_unified_memory` in
+`muTopOpt/homogenization.py`.
+
 ## Usage
 
 ### Python API

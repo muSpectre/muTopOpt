@@ -489,6 +489,12 @@ def main():
     print(mugrid_version(homog.comm, homog.device))
     if rank0:
         print(mutopopt_version())
+        if homog.device_memory != "host":
+            line = f"device memory: {homog.device_memory_reason}"
+            if homog.mugrid_environment:
+                line += "; set " + " ".join(
+                    f"{k}={v}" for k, v in homog.mugrid_environment.items())
+            print(line)
     if (args.target_E is None) != (args.target_nu is None):
         p.error("--target-E and --target-nu must be given together")
     if args.target_E is not None:
@@ -709,6 +715,9 @@ def main():
             "nb_grid_pts", [int(n) for n in args.nb_grid_pts]
         )
         fio.write_global_attribute("precision", args.precision)
+        # "managed", "plain" or "host": it changes the speed of a multi-GPU
+        # run several-fold, so it belongs next to the other run parameters.
+        fio.write_global_attribute("device_memory", homog.device_memory)
         # Full invocation that produced this file, quoted so it can be pasted
         # back into a shell to reproduce the run. Known up front, so written
         # with its final value here (no placeholder/update). `sys.argv` is
