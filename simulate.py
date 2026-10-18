@@ -120,7 +120,12 @@ def main():
     p.add_argument("--solid-nu", type=float, default=0.3, help="solid Poisson's ratio")
     p.add_argument("--penalty", type=float, default=2.0, help="SIMP exponent p")
     p.add_argument(
-        "--void-ratio", type=float, default=0.0, help="void/solid stiffness ratio"
+        "--void-ratio",
+        type=float,
+        default=1e-3,
+        help="void/solid stiffness ratio (default: 1e-3). Must be positive: "
+        "with 0 the stiffness of void pixels vanishes and the system is "
+        "only positive semidefinite",
     )
     p.add_argument("--target-K", type=float, default=0.1, help="target bulk modulus")
     p.add_argument("--target-G", type=float, default=0.05, help="target shear modulus")
@@ -165,7 +170,8 @@ def main():
         default="filtered_random",
         metavar="KIND_OR_FILE",
         help="initial density field: 'uniform' (constant), 'random' "
-        "(white noise), 'filtered_random' (noise smoothed to a correlation "
+        "(noise lightly smoothed by two box-filter sweeps), "
+        "'filtered_random' (noise smoothed to a correlation "
         "length; least prone to locking the initial topology), or the NetCDF "
         "output of a previous run to restart from its last frame (Fourier-"
         "resampled if the stored grid does not match -n)",
@@ -257,8 +263,8 @@ def main():
         "--bfgs-xtol",
         type=float,
         default=0.0,
-        help="L-BFGS convergence tolerance on the step size (relative change "
-        "in the density iterate); 0 disables the criterion",
+        help="L-BFGS convergence tolerance on the step size (maximum absolute "
+        "change of the density between iterates); 0 disables the criterion",
     )
     p.add_argument(
         "--cg-tol",
