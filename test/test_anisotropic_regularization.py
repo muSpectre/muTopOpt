@@ -5,13 +5,14 @@
 #
 """The element-wise phase-field regularization on anisotropic voxels.
 
-``PhaseFieldRegularization`` used to build its Laplacian with
-``grid_spacing[0]`` on every axis (muGrid's ``LaplaceOperator`` had a single
-scale), so on a grid with unequal spacing the gradient penalty was mis-scaled
-along the other axes. With a muGrid that takes the spacing per axis, the
-penalty must be the finite-difference ``eta * sum_d |d rho / d x_d|^2`` of
-the actual grid, and value, gradient and Hessian-vector product must agree
-with each other.
+On a grid with unequal spacing ``h_d`` per axis, the gradient penalty of
+``PhaseFieldRegularization`` must be the finite-difference
+``eta * sum_d |d rho / d x_d|^2`` of the actual grid, with each axis scaled by
+its own ``h_d``; a Laplacian built with ``grid_spacing[0]`` on every axis
+mis-scales the penalty along the other axes. Value, gradient and
+Hessian-vector product must also agree with each other. The tests need a
+muGrid whose ``LaplaceOperator`` takes the spacing per axis and are skipped
+otherwise.
 """
 
 import numpy as np
@@ -51,6 +52,12 @@ def _gradient_penalty_reference(rho, grid_spacing):
     ((12, 6), (1.0, 2.0)), ((8, 6, 5), (1.0, 3.0, 0.5))])
 def test_gradient_penalty_uses_every_axis_spacing(comm, nb_grid_pts,
                                                    domain_lengths):
+    """The regularization value equals the per-axis reference
+
+        f = scale * [eta * vol_pixel * sum_i sum_d ((rho[i + e_d] - rho[i]) / h_d)^2
+                     + (1/eta) * vol_pixel * sum_i rho_i^2 (1 - rho_i)^2],
+
+    and differs from what an isotropic stencil with h_0 on every axis gives."""
     if comm.size > 1:
         pytest.skip("serial reference")
     hom = _homogenization(comm, nb_grid_pts, domain_lengths)
@@ -76,7 +83,13 @@ def test_gradient_penalty_uses_every_axis_spacing(comm, nb_grid_pts,
 def test_gradient_and_hessian_are_consistent(comm, nb_grid_pts,
                                              domain_lengths):
     """Central finite differences of the value give the gradient, and of
-    the gradient the Hessian-vector product, on an anisotropic grid."""
+    the gradient the Hessian-vector product, on an anisotropic grid:
+
+        (f(rho + eps v) - f(rho - eps v)) / (2 eps) = <g(rho), v>
+        <(g(rho + eps v) - g(rho - eps v)) / (2 eps), w> = <H(rho) v, w>
+
+    The functional is a quartic polynomial in rho, so the O(eps^2) truncation
+    error of the central difference is negligible at eps = 1e-6."""
     hom = _homogenization(comm, nb_grid_pts, domain_lengths)
     reg = PhaseFieldRegularization(hom, eta=0.4, weight=2.0)
     rng = np.random.default_rng(2)

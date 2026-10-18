@@ -3,6 +3,12 @@ Finite-difference gradient check for the conductivity (flux-matching) problem
 -- the decisive correctness gate for the whole adjoint sensitivity assembly
 (forward solve + homogenized flux + adjoint solve + compute_sensitivity +
 SIMP chain rule + phase-field regularization). Mirrors test_gradient.py.
+
+For sampled pixels i the analytic gradient must match the central difference
+
+    df/drho_i ~ (f(rho + d e_i) - f(rho - d e_i)) / (2 d),  d = 1e-6,
+
+at tight inner CG tolerance (cg_tol = 1e-12).
 """
 
 import numpy as np
@@ -32,6 +38,7 @@ def _make_problem(dim, n, with_reg, comm):
     return FluxTargetProblem(homog, cases, regularization=reg)
 
 
+# TODO: rationale for tolerance rtol=2e-4, atol=1e-7?
 def _check_gradient(problem, rho, sample, d=1e-6, rtol=2e-4, atol=1e-7):
     _, g = problem.objective_and_gradient(rho)
     for idx in sample:

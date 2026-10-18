@@ -14,10 +14,23 @@ void phase, so only the upper bounds constrain feasibility: inverting them in
 ``phi`` gives the *minimum* solid fraction any microstructure needs to reach a
 target modulus.
 
-Conventions match the rest of muTopOpt: ``G`` is the Lamé shear modulus ``mu``
-and ``K = lambda + 2 mu / dim`` -- the ordinary bulk modulus in 3D, the
-plane-strain area modulus in 2D. The 2D bounds are the transverse (plane-
-strain) Hashin bounds in exactly this parameterization.
+Conventions match the rest of muTopOpt: ``G`` is the Lamé shear modulus ``μ``
+and ``K = λ + 2μ/d`` -- the ordinary bulk modulus in 3D, the plane-strain
+area modulus in 2D. The 2D bounds are the transverse (plane-strain) Hashin
+bounds in exactly this parameterization.
+
+For a solid of moduli ``(K₀, G₀)`` at volume fraction ``φ`` and a void of
+zero stiffness, the Voigt bound is ``(φK₀, φG₀)`` and the Hashin-Shtrikman
+upper bound is
+
+    K_HS = K₀ + (1 − φ) / (−1/K₀ + φ/(K₀ + G₀)),             (d = 2)
+    K_HS = K₀ + (1 − φ) / (−1/K₀ + 3φ/(3K₀ + 4G₀)),          (d = 3)
+    G_HS = G₀ + (1 − φ) / (−1/G₀ + φ/(G₀ + ζ)),
+
+with ``ζ = K₀G₀/(K₀ + 2G₀)`` in 2D and
+``ζ = G₀(9K₀ + 8G₀)/(6(K₀ + 2G₀))`` in 3D. Both bounds increase
+monotonically in ``φ``, so the minimum solid fraction for a target modulus
+is found by bisection.
 
 These bound each modulus *separately*; cross-property bounds coupling K and G
 are sharper still, so a target that passes this check can still be hard (or
@@ -30,9 +43,9 @@ from .material import lame_from_E_nu
 
 
 def solid_moduli(dim, E, nu):
-    """(K, G) of an isotropic material given Young's modulus and Poisson's
-    ratio, in muTopOpt's convention ``K = lambda + 2 mu / dim`` (3D bulk
-    modulus / 2D plane-strain area modulus)."""
+    """``(K, G)`` of an isotropic material given Young's modulus and Poisson's
+    ratio, in muTopOpt's convention ``K = λ + 2μ/dim`` (3D bulk modulus / 2D
+    plane-strain area modulus) and ``G = μ``."""
     lam, mu = lame_from_E_nu(E, nu)
     return lam + 2.0 * mu / dim, mu
 
@@ -58,8 +71,9 @@ def hashin_shtrikman_upper(dim, phi, K0, G0):
 
 
 def _minimum_phi(bound, target):
-    """Smallest ``phi`` in [0, 1] with ``bound(phi) >= target`` (bisection on
-    the monotonically increasing ``bound``); ``inf`` if even the solid
+    """Smallest ``phi`` in [0, 1] with ``bound(phi) >= target`` (80 bisection
+    steps on the monotonically increasing ``bound``, i.e. to double-precision
+    resolution); 0 for a non-positive target, ``inf`` if even the solid
     (``phi = 1``) falls short."""
     if target <= 0.0:
         return 0.0
@@ -77,17 +91,33 @@ def _minimum_phi(bound, target):
 
 def target_feasibility(dim, target_K, target_G, solid_E, solid_nu,
                        phi_low=0.2, phi_high=0.8):
-    """Envelope feasibility check of a target (K, G) against the solid.
+    """Envelope feasibility check of a target ``(K, G)`` against the solid.
 
-    Returns a dict with the solid moduli (``K0``, ``G0``), the minimum solid
-    fraction each target modulus requires under the Hashin-Shtrikman upper
-    bound (``phi_hs_K``, ``phi_hs_G``, ``inf`` if unreachable) and under the
-    looser Voigt bound (``phi_voigt``, the binding maximum of K and G), their
-    overall maximum ``phi_min``, and a list of human-readable ``warnings``:
-    when a target modulus exceeds the solid's, when reaching the target needs
-    a solid fraction above ``phi_high`` (near-solid designs), or when
-    bound-efficient designs would sit below ``phi_low`` (sparse structures
-    that may fail to percolate).
+    Parameters
+    ----------
+    dim : int
+        Spatial dimension (2 or 3).
+    target_K, target_G : float
+        Target moduli, in the convention of :func:`solid_moduli`.
+    solid_E, solid_nu : float
+        Young's modulus and Poisson's ratio of the solid phase.
+    phi_low, phi_high : float, optional
+        Solid fractions below / above which a warning is issued (defaults
+        0.2 and 0.8).
+
+    Returns
+    -------
+    dict
+        The solid moduli (``K0``, ``G0``); the minimum solid fraction each
+        target modulus requires under the Hashin-Shtrikman upper bound
+        (``phi_hs_K``, ``phi_hs_G``, ``inf`` if unreachable) and under the
+        looser Voigt bound (``phi_voigt``, the larger of the K and G
+        requirements); ``phi_min = max(phi_hs_K, phi_hs_G)``; and a list of
+        human-readable ``warnings``: when a target modulus exceeds the
+        solid's, when reaching the target needs a solid fraction above
+        ``phi_high`` (near-solid designs), or when bound-efficient designs
+        would sit below ``phi_low`` (sparse structures that may fail to
+        percolate).
     """
     K0, G0 = solid_moduli(dim, solid_E, solid_nu)
     phi_hs_K = _minimum_phi(

@@ -4,24 +4,60 @@
 # MIT License (see LICENSE)
 #
 """
-Stress-matching topology optimization problem (element-wise density).
+Stress-matching topology optimization problem.
 
-Minimize, over the per-pixel density ``rho in [0, 1]``,
+Objective. For load cases Γ with prescribed macro strain ``Ē^Γ``, target
+stress ``σ*^Γ`` and weight ``a_Γ``, minimize over the density ``ρ ∈ [0, 1]``
 
-    f(rho) = Σ_Γ a_Γ ‖⟨σ^Γ⟩ - σ_target^Γ‖² / ‖σ_target^Γ‖²   +   f_reg(rho)
+    f(ρ) = Σ_Γ a_Γ ‖σ̄^Γ(ρ) − σ*^Γ‖² / ‖σ*^Γ‖²  +  f_reg(ρ),
 
-subject to mechanical equilibrium for each load case Γ (a prescribed macro
-strain ``Ē^Γ``), solved by the FFT-accelerated FE solver. The gradient is
-obtained by the discrete adjoint method: because the system matrix is symmetric,
-the adjoint problem uses the same operator and preconditioner as the forward
-solve, and its right-hand side is ``-(1/V) Bᵀ C : S^Γ`` with
-``S^Γ = ∂f/∂⟨σ^Γ⟩``. The per-pixel material-derivative sensitivity is assembled
-by the fused ``compute_sensitivity`` kernel (which returns the geometry
-contractions ``g_shear = ε(u):ε(costate)``, ``g_vol = tr·tr``) followed by the
-SIMP chain rule ``d(2μ)/drho · g_shear + dλ/drho · g_vol``.
+with Frobenius norms, the homogenized stress
+``σ̄^Γ = (1/V) ∫ C(ρ):(Ē^Γ + ∇ˢu^Γ) dV`` and the fluctuation ``u^Γ`` solving
+the cell problem ``K(ρ) u^Γ = b^Γ = −Bᵀ C(ρ):Ē^Γ`` (see
+:mod:`muTopOpt.homogenization`). ``f_reg`` is the phase-field term of
+:mod:`muTopOpt.regularization`. In 2D, 3 independent load cases constrain
+the effective stiffness, in 3D 6 (:mod:`muTopOpt.loadcases`).
 
-This holds in 2D and 3D unchanged; a 2D problem takes 3 independent load cases
-to constrain the effective stiffness, a 3D problem 6.
+Adjoint gradient. With ``S^Γ = ∂f/∂σ̄^Γ = 2 a_Γ (σ̄^Γ − σ*^Γ)/‖σ*^Γ‖²`` the
+Lagrangian
+
+    L(ρ, u, v) = f + Σ_Γ v^Γᵀ (K u^Γ − b^Γ)
+
+is stationary in ``u^Γ`` when the adjoint (costate) ``v^Γ`` solves
+
+    K v^Γ = −∂f/∂u^Γ = −(1/V) Bᵀ C:S^Γ.
+
+``K`` is symmetric, so the adjoint problem uses the same operator and the
+same preconditioner as the forward problem. The total derivative is then
+
+    df/dρ_e = ∫_e (Ē^Γ + ∇ˢu^Γ) : ∂C/∂ρ_e : (S^Γ/V + ∇ˢv^Γ) dV + ∂f_reg/∂ρ_e,
+
+summed over Γ: the macro part ``S^Γ/V`` of the costate strain carries the
+explicit dependence of ``σ̄^Γ`` on ``ρ``. Since ``∂C/∂ρ_e = 2 μ'(ρ_e) G +
+λ'(ρ_e) V`` (the SIMP derivatives of :mod:`muTopOpt.material`), the fused
+``compute_sensitivity`` kernel only returns the two geometric contractions
+``g_shear = ∫_e ε(u):ε(v)`` and ``g_vol = ∫_e tr ε(u) tr ε(v)`` of the total
+strains, and ``df/dρ_e = Σ_Γ [2 μ' g_shear + λ' g_vol]``.
+
+Adjoint-corrected objective. The CG solves are truncated at a relative
+tolerance, leaving residuals ``r^Γ = b^Γ − K u^Γ``. The reported objective is
+``L = f − Σ_Γ v^Γᵀ r^Γ`` rather than ``f``: because the adjoint equation
+makes ``∂f/∂u δu + vᵀ K δu`` vanish, the first-order effect of the forward
+solve error cancels, so ``L`` differs from the exact objective by a term of
+the order of the product of the forward and adjoint solve errors,
+``O(rtol²)``, whereas ``f`` differs by ``O(rtol)``. ``L`` is also exactly
+the function whose ``ρ``-derivative the adjoint gradient is, which keeps line
+searches consistent with loose inner tolerances.
+
+Hessian-vector products. :meth:`StressTargetProblem.hessian_vector_product`
+differentiates the gradient once more along a direction ``δρ`` (second-order
+adjoint): per load case one forward-sensitivity solve for ``δu`` and one
+second-adjoint solve for ``δv``, again with ``K`` and its preconditioner.
+
+Nodal design. With ``design="nodal"`` the design variable is a nodal density;
+the element densities are its exact element averages
+(:class:`muTopOpt.nodal.NodalElementMap`) and the element gradient is pulled
+back with the transpose of that map.
 """
 
 from dataclasses import dataclass
@@ -44,40 +80,65 @@ class StressTargetProblem:
     def __init__(self, homogenization, load_cases, regularization=None,
                  design="element", consistent_objective=True, hessian=False,
                  hv_warm_start=False):
-        """``design='element'`` optimizes a per-pixel density (the material of
-        each element is ``SIMP(rho_e)`` directly). ``design='nodal'`` optimizes
-        a *nodal* FE density: each element's material is ``SIMP(rho_e)`` with
-        ``rho_e`` the exact element average of the nodal interpolant (see
-        :class:`muTopOpt.nodal.NodalElementMap`), so every nodal degree of
-        freedom couples its ``2^dim`` adjacent elements -- an implicit
-        sensitivity filter. Pair the nodal design with
-        :class:`~muTopOpt.regularization.NodalPhaseFieldRegularization`.
+        """Stress-matching objective over a set of load cases (see the module
+        docstring for the mathematics).
 
-        ``consistent_objective=True`` (default) reports the *Lagrangian*
-        ``L = f + Σ_Γ λ_Γᵀ (K u_Γ - b_Γ)`` instead of the raw objective: the
-        adjoint-weighted residual of each (possibly truncated) forward solve
-        cancels the first-order effect of the solve error, making the reported
-        value second-order accurate in the CG tolerance and *consistent* with
-        the adjoint gradient (which is exactly ``∂L/∂ρ``). At converged solves
-        the correction vanishes; with it, loose inner tolerances (e.g.
-        ``cg_tol ~ 1e-3``) suffice for clean L-BFGS line searches.
+        Parameters
+        ----------
+        homogenization : Homogenization
+            Solver of the cell problem; its material and preconditioner are
+            updated on every evaluation.
+        load_cases : sequence of LoadCase
+            Macro strains, target stresses and weights (any object with
+            ``macro_strain``, ``target_stress`` and ``weight`` attributes).
+        regularization : object, optional
+            A :class:`~muTopOpt.regularization.PhaseFieldRegularization` or
+            :class:`~muTopOpt.regularization.NodalPhaseFieldRegularization`
+            (default None: no regularization). Added to the objective,
+            gradient and Hessian-vector product; it acts on the design
+            variable itself (nodal for the nodal design).
+        design : {"element", "nodal"}, optional
+            ``"element"`` (default) optimizes a per-pixel density; the
+            material of element ``e`` is ``C(ρ_e)``. ``"nodal"`` optimizes a
+            *nodal* FE density whose exact element averages ``ρ_e`` (see
+            :class:`muTopOpt.nodal.NodalElementMap`) set the material, so
+            every nodal degree of freedom couples its ``2^d`` adjacent
+            elements -- an implicit sensitivity filter. Pair it with
+            :class:`~muTopOpt.regularization.NodalPhaseFieldRegularization`.
+        consistent_objective : bool, optional
+            If True (default), report the adjoint-corrected Lagrangian
+            ``L = f − Σ_Γ v^Γᵀ r^Γ`` instead of ``f``. ``L`` is second-order
+            accurate in the CG tolerance and is exactly the function whose
+            derivative the adjoint gradient is, so loose inner tolerances
+            (e.g. ``cg_tol ~ 1e-3``) still give consistent L-BFGS line
+            searches. The correction vanishes for converged solves. The
+            remaining ``O(rtol²)`` error means values computed at
+            *different* inner tolerances are not directly comparable: when an
+            adaptive controller tightens the tolerance between outer
+            iterates, the reported objective can increase by up to the old
+            tolerance's evaluation error (bounded by
+            ``sum(|last['corrections']|)``) although the true objective
+            decreased. Compare values at equal ``cg_rtol`` only (both are
+            recorded in :attr:`last`).
+        hessian : bool, optional
+            If True, enable exact (second-order adjoint) Hessian-vector
+            products (:meth:`hessian_vector_product`, used by the
+            trust-region Newton-CG optimizer). This keeps the forward and
+            adjoint solutions of every load case resident (two vector fields
+            per case) plus shared scratch, so it is opt-in (default False).
+        hv_warm_start : bool, optional
+            Only with ``hessian=True``. If True, keep the two Hessian-vector
+            solution fields per load case (another two vector fields per
+            case) so that each product warm-starts its solves from the same
+            case's previous product. Default False: the two fields are
+            shared by all cases and every solve starts from zero (see the
+            comment in the constructor for the measured trade-off).
 
-        Caveat: the remaining ``O(rtol²)`` evaluation error means reported
-        values computed at *different* inner tolerances are not directly
-        comparable -- when an adaptive controller tightens the tolerance
-        between outer iterates, the reported objective can appear to
-        increase by up to the old tolerance's evaluation error (bounded by
-        ``sum(|last['corrections']|)``) even though the true objective
-        decreased. Compare values across iterates at equal ``cg_rtol`` only
-        (both are recorded in :attr:`last`).
-
-        ``hessian=True`` enables exact (second-order-adjoint) Hessian-vector
-        products (:meth:`hessian_vector_product`, for the trust-region
-        Newton-CG optimizer). It allocates *four* vector fields per load case
-        -- the forward/adjoint solutions that must survive the load-case loop,
-        plus the sensitivity/co-state fields kept per case so the Hv solves can
-        warm-start from the previous product -- and a handful of shared scratch
-        fields, so it is opt-in."""
+        Raises
+        ------
+        ValueError
+            If ``design`` is neither ``"element"`` nor ``"nodal"``.
+        """
         self.h = homogenization
         self.dim = homogenization.dim
         self.load_cases = [self._as_case(lc) for lc in load_cases]
@@ -121,7 +182,7 @@ class StressTargetProblem:
 
         if self.hessian:
             # Per-case solution/adjoint fields (the Hessian-vector product
-            # needs u_G and lambda_G of *every* case, so they cannot share the
+            # needs u^Γ and v^Γ of *every* case, so they cannot share the
             # single scratch fields above) plus Hv scratch.
             n = len(self.load_cases)
             self._u_cases = [
@@ -133,22 +194,21 @@ class StressTargetProblem:
             self._dmu_v = self.h.scalar_field("to_prob_hv_dmu")
             self._hv_rhs = self.h.vector_field("to_prob_hv_rhs")
             self._hv_tmp = self.h.vector_field("to_prob_hv_tmp")
-            # Per-case sensitivity/co-state fields. Kept per case (not
-            # shared) so each Hessian-vector product warm-starts its two
-            # solves from the same load case's previous solution -- successive
-            # Hv products (trust-region CG iterations) have a slowly-varying
-            # rhs, so the warm start cuts the CG count. Zero-initialized, so
-            # the first Hv cold-starts.
+            # Sensitivity/co-state fields (du, dv) of the Hessian-vector
+            # product. Kept per case with hv_warm_start=True, so each product
+            # warm-starts its two solves from the same load case's previous
+            # solution: successive Hv products (trust-region CG iterations)
+            # have a slowly varying rhs. Zero-initialized, so the first Hv
+            # cold-starts.
             #
-            # These are 2*n_cases vector fields and, at scale, the single
-            # largest block of device memory the optimizer holds (2x6 fields =
-            # 135 MB at 96^3 in single precision, ~28% of the resident set).
-            # Measured, the warm start is not worth that: cold-starting
-            # every Hv solve costs 2-4% more inner CG iterations and no
-            # measurable wall time (32^3: 5779 -> 5989 iterations, 11.14 s ->
-            # 11.15 s; 48^3: 33.6 s -> 34.0 s). It is therefore off by
-            # default, and `hv_warm_start=True` restores the per-case fields
-            # for anyone whose problem benefits more than these did.
+            # Per case they are 2*n_cases vector fields, at scale the largest
+            # block of device memory the optimizer holds (2x6 fields of
+            # 3x98^3 floats incl. ghosts = 135 MB at 96^3 in single
+            # precision, ~28% of the resident set). Shared fields with cold
+            # starts cost 2-4% more inner CG iterations (3D runs, 32^3: 5779
+            # -> 5989 iterations; wall time 11.14 s -> 11.15 s at 32^3 and
+            # 33.6 s -> 34.0 s at 48^3). Hence shared fields by default.
+            # TODO: record the hardware and command of these timings.
             self.hv_warm_start = bool(hv_warm_start)
             if self.hv_warm_start:
                 self._du_cases = [
@@ -176,9 +236,18 @@ class StressTargetProblem:
         return LoadCase(E, S, float(lc.weight))
 
     def objective_and_gradient(self, rho):
-        """Return (f, df/drho) for a density array of shape
+        """Return ``(f, df/dρ)`` for a density array of shape
         :attr:`Homogenization.nb_pixels` (element-wise or nodal, per the
-        ``design`` chosen at construction)."""
+        ``design`` chosen at construction).
+
+        ``f`` is the MPI-reduced objective (the adjoint-corrected Lagrangian
+        if ``consistent_objective``) including the regularization; the
+        gradient is the rank-local slice. Diagnostics of the evaluation are
+        stored in :attr:`last`: ``objective``, ``stresses`` (``σ̄^Γ``),
+        ``cg_iters`` (forward and adjoint per case), ``corrections`` (the
+        Lagrangian corrections ``−v^Γᵀ r^Γ``) and ``cg_rtol`` (``None`` for
+        the fixed ``Homogenization.cg_tol``).
+        """
         with timer("objective_and_gradient"):
             return self._objective_and_gradient(rho)
 
@@ -246,9 +315,9 @@ class StressTargetProblem:
                 # error and exactly the function whose ρ-derivative the
                 # gradient below is.
                 # vecdot reduces the interior in double and needs no
-                # temporary; `xp.sum(adj.p * res.p)` built a full-size float32
-                # product array and summed it in float32, which at 512^3 costs
-                # both accuracy and ~dim*N*4 bytes. This value is the reported
+                # temporary, whereas `xp.sum(adj.p * res.p)` would build a
+                # full-size product array (~dim*N*4 bytes in float32) and sum
+                # it in the field precision. This value is the reported
                 # objective *and* feeds the trust region's accuracy control,
                 # so its error budget is the tightest in the package.
                 corr = -h.comm.sum(float(linalg.vecdot(adj, self._res_u)))
@@ -327,7 +396,8 @@ class StressTargetProblem:
 
     def ensure_state(self, rho):
         """Make the cached linearization point match ``rho``, re-evaluating
-        the objective/gradient if it does not.
+        the objective/gradient if it does not. Raises ``RuntimeError`` if
+        the problem was constructed with ``hessian=False``.
 
         The Hessian-vector product differentiates around the *last evaluated*
         iterate (cached per-case solutions, material state, preconditioner).
@@ -349,33 +419,46 @@ class StressTargetProblem:
             self.objective_and_gradient(rho)
 
     def hessian_vector_product(self, v, rtol=None):
-        """Return the exact reduced-Hessian action ``H v`` on a design-space
-        direction ``v`` by the second-order adjoint method, around the last
-        evaluated iterate (see :meth:`ensure_state`).
+        """Return the reduced-Hessian action ``H δρ`` on a design-space
+        direction ``δρ`` (the argument ``v``) by the second-order adjoint
+        method, around the last evaluated iterate (see :meth:`ensure_state`).
 
-        Per load case this costs two CG solves with the *same* operator and
-        preconditioner as the forward problem:
+        Let ``δC = ∂C/∂ρ · δρ`` (the perturbed Lamé fields ``λ'δρ, μ'δρ``) and
+        ``δK`` the stiffness assembled from them. Per load case this costs
+        two CG solves with the *same* operator and preconditioner as the
+        forward problem:
 
-        * forward sensitivity  ``K du = -(dK v) u - Bᵀ (dC v):Ē``;
-        * second adjoint       ``K dl = -(dK v) l - (1/V) Bᵀ [(dC v):S + C:dS]``
-          with ``dS = (2w/n) d<sigma>``, where
-          ``d<sigma> = (1/V)∫[(dC v):(Ē+∇u) + C:∇du]``.
+        * forward sensitivity  ``K δu = −δK u − Bᵀ δC:Ē``;
+        * second adjoint       ``K δv = −δK v − (1/V) Bᵀ [δC:S + C:δS]``,
 
-        The operator is linear in the Lamé fields, so ``(dK v) u`` is simply
-        the fused stiffness ``apply`` with the perturbed fields
-        ``dλ/dρ·v, dμ/dρ·v`` -- no new kernels are needed. The chain rule of
-        the gradient assembly then gives
+        with ``δS = 2a (δσ̄)/‖σ*‖²`` and
+        ``δσ̄ = (1/V) ∫ [δC:(Ē + ∇ˢu) + C:∇ˢδu] dV``. ``K`` is linear in the
+        Lamé fields, so ``δK u`` is the fused stiffness ``apply`` with the
+        perturbed fields -- no further kernels are needed. Differentiating
+        the gradient ``∫_e (Ē + ∇ˢu):∂C/∂ρ_e:(S/V + ∇ˢv)`` gives, per
+        element,
 
-            H v = [2 d²μ·v g_shear + d²λ·v g_vol]                (pointwise)
-                + kernel(du, 0;  l, S/V) + kernel(u, Ē;  dl, dS/V)
-                + H_reg v,
+            (H δρ)_e = [2 μ'' g_shear + λ'' g_vol]_e δρ_e
+                     + ∫_e ∇ˢδu : ∂C/∂ρ_e : (S/V + ∇ˢv)
+                     + ∫_e (Ē + ∇ˢu) : ∂C/∂ρ_e : (δS/V + ∇ˢδv),
 
-        contracted with (2 dμ, dλ) as in the gradient. The model Hessian is
-        exact up to the CG tolerance of the two solves; a trust-region method
-        only requires it to be bounded, so ``rtol`` may be loose.
+        summed over load cases, plus the regularization term ``H_reg δρ``;
+        for the nodal design ``δρ`` is mapped to elements and the result back
+        to nodes with :class:`~muTopOpt.nodal.NodalElementMap`. The product
+        is exact up to the CG tolerance ``rtol`` of the two solves (``None``
+        uses ``Homogenization.cg_tol``); a trust-region method only
+        requires it to be bounded, so ``rtol`` may be loose. The solves use
+        the unit direction ``δρ/‖δρ‖`` and the result is rescaled, so the
+        relative tolerance means the same accuracy for every direction.
 
-        Note ``W''`` of the double-well makes ``H`` genuinely indefinite --
-        intended for optimizers that exploit negative curvature (Steihaug).
+        ``W''(1/2) < 0`` of the double well makes ``H`` indefinite; the
+        product is intended for optimizers that exploit negative curvature
+        (Steihaug-CG).
+
+        Raises
+        ------
+        RuntimeError
+            If no linearization point has been evaluated yet.
         """
         with timer("hessian_vector_product"):
             return self._hessian_vector_product(v, rtol=rtol)
@@ -441,9 +524,11 @@ class StressTargetProblem:
             norm = float(np.sum(lc.target_stress**2))
             S = cache["S"][i]
 
-            # Forward sensitivity: K du = -(dK v) u - Bᵀ (dC v):Ē. Warm-started
-            # from this case's previous product (rhs is O(1) in the unit
-            # direction, so the guess is well-scaled).
+            # Forward sensitivity: K du = -(dK v) u - Bᵀ (dC v):Ē. With
+            # hv_warm_start, warm-started from this case's previous product
+            # (the rhs is O(1) in the unit direction, so the guess is
+            # well-scaled); otherwise du was zeroed above and solve_rhs's
+            # warm start reduces to a cold start.
             with timer("hv forward solve"):
                 h.engine.communicate_ghosts(u)
                 h.op.apply(u, self._dlam_v, self._dmu_v, self._hv_rhs)
@@ -481,7 +566,7 @@ class StressTargetProblem:
                             label=f"case {i + 1} hv-adj")
             cg_iters.append(h.last_cg_iters)
 
-            # Chain rule of grad = dC (Ē+∇u):(S/V+∇l), term by term:
+            # Chain rule of grad = dC (Ē+∇u):(S/V+∇v), term by term:
             with timer("hv sensitivity"):
                 # (a) second material derivative, with the cached kernels;
                 hv_e += ((2.0 * d2mu * cache["g_shear"][i]
@@ -493,7 +578,7 @@ class StressTargetProblem:
                     self._g_shear, self._g_vol)
                 hv_e += (2.0 * dmu * h.to_host(self._g_shear.p)
                          + dlam * h.to_host(self._g_vol.p))
-                # (c) costate variation: dC (Ē+∇u):(dS/V + ∇dl).
+                # (c) costate variation: dC (Ē+∇u):(dS/V + ∇dv).
                 h.engine.communicate_ghosts(dadj)
                 h.op.compute_sensitivity(
                     u, list(E.ravel()), dadj, list((dS / V).ravel()),

@@ -5,25 +5,54 @@
 # MIT License (see LICENSE)
 #
 """
-Command-line driver for muTopOpt: optimize a density unit cell for a target
-isotropic effective stiffness, in 2D or 3D. The target is given either as bulk
-and shear moduli (``--target-K``/``--target-G``) or as Young's modulus and
-Poisson's ratio (``--target-E``/``--target-nu``).
+Command-line driver for muTopOpt elasticity: optimize the density of a
+periodic unit cell, in 2D or 3D, so that its homogenized stiffness matches a
+target isotropic stiffness. The target is given either as bulk and shear
+moduli (``--target-K``/``--target-G``) or as Young's modulus and Poisson's
+ratio (``--target-E``/``--target-nu``).
 
-By default the density is a *nodal* finite-element field with the fully
-consistent Galerkin phase-field regularization, started from a filtered random
-field -- the combination least prone to locking in the initial topology.
+Mathematical setup
+------------------
+The design is a density rho in [0, 1] -- a nodal finite-element field by
+default (``--density nodal``), or one value per pixel (``--density
+element``) -- mapped to per-pixel Lame parameters by SIMP with exponent p
+(``--penalty``). Each of the d(d+1)/2 load cases G applies a macro strain E_G
+of magnitude 0.01 along one direction of the symmetric strain space; the
+periodic displacement fluctuation solves the FE equilibrium
+
+    K(rho) u_G = -B^T C(rho) : E_G
+
+by FFT-preconditioned CG, and the homogenized stress <sigma_G> is compared
+with the target stress C* : E_G:
+
+    f(rho) = sum_G |<sigma_G> - C*:E_G|^2 / |C*:E_G|^2 + f_reg(rho),
+
+where f_reg is the Modica-Mortola phase-field regularization with interface
+width ``--eta`` (default one grid spacing) and weight ``--reg-weight``. The
+gradient comes from the discrete adjoint (one extra solve per load case).
+The outer optimizer (``--optimizer``) is either NuMPI's bound-constrained
+trust-region Newton-CG with exact Hessian-vector products (chosen by
+``auto`` when the installed NuMPI provides it) or NuMPI's projected L-BFGS;
+both run MPI-distributed on the same domain decomposition as the fields. The
+inner CG tolerance adapts from ``--cg-tol-start`` down to ``--cg-tol-min``
+(see muTopOpt.optimize). The run starts from a filtered random field
+(``--init``) or from the last frame of a previous output file, which is
+Fourier-resampled if its grid differs from ``-n``.
+
+The solves and the sensitivity run on the host or, with a GPU build of
+muGrid and ``--device gpu``, on the device; the outer optimizer always runs
+on the host. With ``--output`` the density (and per-frame homogenized
+stresses and effective moduli) is written to a NetCDF file through muGrid,
+readable with muGrid's FileIONetCDF and usable as ``--init`` for a restart.
 
 Examples
 --------
     python simulate.py -n 64 64            --target-K 0.1 --target-G 0.05
     python simulate.py -n 64 64            --target-E 0.2 --target-nu -0.3
     python simulate.py -n 96 96 96 --bfgs-maxiter 300 --eta 0.02
-    mpirun -np 4 python simulate.py -n 128 128 128     # (serial optimizer; see notes)
-
-The solve/sensitivity are FFT-accelerated, J-FFT-preconditioned and (with a GPU
-build of muGrid + ``--device gpu``) run on device. The outer L-BFGS optimizer is
-currently serial.
+    python simulate.py -n 64 64 64 --device gpu --precision single
+    mpirun -np 4 python simulate.py -n 128 128 128 --output design.nc
+    python simulate.py -n 256 256 256 --init design.nc   # restart, resampled
 """
 
 import argparse
@@ -402,14 +431,16 @@ def main():
     # tolerances below ~1e-6 buy no true accuracy.
     #
     # The gradient tolerance is measured on the mesh-invariant volume-fraction
-    # derivative ĝ = (V/V_pixel) df/drho (see muTopOpt.optimize.
-    # _gradient_scale) -- the raw per-pixel gradient shrinks like 1/N with
-    # resolution, so an absolute per-pixel gtol falsely certified untouched
-    # initial designs as converged on fine grids. Typical initial designs
-    # start at ||ĝ||_inf ~ O(100); the defaults reproduce the pre-scaling
-    # 64^3 behavior (1e-4 per-pixel * 64^3 ~ 26) at every resolution. The
-    # single-precision default stays 10x coarser: the achievable ĝ accuracy
-    # at the float32 residual floor makes a tighter tolerance uncertifiable.
+    # derivative ĝ = (V/V_pixel) df/drho = N df/drho (see muTopOpt.optimize.
+    # _gradient_scale): the raw per-pixel gradient shrinks like 1/N with
+    # resolution, so an absolute per-pixel gtol would certify an unchanged
+    # initial design as converged on a fine enough grid. Typical initial
+    # designs start at ||ĝ||_inf ~ O(100). For scale: on a 64^3 grid
+    # (N ~ 2.6e5) ĝ = 25 corresponds to a per-pixel gradient of ~1e-4 and
+    # ĝ = 2.5 to ~1e-5. The single-precision default is 10x coarser because
+    # the achievable ĝ accuracy at the float32 residual floor makes a tighter
+    # tolerance uncertifiable.
+    # TODO: rationale for the double-precision default gtol of 2.5?
     single = args.precision == "single"
     rtol_floor = 1e-6 if single else 0.0
     bfgs_gtol = (args.bfgs_gtol if args.bfgs_gtol is not None
@@ -448,9 +479,9 @@ def main():
         # fixed --cg-tol (start == floor), i.e. a truly fixed tolerance.
         cg_tol_start = args.cg_tol
         cg_tol_min = args.cg_tol
-    # Apply the precision floor *last*, so no branch above can route around it
-    # -- which is exactly what the two assignments immediately above used to
-    # do, silently discarding the floor whenever adaptation was switched off.
+    # Apply the precision floor *last*, after every branch above has set
+    # cg_tol_min/cg_tol_start, so that no branch (including the one that
+    # disables adaptation) can bypass it.
     cg_tol_min = max(cg_tol_min, rtol_floor)
     if cg_tol_start is not None:
         cg_tol_start = max(cg_tol_start, cg_tol_min)
@@ -984,11 +1015,11 @@ def main():
         # Always include the final iterate as the last frame (unless it was
         # already the most recent one dumped, i.e. its iteration is a multiple
         # of --dump-every).
-        # Label the final frame with the accepted-iterate index, the same
-        # counter `write_frame` uses for the intermediate dumps -- labelling it
-        # with the raw step count instead made `frame_iterations` mix two
-        # counters, and made this duplicate-check miss (so the last iterate was
-        # written twice whenever it had already been dumped).
+        # The final frame is labelled with the accepted-iterate index, the
+        # same counter `write_frame` uses for the intermediate dumps: then
+        # `frame_iterations` holds a single counter, and the duplicate check
+        # below recognizes an iterate that was already dumped (the raw step
+        # count info["nit"] also counts rejected trust-region steps).
         final_it = nb_accepted
         if not frame_iters or frame_iters[-1] != final_it:
             write_frame(final_it, rho, final_stresses)

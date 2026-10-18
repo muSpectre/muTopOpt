@@ -8,11 +8,14 @@ from muTopOpt import SimpMaterial, E_nu_from_lame, lame_from_E_nu
 
 @pytest.mark.parametrize("E,nu", [(1.0, 0.3), (0.5, 0.1), (2.3, 0.45)])
 def test_E_nu_lame_roundtrip(E, nu):
+    """E_nu_from_lame(lame_from_E_nu(E, nu)) == (E, nu)."""
     np.testing.assert_allclose(
         E_nu_from_lame(*lame_from_E_nu(E, nu)), [E, nu], rtol=1e-12)
 
 
 def test_endpoints():
+    """(lambda, mu)(1) = solid Lame parameters, (lambda, mu)(0) =
+    void_ratio times them."""
     m = SimpMaterial(E_solid=2.0, nu=0.3, penalty=3.0, void_ratio=1e-3)
     lam1, mu1 = m.lame(np.array([1.0]))
     lam0, mu0 = m.lame(np.array([0.0]))
@@ -22,6 +25,8 @@ def test_endpoints():
 
 
 def test_derivative_matches_fd():
+    """d(lambda, mu)/drho ~ ((lambda, mu)(rho + d) - (lambda, mu)(rho - d))
+    / (2 d)."""
     m = SimpMaterial(E_solid=1.7, nu=0.25, penalty=3.0, void_ratio=1e-2)
     rho = np.linspace(0.1, 0.9, 9)
     dlam, dmu = m.dlame(rho)

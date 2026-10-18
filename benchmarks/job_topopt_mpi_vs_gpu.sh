@@ -21,12 +21,22 @@
 # ratios are a rough throughput comparison of the FFT-accelerated forward/adjoint
 # solve across the backends.
 #
-# Note: `filtered_random` init draws per-rank noise, so the CPU (multi-rank) and
-# GPU (single-rank) runs do not start from a bit-identical density and their inner
-# CG iteration counts can differ slightly — fine for a wall-clock comparison, not
-# a convergence-trajectory comparison. Set SIZE/ITERS/RANKS/PRECISION below to
+# What is measured: the wall-clock time of each complete simulate.py
+# invocation, in whole seconds (bash $SECONDS), i.e. including process and
+# MPI start-up, module import, setup, FFT planning and any rocFFT kernel
+# compilation, not only the optimization; no output file is written. The
+# job log records the muGrid build (printed by _env.sh and by simulate.py),
+# grid, iteration count, precision and the date. simulate.py's default
+# optimizer ('auto') is used, i.e. trust-region Newton-CG if the installed
+# NuMPI provides it, else L-BFGS.
+#
+# Note: `filtered_random` init is generated on the global grid and sliced per
+# rank, so all three runs start from the same density; their inner CG
+# iteration counts can still differ slightly because floating-point results
+# depend on the backend (FFT library) and rank count (reduction order) — fine for a wall-clock comparison, not a
+# convergence-trajectory comparison. Set SIZE/ITERS/RANKS/PRECISION below to
 # taste; PRECISION=single runs the whole FFT-accelerated solve in float32 (the
-# host L-BFGS optimizer stays double regardless).
+# host-side outer optimizer stays double regardless).
 
 set -euo pipefail
 MUGRID_BUILD="${MUGRID_BUILD:-build_mpi}"

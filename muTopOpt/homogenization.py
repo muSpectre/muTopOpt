@@ -6,17 +6,41 @@
 """
 FFT-accelerated FE micromechanical homogenization on a regular grid.
 
+Cell problem. A periodic unit cell of volume ``V`` is loaded by a macro
+strain ``Ē``; the total strain is ``ε = Ē + ∇ˢu`` with a periodic nodal
+fluctuation ``u``. With the discrete symmetric gradient ``B`` (nodal values
+-> quadrature-point strains), the quadrature weights ``W`` and the per-element
+isotropic stiffness ``C(ρ)`` of :mod:`muTopOpt.material`, equilibrium
+``Bᵀ W C (Ē + B u) = 0`` reads
+
+    K u = −Bᵀ C:Ē,        K = Bᵀ W C B,
+
+where on each element ``K_e = 2μ_e G + λ_e V`` with the constant geometric
+matrices ``G`` (deviatoric/shear) and ``V`` (volumetric). ``K`` is symmetric,
+and positive definite on fluctuations modulo rigid translations as long as
+``λ, μ > 0`` everywhere. The homogenized stress is the cell average
+
+    σ̄ = (1/V) ∫ C:(Ē + ∇ˢu) dV,
+
+and ``Ē ↦ σ̄`` is the effective stiffness ``C̄``.
+
 :class:`Homogenization` owns the muGrid machinery -- the FFT engine (which
 doubles as the ghosted domain decomposition), the fused
-``IsotropicStiffnessOperator`` (the system matrix ``K``), the per-pixel Lamé
-fields, and the J-FFT (Green-Jacobi) preconditioner -- and exposes the three
-operations the optimizer needs:
+``IsotropicStiffnessOperator`` (which applies ``K`` without assembling it),
+the per-pixel Lamé fields, and the preconditioner ``M ≈ K⁻¹`` -- and exposes
+the operations the optimizer needs:
 
-* :meth:`solve_macro`   -- solve ``K(rho) u = -Bᵀ C:Ē`` for a macro strain ``Ē``;
-* :meth:`solve_rhs`     -- solve ``K(rho) x = b`` for an arbitrary rhs (adjoint);
-* :meth:`homogenized_stress` -- the cell-averaged stress ``⟨σ⟩``.
+* :meth:`solve_macro`   -- solve ``K(ρ) u = −Bᵀ C:Ē`` for a macro strain ``Ē``;
+* :meth:`solve_rhs`     -- solve ``K(ρ) x = b`` for an arbitrary rhs (adjoint);
+* :meth:`homogenized_stress` -- the cell-averaged stress ``σ̄``.
 
-Everything is dimension-agnostic (``dim`` = 2 or 3): the only per-dimension
+The default preconditioner is J-FFT (Green-Jacobi): the inverse of the
+stiffness of a homogeneous reference medium -- the global means of ``λ`` and
+``μ`` at the first :meth:`set_density` -- applied by FFT, combined with the
+Jacobi diagonal of ``K``. The reference part is built once; the diagonal is
+refreshed from the current design on every :meth:`set_density`.
+
+Everything is dimension-agnostic (``d`` = 2 or 3): the only per-dimension
 detail is which ``IsotropicStiffnessOperator{2,3}D`` to instantiate. Fields live
 on the engine's real-space collection so the solver, the preconditioner FFTs and
 the operators all share one ghosted, MPI-decomposed, (optionally) device-resident
@@ -43,10 +67,10 @@ from .material import SimpMaterial
 from .precision import cg_rtol_floor
 from .timing import timer
 
-# muGrid's ``conjugate_gradients`` gained an optional ``residual`` out-field
-# (the final r = b - Kx, needed for the adjoint-corrected objective) after
-# 0.110. Detect it once so we work against released muGrid too, falling back
-# to one extra operator apply when the argument is unavailable.
+# muGrid's ``conjugate_gradients`` accepts an optional ``residual`` out-field
+# (the final r = b - Kx, needed for the adjoint-corrected objective) only in
+# versions after 0.110. Detect it once; without it, the residual costs one
+# extra operator apply.
 import inspect as _inspect
 
 _CG_HAS_RESIDUAL = "residual" in _inspect.signature(
@@ -172,10 +196,11 @@ def _resolve_device(device, comm=None):
 # MI300A says yes -- true for managed memory, false for plain hipMalloc
 # memory. With plain memory it would then hand device pointers to an MPI it
 # does not know to be GPU-aware (and stop with an error), and read fields in
-# place for NetCDF output. Until muGrid decides per allocation, muTopOpt sets
-# muGrid's switches for this case (_mugrid_settings_for_plain_memory): it
-# takes effect only if no earlier muGrid object in the process has already
-# exchanged ghosts or written NetCDF, since muGrid reads both once.
+# place for NetCDF output. Because muGrid makes this decision per device and
+# not per allocation, muTopOpt sets muGrid's switches for this case
+# (_mugrid_settings_for_plain_memory). They take effect only if no earlier
+# muGrid object in the process has already exchanged ghosts or written
+# NetCDF, since muGrid reads both once.
 # --------------------------------------------------------------------------- #
 
 
@@ -318,31 +343,85 @@ class Homogenization:
         managed_memory=None,
         timer=None,
     ):
-        """``dtype`` (``np.float64`` default, or ``np.float32``) is the
-        precision of all grid fields and hence of the forward/adjoint solves,
-        the preconditioner FFTs and the sensitivity kernels. The outer
-        optimizer and the host-side reductions stay in double precision.
+        """Set up the grid, the stiffness operator and the solver state.
 
-        ``managed_memory`` chooses between *managed* and plain device memory
-        for everything on the GPU. ``None`` (default) decides from the device
-        and the rank count: managed only on a unified-memory APU (AMD MI300A)
-        with a single rank, where it reaches the full 128 GB instead of the
-        ~62.8 GiB plain window at no compute cost; plain device memory on
-        discrete GPUs, where managed pages migrate, and with more than one
-        MPI rank, where MPI is slow on managed buffers. ``True``/``False``
-        (or ``MUTOPOPT_MANAGED=1``/``0``) override that. The choice and its
-        reason end up in ``device_memory`` and ``device_memory_reason``; the
-        notes above ``_device_has_unified_memory`` give the measurements.
-        Ignored on CPU.
+        The material fields are filled, and the preconditioner built, by the
+        first :meth:`set_density`.
 
-        ``timer`` (a ``muTimer.Timer``) is handed to the CG solver and the
-        preconditioner so a benchmark can read back where the *wall* time of a
-        solve goes. On a GPU the phases are host-side: the operator and
-        preconditioner regions measure only the cost of queueing their kernels,
-        and the wait for that work lands in the next region that reads a
-        reduction back to the host. That is the intended reading -- the gap
-        between these numbers and the GPU-busy time from a kernel trace is the
-        pipeline bubble."""
+        Parameters
+        ----------
+        nb_grid_pts : sequence of int
+            Global number of grid points ``N_α`` per axis (2 or 3 entries).
+        material : SimpMaterial
+            Maps the density to the Lamé parameters and their derivatives.
+        comm : muGrid.Communicator, optional
+            Communicator of the domain decomposition (default: serial).
+        domain_lengths : sequence of float, optional
+            Cell size per axis (default 1 per axis); the grid spacing is
+            ``h_α = L_α / N_α``.
+        element : {"q1", "p1"}, optional
+            Finite element of the stiffness operator (default ``"q1"``; any
+            other value selects P1).
+        preconditioner : str or None, optional
+            ``"green-jacobi"`` (default): J-FFT, reference-medium FFT inverse
+            combined with the Jacobi diagonal. ``"green"``: the
+            reference-medium FFT inverse alone. ``"hybrid"``: the reference
+            operator inverted by FFT along the rank-local axes and by a
+            tridiagonal solve along the distributed one, which needs no
+            all-to-all communication. ``"hybrid-jacobi"``: ``"hybrid"``
+            combined with the Jacobi diagonal. ``None``: unpreconditioned CG.
+            Any other value raises ``ValueError`` in the first
+            :meth:`set_density`.
+        cg_tol : float, optional
+            Default relative CG tolerance ``‖r‖ ≤ cg_tol ‖b‖``. ``None``
+            (default) gives ``max(1e-8, cg_rtol_floor(dtype))``, i.e. 1e-8 in
+            double and the float32 floor (1e-6) in single precision. An
+            explicit value below the floor is raised to it with a
+            ``RuntimeWarning``.
+
+            .. TODO: rationale for the default ``cg_tol = 1e-8``?
+        cg_maxiter : int, optional
+            Maximum number of CG iterations per solve (default 2000).
+        cg_verbose : bool, optional
+            Print the residual of every CG iteration on rank 0 (default
+            False).
+        device : str or muGrid.Device, optional
+            ``None``/``"cpu"`` (default), ``"gpu"``/``"cuda"``/``"rocm"``
+            (one GPU per rank, ``local_rank % n_gpus``), or an explicit
+            ``"<kind>:N"`` (see :func:`_resolve_device`).
+        dtype : {numpy.float64, numpy.float32}, optional
+            Precision of all grid fields and hence of the forward/adjoint
+            solves, the preconditioner FFTs and the sensitivity kernels
+            (default float64). The outer optimizer and the host-side
+            reductions stay in double precision.
+        managed_memory : bool, optional
+            Managed instead of plain device memory for everything on the GPU.
+            ``None`` (default) decides from the device and the rank count:
+            managed only on a unified-memory APU (AMD MI300A) with a single
+            rank, where it reaches the full 128 GB instead of the ~62.8 GiB
+            plain window at no compute cost; plain device memory on discrete
+            GPUs, where managed pages migrate, and with more than one MPI
+            rank, where MPI is slow on managed buffers. ``True``/``False``
+            (or ``MUTOPOPT_MANAGED=1``/``0``) override that. The choice and
+            its reason are stored in :attr:`device_memory` and
+            :attr:`device_memory_reason`; the notes above
+            ``_device_has_unified_memory`` give the measurements. Ignored on
+            CPU.
+        timer : muTimer.Timer, optional
+            Handed to the CG solver and the preconditioner so a benchmark can
+            read back where the *wall* time of a solve goes. On a GPU the
+            phases are host-side: the operator and preconditioner regions
+            measure only the cost of queueing their kernels, and the wait for
+            that work lands in the next region that reads a reduction back to
+            the host. The gap between these numbers and the GPU-busy time
+            from a kernel trace is therefore the pipeline bubble.
+
+        Raises
+        ------
+        ValueError
+            If ``nb_grid_pts`` is not 2- or 3-dimensional, or ``dtype`` is
+            neither float64 nor float32.
+        """
         self.dim = len(nb_grid_pts)
         if self.dim not in (2, 3):
             raise ValueError("nb_grid_pts must be 2- or 3-dimensional")
@@ -517,8 +596,12 @@ class Homogenization:
 
     # -- material update ----------------------------------------------------
     def set_density(self, rho):
-        """Interpolate rho -> (lambda, mu), fill ghosts, and (re)build/refresh
-        the preconditioner. ``rho`` has shape :attr:`nb_pixels`."""
+        """Interpolate ``ρ -> (λ, μ)``, fill ghosts, and build (first call) or
+        refresh the preconditioner. ``rho`` is the element-wise density of
+        shape :attr:`nb_pixels`.
+
+        Raises ``ValueError`` on the first call if the ``preconditioner``
+        given to the constructor is unknown."""
         with timer("set_density"):
             lam, mu = self.material.lame(np.asarray(rho))
             self.lam.p[...] = self.to_device(lam)
@@ -636,8 +719,33 @@ class Homogenization:
 
     def solve_rhs(self, b, x, rtol=None, maxiter=None, rhs_scale=None,
                   residual=None, label=None, warm_start=False):
-        """Solve ``K x = b`` in place; returns ``x``.
+        """Solve ``K x = b`` by preconditioned CG in place; returns ``x``.
 
+        Parameters
+        ----------
+        b : muGrid field
+            Right-hand side (vector field on :attr:`fc`).
+        x : muGrid field
+            Solution, overwritten (and read as initial guess with
+            ``warm_start``).
+        rtol : float, optional
+            Relative tolerance (default :attr:`cg_tol`), clamped to the
+            precision floor (:mod:`muTopOpt.precision`).
+        maxiter : int, optional
+            Iteration cap (default :attr:`cg_maxiter`).
+        rhs_scale : float, optional
+            Absolute force scale for the negligible-rhs test (default: the
+            material scale :attr:`mat_scale`).
+        residual : muGrid field, optional
+            Receives the final residual ``r = b − K x``.
+        label : str, optional
+            Tag of this solve in the ``cg_verbose`` trace (e.g.
+            ``"case 1 fwd"``).
+        warm_start : bool, optional
+            Use the current ``x`` as initial guess (default False: zero).
+
+        Notes
+        -----
         A negligible right-hand side (e.g. a spatially uniform material, whose
         macro response needs no fluctuation, giving a round-off-level rhs) has
         the exact solution ``x = 0``; return it directly, since CG would divide
@@ -657,15 +765,23 @@ class Homogenization:
         products across trust-region CG iterations) this cuts the iteration
         count; the previous solution must already be in ``x``.
 
-        This method never raises on non-convergence. A solve that stagnates
+        This method does not raise on non-convergence. A solve that stagnates
         (no relative residual improvement of :attr:`cg_stagnation_rel` within
         :attr:`cg_stagnation_patience` iterations -- the finite-precision
         residual floor), hits the iteration cap, or breaks down returns the
-        *best iterate* seen, with its true residual ``b - K x`` recomputed
+        *best iterate* seen, with its true residual ``b − K x`` recomputed
         (and never worse than the zero solution). The callers tolerate a
         less-accurate solve: the consistent objective is second-order in the
         state-solve residual and reports the remaining error, and the
-        trust-region model only needs a bounded Hessian-vector product."""
+        trust-region model only needs a bounded Hessian-vector product. The
+        number of such solves is counted in :attr:`cg_stagnation_count`, the
+        iterations of the last solve in :attr:`last_cg_iters`.
+
+        Raises
+        ------
+        muGrid.Solvers.ConvergenceError
+            Only if CG breaks down (NaN) before its first iteration, so that
+            no iterate exists to fall back to."""
         if not warm_start:
             x.set_zero()
         # muGrid's reductions run over the interior in double precision and
@@ -681,10 +797,11 @@ class Homogenization:
         verbose = self.cg_verbose and self.comm.rank == 0
         tag = f"{label}  " if label else ""
         # Negligible-rhs threshold, relative to the natural force scale of this
-        # solve. The historic 1e-9 is calibrated for float64; in float32 the
-        # assembly round-off alone is ~eps*scale ~ 1e-7*scale, so a rhs below a
-        # few eps is indistinguishable from noise (and CG on pure noise
-        # diverges -- the operator is only semi-definite for void_ratio=0).
+        # solve: 1e-9 in float64; in float32 the assembly round-off alone is
+        # ~eps*scale ~ 1e-7*scale, so a rhs below a few eps is
+        # indistinguishable from noise (and CG on pure noise diverges -- the
+        # operator is only semi-definite for void_ratio=0), hence 10 eps.
+        # TODO: rationale for the float64 threshold 1e-9?
         negligible = max(1e-9, 10.0 * float(np.finfo(self.dtype).eps)) * scale
         if b_norm <= negligible:
             # Exact solution x = 0; no CG iterations performed. The residual
@@ -762,9 +879,9 @@ class Homogenization:
             if rr < guard["best"]:
                 guard["best"] = rr
                 guard["best_iter"] = iteration
-                # Full-buffer device copy. The `.s[...] = .s` form goes
-                # through a strided (ghost-excluded) view, which is ~7x
-                # slower and ran on most CG iterations.
+                # Full-buffer copy (ghosts included): a contiguous copy,
+                # whereas `.s[...] = .s` goes through a strided,
+                # ghost-excluded view. It runs on most CG iterations.
                 muGrid.linalg.copy(x, self._x_best)
                 guard["saved"] = True
             elif cold_start and guard["best_iter"] == 0 and (
@@ -832,8 +949,8 @@ class Homogenization:
                       flush=True)
             return x
         if residual is not None and not _CG_HAS_RESIDUAL:
-            # Released muGrid without the residual out-field: recover
-            # r = b - K x with one extra operator apply.
+            # muGrid without the residual out-field: recover r = b - K x
+            # with one extra operator apply.
             self._hessp(x, self._Ku)
             residual.s[...] = b.s - self._Ku.s
         self.last_cg_iters = counter["n"]
@@ -841,8 +958,11 @@ class Homogenization:
 
     def solve_macro(self, E_macro, x, rtol=None, maxiter=None, residual=None,
                     label=None):
-        """Solve the periodic homogenization problem ``K u = -Bᵀ C:Ē`` for the
-        fluctuation displacement ``u`` under macro strain ``Ē``."""
+        """Solve the periodic cell problem ``K u = −Bᵀ C:Ē`` for the
+        fluctuation displacement ``u`` (written to ``x`` and returned) under
+        the ``dim × dim`` macro strain ``E_macro``. The remaining arguments
+        are those of :meth:`solve_rhs`; the negligible-rhs scale is
+        ``mat_scale · max|Ē|``."""
         E_arr = np.asarray(E_macro, dtype=float)
         E = list(E_arr.ravel())
         self.op.apply_macro_rhs(self.lam, self.mu, E, self._rhs)
@@ -855,12 +975,14 @@ class Homogenization:
 
     @property
     def mat_scale(self):
-        """Stiffness force scale (max |λ|, |2μ|) of the current material."""
+        """Stiffness force scale ``max(max|λ|, max|2μ|)`` of the current
+        material, MPI-reduced (1 before the first :meth:`set_density`)."""
         return getattr(self, "_mat_scale", 1.0)
 
     def macro_rhs_tensor(self, tensor, out, scale=1.0):
-        """Assemble ``out = scale * Bᵀ C : T`` for a constant symmetric tensor
-        ``T`` (used to build the adjoint right-hand side)."""
+        """Assemble ``out = scale · Bᵀ C:T`` for a constant symmetric
+        ``dim × dim`` tensor ``T`` (used to build the adjoint right-hand
+        side); returns ``out``."""
         T = list(np.asarray(tensor, dtype=float).ravel())
         self.op.apply_macro_rhs(self.lam, self.mu, T, out)
         if scale != 1.0:
@@ -868,12 +990,12 @@ class Homogenization:
         return out
 
     def homogenized_stress(self, u, E_macro, lam=None, mu=None):
-        """Cell-averaged stress ``⟨σ⟩ = (1/V) ∫ C:(Ē + ∇u) dV`` as a
-        ``dim x dim`` array (MPI-reduced).
+        """Homogenized stress ``σ̄ = (1/V) ∫ C:(Ē + ∇ˢu) dV`` as a
+        ``dim × dim`` host array (MPI-reduced).
 
         ``lam``/``mu`` override the material fields; passing *perturbed* Lamé
-        fields ``dλ/dρ·v``/``dμ/dρ·v`` evaluates the material-derivative
-        stress ``(1/V) ∫ δC:(Ē + ∇u) dV`` (the operator is linear in the
+        fields ``λ'δρ``/``μ'δρ`` evaluates the material-derivative stress
+        ``(1/V) ∫ δC:(Ē + ∇ˢu) dV`` (the operator is linear in the
         material), as needed for Hessian-vector products."""
         E = list(np.asarray(E_macro, dtype=float).ravel())
         local = self.op.average_stress(

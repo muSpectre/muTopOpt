@@ -15,7 +15,8 @@ from muTopOpt.optimize import initial_density
 @pytest.mark.parametrize("nb_ranks", [2, 3, 4])
 def test_subdomains_tile_the_global_field(kind, nb_ranks):
     """Slab subdomains, as the FFT engine splits the grid, reassemble to
-    exactly the field generated on the whole grid."""
+    exactly the field generated on the whole grid:
+    concatenate_r(rho[subdomain r]) == rho[global], bit for bit."""
     shape = (16, 12, 24)
     kwargs = dict(kind=kind, seed=5, length=0.1, volume_fraction=0.4)
     glob = initial_density(shape, **kwargs)
@@ -29,5 +30,6 @@ def test_subdomains_tile_the_global_field(kind, nb_ranks):
 
 
 def test_subdomain_needs_both_arguments():
+    """subdomain_locations without nb_subdomain_grid_pts is rejected."""
     with pytest.raises(ValueError):
         initial_density((8, 8), subdomain_locations=(0, 0))

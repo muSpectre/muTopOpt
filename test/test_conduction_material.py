@@ -6,6 +6,7 @@ from muTopOpt import SimpConductivity
 
 
 def test_endpoints():
+    """kappa(1) = kappa_solid and kappa(0) = void_ratio * kappa_solid."""
     m = SimpConductivity(kappa_solid=2.0, penalty=3.0, void_ratio=1e-3)
     k1 = m.kappa(np.array([1.0]))
     k0 = m.kappa(np.array([0.0]))
@@ -14,6 +15,7 @@ def test_endpoints():
 
 
 def test_derivative_matches_fd():
+    """dkappa/drho ~ (kappa(rho + d) - kappa(rho - d)) / (2 d)."""
     m = SimpConductivity(kappa_solid=1.7, penalty=3.0, void_ratio=1e-2)
     rho = np.linspace(0.1, 0.9, 9)
     dkappa = m.dkappa(rho)
@@ -24,6 +26,7 @@ def test_derivative_matches_fd():
 
 
 def test_second_derivative_matches_fd():
+    """d2kappa/drho2 ~ (dkappa(rho + d) - dkappa(rho - d)) / (2 d)."""
     m = SimpConductivity(kappa_solid=1.3, penalty=2.5, void_ratio=1e-2)
     rho = np.linspace(0.1, 0.9, 9)
     d2kappa = m.d2kappa(rho)

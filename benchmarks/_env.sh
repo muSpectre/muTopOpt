@@ -1,7 +1,7 @@
 # Shared environment for the muTopOpt benchmark job scripts.
 #
-# Sourced by the job_*.sh scripts. Sets up the mi300a toolchain, puts the fresh
-# build of muGrid (plus muTopOpt itself) on PYTHONPATH, and applies the UCX
+# Sourced by the job_*.sh scripts. Sets up the mi300a toolchain, puts the
+# selected build of muGrid (plus muTopOpt itself) on PYTHONPATH, and applies the UCX
 # transport workaround needed for the multi-rank MPI runs. Does not set `set -e`
 # — the caller owns that.
 
@@ -32,7 +32,7 @@ source "/work/classic/fr_lp1029-IMTEK-Simulation/$TOOLCHAIN/env.sh"
 
 # Footgun: a plain `import muGrid` picks up whatever copy is installed in the
 # venv's site-packages, which need not be the build under test. Putting the
-# build tree first on PYTHONPATH makes the fresh build win. muTopOpt is a plain
+# build tree first on PYTHONPATH makes the selected build win. muTopOpt is a plain
 # source tree, so its repo root goes on the path too (simulate.py imports the
 # local `muTopOpt` package).
 export PYTHONPATH="$MUGRID/$MUGRID_BUILD/language_bindings/python:$MUGRID/language_bindings/python:$MUTOPOPT${PYTHONPATH:+:$PYTHONPATH}"
@@ -51,14 +51,16 @@ print(f'  extension {ext}')
 
 # rocFFT compiles its kernels at runtime (the `fft_rtc_*` names in a kernel
 # trace). Without a persistent cache every process recompiles them from
-# scratch, which costs minutes per (grid, precision) before the first solve --
-# absorbed by the benchmark's warmup, so it does not distort ms/CG-iter, but it
-# makes a sweep far slower than the work it measures.
+# scratch for each (grid, precision) before the first solve. solve_bench.py
+# absorbs that in its warmup, so it does not distort ms/CG-iter, but it adds
+# to every process's run time and hence to the wall times that
+# job_topopt_mpi_vs_gpu.sh reports.
 export ROCFFT_RTC_CACHE_PATH="${ROCFFT_RTC_CACHE_PATH:-$HOME/.cache/rocfft_kernels.db}"
 
-# UCX_TLS=^rocm_ipc: the ROCm IPC rendezvous transport triggers an rkey-size
-# assertion failure between ranks; disable it so UCX falls back to
-# rocm_copy / shared-memory transfers. Harmless for the pure-CPU MPI run.
+# UCX_TLS=^rocm_ipc: the ROCm IPC rendezvous transport fails with an
+# rkey-size assertion between ranks on this toolchain; excluding it makes UCX
+# use rocm_copy / shared-memory transfers. It does not affect the pure-CPU
+# MPI run.
 export UCX_TLS="^rocm_ipc"
 
 cd "$MUTOPOPT"

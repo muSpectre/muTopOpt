@@ -6,12 +6,13 @@ objective, so the reported value is second-order accurate in the solve error
 and consistent with the adjoint gradient (∂L/∂ρ). Tested:
 
   1. superconvergence: at loose cg_tol the corrected objective is far closer
-     to the tight-tolerance objective than the raw one;
-  2. the correction vanishes at tight tolerance;
-  3. finite-difference gradient consistency at loose tolerance is far better
-     WITH the correction than without (this is what keeps L-BFGS line
-     searches clean at cheap solves);
-  4. an optimization at loose tolerance reaches the same design quality as
+     to the tight-tolerance objective than the raw one,
+     |L(loose) - f(tight)| < 0.1 |f_raw(loose) - f(tight)|;
+  2. the corrected error falls superlinearly with the CG tolerance;
+  3. the correction vanishes at tight tolerance;
+  4. the corrected (objective, gradient) pair stays finite-difference
+     consistent at a loose tolerance (cg_tol = 1e-4);
+  5. an optimization at loose tolerance reaches the same design quality as
      one at tight tolerance.
 """
 
@@ -91,6 +92,8 @@ def test_corrected_error_scales_superlinearly(comm):
 
 
 def test_correction_vanishes_at_tight_tolerance(comm):
+    """At cg_tol = 1e-12 every per-load-case correction λ_Γᵀ (K u_Γ - b_Γ)
+    (three load cases in 2D) is below 1e-9 of the objective."""
     n = 12
     rho = _smooth_rho(n, 2, seed=1)
     problem = _problem(2, n, comm, 1e-12, True)
@@ -103,7 +106,9 @@ def test_correction_vanishes_at_tight_tolerance(comm):
 
 def _fd_mismatch(problem, rho, sample, d=1e-5):
     """Worst relative mismatch between the assembled gradient and central
-    finite differences of the reported objective."""
+    finite differences of the reported objective,
+    max_i |g_i - fd_i| / max(|g_i|, |fd_i|) with
+    fd_i = (f(rho + d e_i) - f(rho - d e_i)) / (2 d)."""
     _, g = problem.objective_and_gradient(rho)
     worst = 0.0
     for idx in sample:

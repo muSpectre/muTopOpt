@@ -35,9 +35,12 @@ def _mpi_comm():
 
 
 def test_controller_clips_and_freezes():
-    """The relative forcing term clips to [rtol_min, rtol_start], only moves
-    on advance() (observe() alone must not change the live tolerance), and is
-    monotone (never loosens once tightened)."""
+    """The relative forcing term
+
+        rtol_k = clip(c * rtol_start * (g_k / g_0)^alpha, rtol_min, rtol_start)
+
+    (here c = alpha = 1) only moves on advance() (observe() alone must not
+    change the live tolerance), and is monotone: rtol_{k+1} <= rtol_k."""
     c = AdaptiveInnerTolerance(rtol_start=1e-1, rtol_min=1e-6, c=1.0, alpha=1.0)
     assert c.current == 1e-1
 
@@ -69,8 +72,9 @@ def test_controller_clips_and_freezes():
 
 def test_ratchets_down_on_stagnation():
     """When the projected gradient plateaus above rtol_start, the stagnation
-    ratchet drives the tolerance down to rtol_min anyway (the production
-    deadlock: rtol would otherwise stay pinned at the coarse start)."""
+    ratchet drives the tolerance down to rtol_min anyway,
+    rtol_{k+1} = max(shrink * rtol_k, rtol_min). Without it the forcing term
+    stays pinned at the coarse rtol_start and the inner solves never tighten."""
     c = AdaptiveInnerTolerance(rtol_start=1e-2, rtol_min=1e-4, c=1.0, alpha=1.0,
                                stall_rel=1e-2, shrink=0.3)
     # Constant gradient of 0.05 -- above rtol_start, so the pure forcing term
@@ -90,7 +94,7 @@ def test_ratchets_down_on_stagnation():
 
 def test_monotone_under_rising_gradient():
     """A rising gradient never loosens the tolerance; the ratchet only tightens
-    it (the old forcing-only controller would raise it back toward start)."""
+    it (a forcing term alone would raise it back toward rtol_start)."""
     c = AdaptiveInnerTolerance(rtol_start=1e-1, rtol_min=1e-6, c=1.0, alpha=1.0)
     seq = []
     for g in (1e-2, 1e-1, 1.0, 10.0):
@@ -172,7 +176,11 @@ def test_adaptive_matches_fixed_with_fewer_cg_iters(comm):
 
 def test_gradient_accurate_at_floor(comm):
     """With the controller frozen at its floor, the analytic gradient still
-    matches finite differences -- the floor must satisfy the norm condition."""
+    matches central finite differences,
+
+        df/drho_i ~ (f(rho + d e_i) - f(rho - d e_i)) / (2 d),  d = 1e-6,
+
+    i.e. the floor satisfies the norm condition."""
     n = 6
     material = SimpMaterial(E_solid=1.0, nu=0.3, penalty=3.0, void_ratio=1e-2)
     homog = Homogenization((n, n), material, comm=comm, cg_tol=1e-4,
@@ -196,5 +204,6 @@ def test_gradient_accurate_at_floor(comm):
         rm = rho.copy(); rm[idx] -= 1e-6
         fm, _ = problem.objective_and_gradient(rm)
         fd = (fp - fm) / 2e-6
+        # TODO: rationale for tolerance rtol=2e-4, atol=1e-7?
         assert np.isclose(g[idx], fd, rtol=2e-4, atol=1e-7), (
             f"pixel {idx}: analytic {g[idx]:.6e} vs FD {fd:.6e}")

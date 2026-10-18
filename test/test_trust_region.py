@@ -58,6 +58,8 @@ def _build(comm, cg_tol, hessian):
 
 
 def test_tr_reduces_objective_and_respects_bounds(comm):
+    """30 TR iterations lower the objective, keep rho in [0, 1], and use at
+    least one Hessian-vector product."""
     problem, rho0 = _build(comm, cg_tol=1e-6, hessian=True)
     f0, _ = problem.objective_and_gradient(rho0)
 
@@ -70,8 +72,8 @@ def test_tr_reduces_objective_and_respects_bounds(comm):
 
 
 def test_tr_comparable_to_lbfgs(comm):
-    """From the same start, the TR run must reach an objective at least as
-    good as (comparable to) the L-BFGS run."""
+    """From the same start and with the same iteration budget, the TR run
+    must reach an objective no more than 5% above the L-BFGS run's."""
     maxiter = 30
     prob_lb, rho0 = _build(comm, cg_tol=1e-6, hessian=False)
     _, info_lb = optimize_bounded_lbfgs(
@@ -86,10 +88,11 @@ def test_tr_comparable_to_lbfgs(comm):
 
 
 def test_tr_robust_at_loose_tolerance(comm):
-    """The line-search stall scenario: start at a deliberately loose state
-    tolerance. The TR run must keep decreasing the objective (accuracy
-    control kicks in when the evaluation noise would corrupt acceptance)
-    and converge or at least make monotone progress."""
+    """Starting at a deliberately loose state tolerance (cg_tol_start=1e-2),
+    where evaluation noise can corrupt a line search, the TR run must keep
+    decreasing the objective (accuracy control tightens the tolerance when
+    the noise would corrupt step acceptance): its accepted-iterate history is
+    monotone non-increasing and ends below half the starting objective."""
     problem, rho0 = _build(comm, cg_tol=1e-6, hessian=True)
     f0, _ = problem.objective_and_gradient(rho0)
 
