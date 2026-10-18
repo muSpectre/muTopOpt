@@ -383,9 +383,6 @@ class Homogenization:
         managed, reason = _device_memory_policy(
             on_device, unified, self.comm.size,
             _requested_managed_memory(managed_memory))
-        #: muGrid environment variables set for plain memory on an APU.
-        self.mugrid_environment = _mugrid_settings_for_plain_memory(
-            unified, managed, self.comm.size)
         self.managed_memory = managed and _enable_managed_device_allocator()
         if managed and not self.managed_memory:
             reason += " -- but cupy is unavailable, so plain device memory"
@@ -400,6 +397,13 @@ class Homogenization:
                               else "plain" if on_device else "host")
         #: One line saying why, for the run's log.
         self.device_memory_reason = reason
+        #: muGrid environment variables set for plain memory on an APU. From
+        #: what is actually allocated, not from the policy: a policy of
+        #: managed memory that could not be installed leaves plain memory,
+        #: which needs them, and managed memory left by an earlier
+        #: Homogenization does not.
+        self.mugrid_environment = _mugrid_settings_for_plain_memory(
+            unified, self.managed_memory, self.comm.size)
         ghosts = (1,) * self.dim
         self.engine = muGrid.FFTEngine(
             self.nb_grid_pts, self.comm,
