@@ -279,8 +279,8 @@ def main():
         choices=["green-jacobi", "green"],
         default="green-jacobi",
         help="inner-solve preconditioner: 'green-jacobi' (J-FFT, "
-             "Green operator times a per-node Jacobi diagonal assembled "
-             "via a 2^dim-colour scheme) or 'green' (plain reference-"
+             "Green operator times the per-node Jacobi diagonal of the "
+             "stiffness) or 'green' (plain reference-"
              "conductivity Green operator)",
     )
     p.add_argument(

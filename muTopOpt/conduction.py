@@ -52,9 +52,9 @@ still be anisotropic (see :mod:`muTopOpt.loadcases_conduction`), only the
 physical solid/void material itself is isotropic.  Both a plain Green's-
 function (``'green'``) and the Green-Jacobi (``'green-jacobi'``) preconditioner
 are available.  The Jacobi diagonal of the conductivity operator is assembled
-via a ``2**dim``-colour graph-colouring scheme (applying the operator to one
-bitmask colour at a time, see :meth:`HomogenizationConductivity.
-_assemble_diagonal`), so no dedicated diagonal-assembly kernel is needed.
+in closed form from the element shape-function gradients and the conductivity
+(see :meth:`HomogenizationConductivity._assemble_diagonal`), exactly for every
+grid and subdomain size.
 """
 
 import inspect as _inspect
