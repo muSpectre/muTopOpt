@@ -7,21 +7,25 @@
 Restarting from the NetCDF output of a previous run.
 
 :func:`read_final_density` reads the last density frame of a file written by
-``simulate.py`` -- all file I/O goes through muGrid's :class:`FileIONetCDF`
-(the files are CDF-5/PnetCDF, which generic Python readers cannot parse).
-:func:`fourier_resample` moves a periodic density between grids by
-zero-padding/truncating its Fourier spectrum, so a converged coarse design can
-seed a finer run (or vice versa) without smearing or shifting the interfaces.
-:func:`restart_density` combines the two.
+``simulate.py`` or ``simulate_conduction.py``. All file I/O goes through
+muGrid's :class:`FileIONetCDF`, the same writer that produced the file; under
+MPI the files are CDF-5 written by PnetCDF, which generic Python NetCDF
+readers cannot open.
 
-muGrid's Python API does not (yet) expose the grid shape or the scalar type of
-a variable stored in a file, but both must be known *before* the field
+:func:`fourier_resample` moves a periodic density between grids by
+trigonometric (band-limited) interpolation -- zero-padding or truncating its
+discrete Fourier spectrum -- so a converged coarse design can seed a finer
+run (or vice versa). Sample ``j`` sits at ``x_j = j h`` on both grids, so the
+interpolant does not shift interfaces, and it preserves the mean (the
+volume fraction) exactly. :func:`restart_density` combines the two.
+
+muGrid's Python API does not expose the grid shape or the scalar type of a
+variable stored in a file, but both must be known *before* the field
 collection is registered for reading -- registering a ``float64`` field for a
 ``float`` variable silently misreads the data in serial muGrid builds. The
 grid and precision are therefore recovered from the file's global attributes:
-the explicit ``nb_grid_pts``/``precision`` attributes when present (files
-written by current ``simulate.py``), else parsed from the ``command_line``
-attribute that every ``simulate.py`` run records.
+the explicit ``nb_grid_pts``/``precision`` attributes when present (both
+drivers write them), else parsed from the ``command_line`` attribute.
 """
 
 import shlex
@@ -36,9 +40,23 @@ INITIAL_DENSITY_KINDS = ("uniform", "random", "filtered_random")
 
 def _resample_axis(a, n_new, axis):
     """Fourier-resample a real array along one axis (periodic band-limited
-    interpolation): the spectrum is truncated (downsampling) or zero-padded
-    (upsampling), with the usual Nyquist-bin handling that keeps the result
-    real and makes up/down round trips of band-limited data exact."""
+    interpolation).
+
+    With ``n = n_old``, ``n' = n_new``, ``m = min(n, n')`` and ``â_k`` the
+    DFT of the input, the output spectrum ``t`` keeps the ``m`` lowest
+    frequencies, ``t_k = â_k`` for ``k = 0, ..., ⌈m/2⌉ - 1`` and
+    ``k = -⌊m/2⌋, ..., -1``, and is zero elsewhere; the result is
+    ``(n'/n) · Re IDFT_{n'}(t)``. For even ``m`` the Nyquist frequency
+    ``m/2`` is treated so that the spectrum stays Hermitian:
+
+    * downsampling (``m = n'``): the old bins ``+m/2`` and ``-m/2`` both
+      alias onto the single new Nyquist bin, ``t_{m/2} = â_{-m/2} + â_{m/2}``;
+    * upsampling (``m = n``): the old Nyquist bin is split equally,
+      ``t_{±m/2} = â_{m/2} / 2``.
+
+    Upsampling followed by downsampling back to ``n`` is therefore the
+    identity, and both directions are exact for data band-limited to the
+    coarser grid."""
     n_old = a.shape[axis]
     if n_new == n_old:
         return a
@@ -51,8 +69,10 @@ def _resample_axis(a, n_new, axis):
     if nneg:
         t[..., -nneg:] = s[..., -nneg:]
     if m % 2 == 0:
-        # A Nyquist bin (frequency +-m/2) is involved. Real input makes the
-        # old bin value real, so splitting/folding preserves realness.
+        # A Nyquist bin (frequency +-m/2) is involved. For real input the
+        # folded pair (conjugate bins, downsampling) sums to a real value and
+        # the split bin (the old Nyquist bin, upsampling) is real, so the
+        # result stays real.
         ny = m // 2
         if n_new < n_old:
             # Downsampling: the old +m/2 and -m/2 bins both alias onto the
@@ -70,9 +90,11 @@ def _resample_axis(a, n_new, axis):
 def fourier_resample(a, nb_grid_pts):
     """Resample a periodic real field to a new grid by Fourier interpolation.
 
-    Trigonometric (band-limited) interpolation: upsampling zero-pads the
-    spectrum, downsampling truncates it. The mean is preserved exactly;
-    interfaces stay in place (no half-pixel shifts). Note the result of
+    Trigonometric (band-limited) interpolation, applied axis by axis (see
+    :func:`_resample_axis` for the spectrum truncation/zero-padding and the
+    Nyquist handling): upsampling zero-pads the spectrum, downsampling
+    truncates it. The mean is preserved exactly; interfaces stay in place
+    (no half-pixel shifts). The result of
     downsampling -- or of upsampling a field with sharp interfaces (Gibbs
     ringing) -- can overshoot the range of the input; clip afterwards if the
     field must stay in ``[0, 1]``.
@@ -88,6 +110,11 @@ def fourier_resample(a, nb_grid_pts):
     -------
     np.ndarray
         The field resampled to ``nb_grid_pts`` (float64).
+
+    Raises
+    ------
+    ValueError
+        If ``nb_grid_pts`` has a different number of axes than ``a``.
     """
     a = np.asarray(a, dtype=np.float64)
     if len(nb_grid_pts) != a.ndim:
@@ -118,8 +145,10 @@ def _parse_option(tokens, names, nb_values):
 def _file_metadata(fio):
     """Recover grid shape, precision and domain lengths of the stored density
     from the file's global attributes (explicit attributes preferred, the
-    recorded ``command_line`` as fallback for files written before they were
-    introduced)."""
+    recorded ``command_line`` as fallback for files without them).
+
+    Raises ``ValueError`` if the grid cannot be determined or the precision
+    is neither ``'single'`` nor ``'double'``."""
     names = fio.read_global_attribute_names()
     tokens = (shlex.split(str(fio.read_global_attribute("command_line")))
               if "command_line" in names else [])
@@ -178,7 +207,8 @@ def read_final_density(filename):
     Parameters
     ----------
     filename : str
-        NetCDF output of a previous ``simulate.py`` run.
+        NetCDF output of a previous ``simulate.py`` or
+        ``simulate_conduction.py`` run.
 
     Returns
     -------
@@ -187,6 +217,12 @@ def read_final_density(filename):
     metadata : dict
         ``nb_grid_pts`` (tuple), ``precision`` (str), ``domain_lengths``
         (list or None) and ``frame`` (index of the frame read) of the file.
+
+    Raises
+    ------
+    ValueError
+        If the file has no frames, or its grid or precision cannot be
+        determined.
     """
     fio = muGrid.FileIONetCDF(
         filename, muGrid.FileIONetCDF.OpenMode.Read, muGrid.Communicator()

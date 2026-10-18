@@ -27,8 +27,8 @@ def test_mesh_invariant_gradient_norm(comm):
     measured on the volume-fraction derivative ``ĝ = (V/V_e) ∂f/∂ρ``, so the
     *same* continuum design reports the *same* stationarity norm at every
     resolution -- one gtol means one physical stopping point. (The raw
-    per-pixel gradient is O(1/N); an absolute per-pixel gtol falsely
-    certified untouched initial designs as converged on fine grids.)"""
+    per-pixel gradient is O(1/N); an absolute per-pixel gtol would certify
+    untouched initial designs as converged on fine grids.)"""
     max_grads = []
     for n in (8, 16):
         material = SimpMaterial(
@@ -53,6 +53,7 @@ def test_mesh_invariant_gradient_norm(comm):
         max_grads.append(info["max_grad"])
     # Same design, same norm -- across a 4x change in pixel count (per-pixel
     # inf-norms would differ by that factor).
+    # TODO: rationale for tolerance rel=1e-3?
     assert max_grads[0] == pytest.approx(max_grads[1], rel=1e-3)
     # O(1) scale: the volume-fraction derivative of an O(1) objective, not a
     # per-pixel O(1/N) entry.
@@ -60,6 +61,8 @@ def test_mesh_invariant_gradient_norm(comm):
 
 
 def test_lbfgs_reduces_objective_2d(comm):
+    """15 bounded L-BFGS iterations on a 16x16 grid lower the objective
+    below its value at the uniform start and keep rho in [0, 1]."""
     n = 16
     material = SimpMaterial(E_solid=1.0, nu=0.3, penalty=3.0, void_ratio=1e-3)
     homog = Homogenization((n, n), material, comm=comm, cg_tol=1e-8)

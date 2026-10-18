@@ -6,24 +6,41 @@ metamaterials, built on [muGrid](https://github.com/muSpectre/muGrid).
 muTopOpt designs a periodic unit cell whose homogenized (effective) stiffness
 matches a prescribed target — e.g. a given bulk/shear modulus or a negative
 Poisson's ratio. It uses a SIMP material interpolation, a stress-matching
-objective with phase-field regularization (no explicit volume constraint),
-and the discrete adjoint method for exact sensitivities. The micromechanical
-equilibrium and the adjoint problem — the two expensive parts of every
-optimization step — are solved by muGrid's matrix-free, GPU-capable, J-FFT
-(Green–Jacobi) preconditioned conjugate gradient.
+objective with Modica–Mortola phase-field regularization (no explicit volume
+constraint), and the discrete adjoint method for exact sensitivities. The
+micromechanical equilibrium and the adjoint problem — the two expensive parts
+of every optimization step — are solved by muGrid's matrix-free, GPU-capable,
+J-FFT (Green–Jacobi) preconditioned conjugate gradient. Unit cells can be 2D
+or 3D, the density can live on elements or on nodes, and runs can be
+MPI-parallel. A heat-conduction (scalar diffusion) variant is included.
 
-See
-* J-FFT: https://doi.org/10.1016/j.cma.2026.119269
+The mathematics is documented in the module docstrings:
+
+| Topic | Module |
+|---|---|
+| SIMP interpolation $C(\rho) = C_\text{void} + \rho^p (C_\text{solid} - C_\text{void})$ | `muTopOpt/material.py` |
+| Cell problem $K u = -B^T C : \bar E$, homogenized stress, CG safeguards, GPU memory | `muTopOpt/homogenization.py` |
+| Macro-strain load cases, isotropic targets | `muTopOpt/loadcases.py` |
+| Objective, adjoint gradient, adjoint-corrected Lagrangian, Hessian-vector products | `muTopOpt/problem.py` |
+| Modica–Mortola regularization | `muTopOpt/regularization.py` |
+| Nodal design field, exact double-well integration | `muTopOpt/nodal.py` |
+| Voigt / Hashin–Shtrikman feasibility bounds | `muTopOpt/bounds.py` |
+| Optimizers and inner-tolerance control | `muTopOpt/optimize.py` |
+
+References:
+* J-FFT preconditioner: https://doi.org/10.1016/j.cma.2026.119269
 * Topology optimization: https://arxiv.org/abs/2107.04123
 
 ## Install
 
-Requires an installed `muGrid` with FFT support, plus `numpy` and `scipy`.
-For GPU support, `muGrid` must be compiled with CUDA or ROCm/HIP support
-and you additionally need `cupy`.
+Requires `muGrid` (≥ 1.4.0, with FFT support), `NuMPI`, `muTimer` and
+`numpy`; these are installed as dependencies. Optional extras: `scipy` (for
+the serial `optimize_lbfgs`), `mpi4py` (MPI runs) and `pytest` (tests). For
+GPU support, `muGrid` must be compiled with CUDA or ROCm/HIP support and you
+additionally need `cupy`.
 
 ```bash
-pip install -e ".[test]"
+pip install -e ".[test,scipy]"      # add ,mpi for mpi4py
 ```
 
 ### GPU memory
@@ -34,9 +51,12 @@ device memory (`hipMalloc`/`cudaMalloc`) or as managed memory
 
 | GPU | ranks | memory | why |
 |---|---|---|---|
-| discrete (NVIDIA, AMD MI200/MI300X, …) | any | plain | managed pages migrate between host and device on every access (9× slower per CG iteration, measured) |
-| unified-memory APU (AMD MI300A) | 1 | managed | reaches all 128 GB instead of the ~62.8 GiB plain window; kernels run at full speed (≤4% slower, measured) |
-| unified-memory APU (AMD MI300A) | > 1 | plain | MPI is several times slower on managed buffers (5.4× for the FFT preconditioner, 1.8× for the hybrid one at 256³ on 4 GPUs, measured) |
+| discrete (NVIDIA, AMD MI200/MI300X, …) | any | plain | host and device memories are separate, so managed pages migrate between them whenever the other side touches them |
+| unified-memory APU (AMD MI300A) | 1 | managed | host and device share one physical memory, so nothing migrates; plain allocations are limited to the ~62.8 GiB device window, managed ones reach all 128 GB |
+| unified-memory APU (AMD MI300A) | > 1 | plain | MPI exchanges of managed buffers are much slower than of plain device buffers |
+
+The measurements behind this choice are in the notes above
+`_device_has_unified_memory` in `muTopOpt/homogenization.py`.
 
 The run prints its choice and the reason (`device memory: ...`) and records it
 in the output file (`device_memory` attribute). `MUTOPOPT_MANAGED=1` or `0`
@@ -47,9 +67,7 @@ fields on one rank exceed the plain window. Either use more ranks or set
 With plain memory on MI300A, muTopOpt also sets `MUGRID_UNIFIED_MEMORY=0`,
 and on Cray MPICH with `MPICH_GPU_SUPPORT_ENABLED=1` also
 `MUGRID_GPU_AWARE_MPI=1`, unless they are already set. muGrid otherwise takes
-plain MI300A memory for host-readable, which it is not. The details and the
-measurements are in the notes above `_device_has_unified_memory` in
-`muTopOpt/homogenization.py`.
+plain MI300A memory for host-readable, which it is not.
 
 ## Usage
 
@@ -75,8 +93,10 @@ rho, info = optimize_lbfgs(problem, rho0, maxiter=200)
 
 ```bash
 python simulate.py -n 64 64        --target-K 0.1  --target-G 0.05 --bfgs-maxiter 200
-python simulate.py -n 96 96 96     --target-K 0.1  --target-G 0.05 --eta 2.0 --output cell.nc
-# restart from a previous run's output; a coarse design seeds a finer grid
+python simulate.py -n 96 96 96     --target-K 0.1  --target-G 0.05 --eta 0.02 --output cell.nc
+# --eta is in the length units of the cell (unit length by default), so
+# 0.02 is about two grid spacings at n = 96.
+# Restart from a previous run's output; a coarse design seeds a finer grid
 # (the density is Fourier-interpolated when the grids differ)
 python simulate.py -n 128 128 128  --target-K 0.1  --target-G 0.05 --init cell.nc
 ```
@@ -84,12 +104,12 @@ python simulate.py -n 128 128 128  --target-K 0.1  --target-G 0.05 --init cell.n
 ### Reading the log
 
 `f` is the full objective — the normalized stress misfit summed over all load
-cases plus the regularization — but it is reported as the adjoint-corrected
-Lagrangian `L = f + Σ_Γ λ_Γᵀ(K u_Γ − b_Γ)` evaluated with the *current* inner
-CG tolerance (the `cg-rtol` column). The correction cancels the first-order
-effect of the truncated state solves, leaving an `O(cg-rtol²)` evaluation
-error, so values printed at *different* `cg-rtol` are not directly
-comparable: when the accuracy control tightens the tolerance (typically right
+cases plus the regularization — reported as the adjoint-corrected Lagrangian
+$L = f + \sum_\Gamma v_\Gamma^T (K u_\Gamma - b_\Gamma)$ (with adjoints
+$v_\Gamma$; see `muTopOpt/problem.py`) evaluated with the *current* inner CG
+tolerance (the `cg-rtol` column). Its evaluation error is
+$O(\text{cg-rtol}^2)$, so values printed at *different* `cg-rtol` are not
+directly comparable: when the accuracy control tightens the tolerance (typically right
 after the first iteration), `f` can appear to jump up by roughly the old
 tolerance's evaluation error even though the true objective did not increase.
 At constant `cg-rtol` the printed sequence decreases monotonically. Only
@@ -100,11 +120,11 @@ printed iterations.
 A `cg-stalled=N` entry in an iterate line counts the inner solves of that
 outer step that hit their finite-precision residual floor before the
 requested tolerance (common in `--precision single`, where the achievable
-relative residual is ~1e-6 for a healthy right-hand side and far coarser
+relative residual is ~$10^{-6}$ for a healthy right-hand side and far coarser
 for the near-round-off right-hand sides that Hessian-vector products can
 produce). Such a solve is cut short — on stagnation, divergence, or the
 iteration cap — and its best iterate is used (never worse than the zero
-solution, with the true residual `b − Kx` recomputed) instead of aborting
+solution, with the true residual $b - Kx$ recomputed) instead of aborting
 the run; the adjoint-corrected objective and the trust-region accuracy
 control account for the extra solve error. `--output-cg-iters` prints a
 detail line per cut-short solve.

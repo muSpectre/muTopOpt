@@ -4,21 +4,70 @@
 # MIT License (see LICENSE)
 #
 """
-Gradient-based optimization drivers for the element-wise density problem.
+Gradient-based outer optimizers for the density design problem.
 
-:func:`optimize_bounded_lbfgs` (the default) wraps NuMPI's **MPI-distributed**
-bound-constrained L-BFGS (``l_bfgs_bounded``): the density is kept in ``[0, 1]``
-by box projection, and every reduction goes through NuMPI so the optimizer runs
-correctly across ranks on the same domain decomposition as the muGrid fields.
-Its MPI contract -- ``x``/gradient/bounds are local per-rank slices, the scalar
-energy is globally reduced -- is exactly what :meth:`StressTargetProblem.
-objective_and_gradient` already provides.
+Every driver minimizes ``f(ρ)`` over the box ``lo ≤ ρ ≤ hi`` (default
+``[0, 1]``) for a problem object providing
+``objective_and_gradient(rho) -> (f, g)``, with ``rho`` shaped like
+:attr:`Homogenization.nb_pixels` (the rank-local slice under MPI).
 
-:func:`optimize_lbfgs` wraps SciPy's serial L-BFGS-B and is kept as a
-dependency-light alternative for single-process runs.
+Stationarity measure
+--------------------
+With ``Π(x) = clip(x, lo, hi)`` the projection onto the box, the free
+(box-KKT) gradient ``g_free`` is ``g`` with every component set to zero where
+``ρ_i`` sits on a bound and ``g_i`` points further into it (``ρ_i = lo`` and
+``g_i ≥ 0``, or ``ρ_i = hi`` and ``g_i ≤ 0``). All drivers stop when
 
-Both take a problem object providing ``objective_and_gradient(rho) -> (f, grad)``
-with ``rho`` shaped like :attr:`Homogenization.nb_pixels`.
+    ‖g_free‖_∞ ≤ gtol · V_e / V,
+
+i.e. ``gtol`` is stated for the mesh-invariant volume-fraction derivative
+``ĝ = (V/V_e) g`` (``V`` cell volume, ``V_e`` pixel volume; see
+:func:`_gradient_scale`).
+
+Drivers
+-------
+:func:`optimize_bounded_lbfgs`
+    NuMPI's MPI-distributed projected L-BFGS (``l_bfgs_bounded``). The search
+    direction ``d = -H g_free`` comes from the two-loop recursion over the
+    last ``maxcor`` curvature pairs ``(s, y) = (ρ_new - ρ, g_free,new -
+    g_free)`` (a pair is stored only if ``sᵀy > 1e-12 ‖s‖ ‖y‖``). The step
+    ``ρ_new = Π(ρ + α d)`` is found by halving ``α`` (from 1) along the
+    projection arc until the Armijo condition
+    ``f(ρ_new) ≤ f(ρ) + c₁ α g_freeᵀ d`` holds.
+:func:`optimize_trust_region`
+    NuMPI's MPI-distributed bound-constrained trust-region Newton-CG
+    (``tr_newton_bounded``), using exact Hessian-vector products ``H v`` from
+    the problem's second-order adjoint. Each iteration approximately
+    minimizes the model ``m(s) = g_freeᵀ s + ½ sᵀ H s`` subject to
+    ``‖s‖₂ ≤ Δ`` on the free subspace with Steihaug--Toint truncated CG
+    (stop on the CG residual tolerance, or step to the trust-region boundary
+    on negative curvature or when the CG iterate would leave it). The trial
+    point ``ρ_try = Π(ρ + s)`` is judged by the ratio of actual to predicted
+    reduction,
+
+        r = (f(ρ) - f(ρ_try)) / pred,   pred = m(0) - m(ρ_try - ρ),
+
+    accepted if ``r ≥ eta``, and the radius is updated as ``Δ ← Δ/4`` if
+    ``r < 1/4`` and ``Δ ← min(2Δ, Δ_max)`` if ``r > 3/4`` and the step
+    reached the boundary (unchanged otherwise).
+:func:`optimize_lbfgs`
+    SciPy's serial L-BFGS-B, for single-process runs without NuMPI.
+
+Choice of optimizer: the trust-region method needs a problem with Hessian
+support (``StressTargetProblem(..., hessian=True)``) and costs two extra CG
+solves per load case per Hessian-vector product, but its acceptance test
+compares against the computable ``pred`` and can require the objective
+evaluation error to stay below ``eta_f · pred``; an Armijo line search
+instead has to resolve decreases proportional to ``α``, which fall below the
+objective noise of truncated inner CG solves as ``α → 0``. ``simulate.py``
+therefore selects the trust region whenever the installed NuMPI provides it,
+and projected L-BFGS otherwise; ``simulate_conduction.py`` uses projected
+L-BFGS because :class:`~muTopOpt.conduction_problem.FluxTargetProblem` has
+no Hessian-vector product.
+
+Both NuMPI drivers take ``x``/gradient/bounds as rank-local slices and the
+scalar objective as a global reduction -- the MPI contract of the problems'
+``objective_and_gradient``.
 """
 
 import numpy as np
@@ -36,10 +85,11 @@ def _gradient_scale(problem):
     The objective matches *volume-averaged* stresses, so a single design
     variable's gradient entry is ``O(V_e/V) = O(1/N)``: an absolute per-pixel
     ``gtol`` would mean a different physical stationarity at every resolution
-    (and falsely certify convergence of the untouched initial design on fine
-    grids). Both the element and the nodal design have one variable per pixel
-    of the periodic grid, so one scale covers both. MPI-safe: ``grid_spacing``
-    and ``domain_volume`` are global quantities, identical on every rank."""
+    (and would certify the unchanged initial design as converged on
+    sufficiently fine grids). Both the element and the nodal design have one
+    variable per pixel of the periodic grid, so one scale covers both.
+    MPI-safe: ``grid_spacing`` and ``domain_volume`` are global quantities,
+    identical on every rank."""
     h = getattr(problem, "h", None)
     if h is None:
         return 1.0
@@ -51,34 +101,42 @@ class AdaptiveInnerTolerance:
     to the outer optimizer's stationarity, with a stagnation ratchet.
 
     The inner (forward/adjoint) CG relative tolerance starts coarse at
-    ``rtol_start`` and is retuned once per accepted outer iterate. Two
-    mechanisms drive it down, and it is **monotone non-increasing** (never
-    loosens) and floored at ``rtol_min``:
+    ``rtol_start`` and is retuned once per accepted outer iterate. It is
+    **monotone non-increasing** (never loosens) and floored at ``rtol_min``.
+    With ``γ_k = ‖g_free,k‖_∞`` the gradient norm last passed to
+    :meth:`observe` (in mesh-invariant ``ĝ`` units), ``γ_0`` the first one
+    and ``γ_best`` the smallest one that counted as progress, the update
+    applied by :meth:`advance` at accepted iterate ``k`` is
 
-    * **Forcing term.** While the box-KKT-masked gradient ``||g_free||`` (the
-      infinity norm; the same stationarity measure ``l_bfgs_bounded`` converges
-      on, see NuMPI ``_kkt_residual``) is *decreasing*, the tolerance tracks
-      ``clip(c * rtol_start * (||g_free|| / ||g_0||)^alpha, rtol_min,
-      rtol_start)`` with ``||g_0||`` the first observed gradient norm
-      (Eisenstat--Walker "choice 2") -- coarse while far from a stationary
-      point (no oversolving), tightening proportionally as it approaches.
-      The *relative* form makes the coupling independent of the units (and
-      hence the mesh resolution) of the reported gradient norm: an absolute
-      term ``c * ||g_free||^alpha`` compared a mesh-dependent per-pixel
-      gradient against mesh-independent tolerances and over-tightened
-      immediately on fine grids.
+        if γ_k < (1 - stall_rel) γ_best:   (progress; γ_best ← γ_k)
+            t_k = clip(c · rtol_start · (γ_k / γ_0)^alpha, rtol_min, rtol_start)
+        else:                              (stagnation)
+            t_k = shrink · rtol_k
+        rtol_{k+1} = max(rtol_min, min(rtol_k, t_k))
 
-    * **Stagnation ratchet.** If ``||g_free||`` fails to decrease by at least
-      ``stall_rel`` (relative) versus the best value seen, the outer optimizer
-      has stalled at the current accuracy, so the tolerance is *forced* down by
-      the factor ``shrink`` toward ``rtol_min``. This is essential: the pure
-      forcing term only tightens once ``||g_free|| < rtol_start``, but the
-      gradient can plateau *above* ``rtol_start`` (the loose inner solves add
-      gradient/objective noise that halts progress), which would otherwise
-      deadlock the tolerance at the coarse start. Refining the inner accuracy on
-      stagnation breaks that deadlock and is the mechanism of inexact
-      trust-region PDE-constrained optimization (Heinkenschloss & Vicente 2001;
-      Kouri, Heinkenschloss, Ridzal & van Bloemen Waanders 2013/14).
+    with ``rtol_0 = rtol_start`` (``t_k = rtol_min`` if ``γ_0 = 0``). Two
+    mechanisms thus drive the tolerance down:
+
+    * **Forcing term.** On progress the tolerance tracks the relative forcing
+      term (Eisenstat--Walker "choice 2" form): coarse while far from a
+      stationary point (no oversolving), tightening in proportion to the
+      gradient as it approaches one. ``γ`` is the box-KKT gradient norm, the
+      same stationarity measure ``l_bfgs_bounded`` converges on (NuMPI
+      ``_kkt_residual``). The *relative* form ``γ_k / γ_0`` makes the
+      coupling independent of the units of ``γ`` and hence of the mesh
+      resolution; an absolute term ``c γ_k^alpha`` would compare a
+      mesh-dependent quantity against the mesh-independent tolerances.
+
+    * **Stagnation ratchet.** If ``γ_k`` fails to beat ``γ_best`` by the
+      relative margin ``stall_rel``, the outer optimizer has stalled at the
+      current accuracy and the tolerance is multiplied by ``shrink``. The
+      forcing term alone cannot do this: it only tightens when ``γ``
+      decreases, but noise from loose inner solves can stop ``γ`` from
+      decreasing, which would hold the tolerance at its current value
+      indefinitely. Refining the inner accuracy on stagnation is the
+      mechanism of inexact trust-region PDE-constrained optimization
+      (Heinkenschloss & Vicente 2001; Kouri, Heinkenschloss, Ridzal & van
+      Bloemen Waanders 2013/14).
 
     **Frozen between iterates.** :meth:`advance` retunes the tolerance once per
     accepted outer iterate (called from the optimizer callback); within an
@@ -103,6 +161,24 @@ class AdaptiveInnerTolerance:
     L-BFGS cannot certify convergence. In the worst case (persistent
     stagnation) the ratchet drives ``current`` all the way to ``rtol_min``, so
     the run degrades to a fixed-``rtol_min`` solve rather than getting stuck.
+
+    Parameters
+    ----------
+    rtol_start : float
+        Initial (coarsest) inner relative tolerance; also the upper clip of
+        the forcing term.
+    rtol_min : float
+        Floor of the tolerance.
+    c, alpha : float, optional
+        Coefficient and exponent of the forcing term (defaults 1.0, 1.0).
+    stall_rel : float, optional
+        Minimum relative decrease of ``γ`` counted as progress (default 0.01).
+    shrink : float, optional
+        Factor applied to the tolerance on stagnation (default 0.3).
+    bounds : tuple, optional
+        Box ``(lo, hi)`` of the design variable (default ``(0.0, 1.0)``);
+        read by the problems to mask the gradient to ``g_free`` before
+        calling :meth:`observe`.
     """
 
     def __init__(self, rtol_start, rtol_min, c=1.0, alpha=1.0, stall_rel=1e-2,
@@ -226,17 +302,24 @@ def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
 
     ``kind='uniform'`` fills with ``volume_fraction``.
 
-    ``kind='random'`` draws a box-smoothed random field (``smoothing`` sweeps),
-    a cheap low-pass start with no controlled length scale.
+    ``kind='random'`` draws uniform noise, applies ``smoothing`` periodic
+    three-point box-filter sweeps per axis, standardizes the result to ``z``
+    (zero mean, unit standard deviation) and returns
+    ``clip(0.5 + 0.5 z, 0, 1)`` -- a cheap low-pass start with no controlled
+    length scale. ``volume_fraction`` and ``contrast`` are not used.
 
     ``kind='filtered_random'`` draws white noise and applies a **periodic
     Gaussian filter** of correlation length ``length`` (in the *physical* units
     of the unit cell -- the cell has length 1 by default, converted to pixels
     via ``grid_spacing``, which defaults to ``1/n`` per axis). The field is then
-    standardized and mapped to ``clip(volume_fraction + contrast * z, 0, 1)`` so
-    it has the requested mean volume fraction with smooth blobs of the chosen
-    size -- and no sharp interfaces, which the phase-field regularization then
-    sharpens on its own during the optimization (no filter is applied there).
+    standardized to ``z`` and mapped to
+    ``clip(volume_fraction + contrast * z, 0, 1)``, so it has (up to the
+    clipping) the requested mean volume fraction with smooth blobs of the
+    chosen size and no sharp interfaces; the phase-field regularization
+    sharpens them during the optimization (no filter is applied there). The
+    filter multiplies the DFT of the noise by
+    ``Π_α exp(-2π² σ_α² f_α²)``, ``σ_α = length / h_α`` (in pixels) and
+    ``f_α`` the frequency in cycles per pixel.
 
     Choosing ``length`` -- the initial blob size must be **larger** than the
     phase-field interface width the regularization will impose. In the
@@ -244,6 +327,19 @@ def initial_density(shape, kind="uniform", volume_fraction=0.5, seed=0,
     defaults to one grid spacing, ``eta = h``), so pick ``length ~= 2..4 *
     eta`` -- the regularization then *sharpens the blob boundaries* rather
     than dissolving the blobs.
+
+    Returns
+    -------
+    np.ndarray
+        Float64 density with shape ``shape``, or ``nb_subdomain_grid_pts``
+        when the subdomain is given.
+
+    Raises
+    ------
+    ValueError
+        If only one of ``subdomain_locations``/``nb_subdomain_grid_pts`` is
+        given, if ``kind='filtered_random'`` has no ``length``, or for an
+        unknown ``kind``.
     """
     if (subdomain_locations is None) != (nb_subdomain_grid_pts is None):
         raise ValueError("pass both subdomain_locations and "
@@ -316,10 +412,19 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
                            cg_stall_rel=1e-2, cg_stall_shrink=0.3,
                            ):
     """Minimize ``problem`` from ``rho0`` with NuMPI's MPI-distributed,
-    box-constrained L-BFGS. Returns ``(rho_opt, info)``.
+    box-constrained (projected) L-BFGS; see the module docstring for the
+    algorithm.
 
     Parameters
     ----------
+    problem : object
+        Provides ``objective_and_gradient(rho) -> (f, g)``, a ``last`` dict of
+        diagnostics, and (for the adaptive tolerance) an ``h`` homogenization
+        and an ``inner_tolerance`` attribute.
+    rho0 : array_like
+        Initial density, shape :attr:`Homogenization.nb_pixels`.
+    maxiter : int, optional
+        Maximum number of outer iterations (default 200).
     gtol : float, optional
         Convergence tolerance on the infinity norm of the box-projected
         gradient, measured on the *mesh-invariant* volume-fraction derivative
@@ -331,12 +436,26 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         The communicator over which the density is distributed (the *same*
         decomposition as the muGrid fields, typically ``MPI.COMM_WORLD``).
         ``None`` runs serially. Density stays in ``bounds`` by projection.
+    ftol : float, optional
+        Stop when ``|f_new - f| < ftol · max(1, |f_new|, |f|)``; 0 (default)
+        disables the test.
+    xtol : float, optional
+        Stop when ``max_i |ρ_new,i - ρ_i| < xtol`` (global infinity norm of
+        the step); 0 (default) disables the test.
+    bounds : tuple of float, optional
+        Box ``(lo, hi)`` of the density (default ``(0.0, 1.0)``).
+    maxcor : int, optional
+        Number of stored L-BFGS curvature pairs (default 10).
+    callback : callable, optional
+        ``callback(it, rho, problem.last)`` after each accepted iterate, with
+        ``it`` the 1-based count of accepted iterates; returning ``True`` is
+        passed on to NuMPI's callback hook.
     cg_tol_start : float, optional
         Enable *adaptive* inner CG tolerance: the forward/adjoint solves start
         at this (coarse) relative tolerance and tighten as the outer projected
         gradient shrinks (an Eisenstat--Walker forcing term; see
-        :class:`AdaptiveInnerTolerance`). ``None`` (default) keeps the fixed
-        ``Homogenization.cg_tol`` used today.
+        :class:`AdaptiveInnerTolerance`). ``None`` (default) uses the fixed
+        ``Homogenization.cg_tol`` throughout.
     cg_tol_min : float, optional
         Floor for the adaptive tolerance; defaults to the homogenization's
         ``cg_tol``. Must be small enough that the final gradient error is below
@@ -352,6 +471,17 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         (default 0.01) over an outer iterate, the tolerance is forced down by
         ``cg_stall_shrink`` (default 0.3) toward ``cg_tol_min``, so a
         noise-limited plateau cannot stall the run.
+
+    Returns
+    -------
+    rho_opt : np.ndarray
+        Final density, same shape as ``rho0``.
+    info : dict
+        ``success``, ``message``, ``nit`` (outer iterations), ``objective``,
+        ``max_grad`` (final ``‖g_free‖_∞`` in ``ĝ`` units), ``history`` (the
+        objective of every accepted iterate) and ``cg_rtol_history`` (the
+        :attr:`AdaptiveInnerTolerance.history` list, or ``None`` with a fixed
+        tolerance).
     """
     from NuMPI.Optimization import l_bfgs_bounded
 
@@ -406,8 +536,9 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
                           cg_tol_min=1e-10, hv_rtol=1e-3, callback=None,
                           disp=False):
     """Minimize ``problem`` from ``rho0`` with NuMPI's MPI-distributed,
-    bound-constrained **trust-region Newton-CG** (``tr_newton_bounded``).
-    Returns ``(rho_opt, info)``.
+    bound-constrained **trust-region Newton-CG** (``tr_newton_bounded``); see
+    the module docstring for the Steihaug--Toint subproblem solve, the ratio
+    test and the radius update.
 
     Requires a problem constructed with ``hessian=True`` (the per-load-case
     state caching and second-order-adjoint Hessian-vector product).
@@ -419,40 +550,79 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
     reduction ``pred``, and the driver enforces the inexact-trust-region
     condition ``|f_err| <= eta_f * pred`` through two hooks wired here:
 
-    * ``fun_error``: the adjoint-weighted residual ``sum_G |lambda^T r|``
-      (``problem.last['corrections']``) -- a computable first-order bound on
-      the objective evaluation error, available for free;
-    * ``request_accuracy(target)``: tightens the state-solve relative
-      tolerance using the second-order error relation of the consistent
-      objective (``f_err ~ C rtol^2``, so ``rtol *= sqrt(target/err)``),
-      floored at ``cg_tol_min``.
+    * ``fun_error``: ``e = Σ_Γ |v_Γᵀ r_Γ|``, the adjoint-weighted residuals of
+      the forward solves (``problem.last['corrections']``) -- a computable
+      first-order estimate of the objective evaluation error that the
+      consistent (Lagrangian) objective already computes;
+    * ``request_accuracy(target)``: with the consistent objective the error
+      is second order, ``f_err ≈ C rtol²``, so the state-solve tolerance is
+      set to ``rtol ← max(cg_tol_min, min(rtol, ½ rtol √(target / e)))``
+      (``rtol ← max(cg_tol_min, rtol / 10)`` if ``e`` or ``target`` is 0).
+      The factor ½ is a safety margin.
 
     Parameters
     ----------
+    problem, rho0 : see :func:`optimize_bounded_lbfgs`
+        ``problem`` must additionally provide ``hessian`` (true),
+        ``ensure_state(rho)``, ``hessian_vector_product(v, rtol)`` and
+        ``last_hv_cg_iters``.
+    maxiter : int, optional
+        Maximum number of outer iterations, counting rejected trial steps
+        (default 200).
     gtol : float, optional
         Convergence tolerance on the box-projected gradient, in the same
         mesh-invariant units as :func:`optimize_bounded_lbfgs` (the
-        volume-fraction derivative ``ĝ = (V/V_e) ∂f/∂ρ``).
+        volume-fraction derivative ``ĝ = (V/V_e) ∂f/∂ρ``; default 2.5).
     comm : mpi4py.MPI.Comm, optional
         Communicator of the domain decomposition (as for
         :func:`optimize_bounded_lbfgs`).
+    bounds : tuple of float, optional
+        Box ``(lo, hi)`` of the density (default ``(0.0, 1.0)``).
     delta0, delta_max : float, optional
-        Initial/maximum trust-region radius in RMS-per-pixel density units
-        (0.05 / 0.5 by default: typical density change per pixel).
+        Initial/maximum trust-region radius in RMS-per-pixel density units:
+        the Euclidean radius is ``Δ = delta · √N`` with ``N`` the global
+        number of design variables (defaults 0.05 / 0.5).
     eta : float, optional
-        Step acceptance threshold on ``rho = ared/pred``.
+        Step acceptance threshold on the ratio ``r = ared/pred``
+        (default 0.1).
     eta_f : float, optional
-        Evaluation-error budget as a fraction of ``pred``.
+        Evaluation-error budget as a fraction of ``pred``, i.e. the driver
+        requests ``|f_err| ≤ eta_f · pred`` (default 0.25).
     cg_tol_start : float, optional
         Initial state-solve relative tolerance (default: the
         homogenization's fixed ``cg_tol``). The accuracy control tightens it
         as needed -- start coarse.
     cg_tol_min : float, optional
-        Floor for the state-solve tolerance.
+        Floor for the state-solve tolerance (default 1e-10), raised to the
+        precision floor of the problem's dtype (see
+        :func:`muTopOpt.precision.cg_rtol_floor`).
     hv_rtol : float, optional
         Relative tolerance of the two extra solves in each Hessian-vector
         product. May be loose (default 1e-3): the Hessian only shapes the
-        trust-region model, which tolerates bounded inexactness.
+        trust-region model, and the method's convergence theory requires
+        only a bounded model Hessian.
+    callback : callable, optional
+        ``callback(it, rho, problem.last)`` after each accepted iterate.
+    disp : bool, optional
+        Let NuMPI print its per-iteration table (default False).
+
+    Returns
+    -------
+    rho_opt : np.ndarray
+        Final density, same shape as ``rho0``.
+    info : dict
+        ``success``, ``message``, ``nit`` (iterations including rejected
+        steps), ``objective``, ``max_grad`` (in ``ĝ`` units), ``history``
+        (objective of every accepted iterate), ``nb_hessp``,
+        ``delta_history``/``rho_history`` (RMS radius and ratio ``r`` per
+        iteration) and ``final_cg_rtol``.
+
+    Raises
+    ------
+    ImportError
+        If the installed NuMPI lacks ``tr_newton_bounded``.
+    ValueError
+        If ``problem`` was not built with Hessian support.
     """
     try:
         from NuMPI.Optimization import tr_newton_bounded
@@ -468,9 +638,9 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
 
     if cg_tol_start is None:
         cg_tol_start = getattr(problem.h, "cg_tol", 1e-8)
-    # The trust-region default (1e-10) is four orders below what float32 can
-    # reach; without this the accuracy control tightens into a region where
-    # only the recursive residual improves.
+    # The default floor (1e-10) is four orders below what float32 can reach;
+    # the clamp keeps the accuracy control from requesting tolerances at
+    # which only the recursive CG residual, not the true one, decreases.
     cg_tol_min = max(cg_tol_min, _problem_rtol_floor(problem))
     cg_tol_start = max(cg_tol_start, cg_tol_min)
     # Reuse AdaptiveInnerTolerance purely as the rtol holder the problem
@@ -561,16 +731,20 @@ def optimize_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=1e-9,
                    bounds=(0.0, 1.0), callback=None, cg_tol_start=None,
                    cg_tol_min=None, cg_forcing_c=1.0, cg_forcing_exp=1.0,
                    cg_stall_rel=1e-2, cg_stall_shrink=0.3):
-    """Minimize ``problem`` from ``rho0`` with L-BFGS-B. Returns
-    ``(rho_opt, info)``.
+    """Minimize ``problem`` from ``rho0`` with SciPy's L-BFGS-B (serial
+    only). Returns ``(rho_opt, info)``.
 
-    ``gtol`` is in the same mesh-invariant units as
+    ``gtol`` (default 2.5) is in the same mesh-invariant units as
     :func:`optimize_bounded_lbfgs` (the volume-fraction derivative
-    ``ĝ = (V/V_e) ∂f/∂ρ``).
+    ``ĝ = (V/V_e) ∂f/∂ρ``) and is passed to SciPy's projected-gradient test;
+    ``ftol`` (default 1e-9) is SciPy's relative-reduction test.
 
     ``cg_tol_start`` (and the other ``cg_*`` arguments) enable the same
     adaptive inner CG tolerance as :func:`optimize_bounded_lbfgs`; see
-    :class:`AdaptiveInnerTolerance`."""
+    :class:`AdaptiveInnerTolerance`.
+
+    ``info`` holds ``success``, ``message``, ``nit``, ``objective``,
+    ``history`` and ``cg_rtol_history`` (no ``max_grad``)."""
     from scipy.optimize import minimize
 
     shape = np.asarray(rho0).shape

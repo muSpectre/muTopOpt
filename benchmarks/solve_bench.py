@@ -7,10 +7,22 @@
 """Benchmark the inner state solve -- the hot loop of a muTopOpt optimization.
 
 An optimization step spends nearly all its time in preconditioned CG solves
-(one per load case for the state, two more per Hessian-vector product), so the
-cost of a single CG iteration is what determines the run time. This driver
-measures exactly that, on a fixed, reproducible design, without the outer
-optimizer in the way.
+(per load case: one forward and one adjoint solve per gradient, and two more
+per Hessian-vector product), so the cost of a single CG iteration is what
+determines the run time. This driver measures exactly that, on a fixed,
+reproducible design, without the outer optimizer in the way.
+
+What is measured: an elasticity :class:`~muTopOpt.Homogenization` on an
+``n^dim`` grid with the filtered random design ``simulate.py`` starts from
+(seed ``--seed``). ``--solves`` state solves ``solve_macro`` are timed,
+cycling through the ``dim(dim+1)/2`` unit macro strains, each cold-started
+from zero and solved to ``--rtol``, after ``--warmup`` untimed solves. Each
+solve is timed with ``time.perf_counter`` around the call plus a device
+synchronization, so the time includes all queued GPU work. Reported are
+iterations per solve, ms per solve and ms per CG iteration (total time
+divided by total CG iterations); ``--csv`` rows also record the host, GPU
+name, muGrid version/commit/dirty flag, rank count and all problem
+parameters.
 
 The headline number is **milliseconds per CG iteration**. It separates the two
 things an optimization can change:
@@ -30,8 +42,10 @@ Usage::
     python benchmarks/solve_bench.py -n 64 --csv results.csv  # append a row
 
 Comparing two builds means running the same command against each and comparing
-`ms/CG-iter`. Run-to-run spread on a laptop GPU is a few percent, so use
-``--repeat`` before believing a small difference.
+`ms/CG-iter`. Run-to-run spread on a laptop GPU is a few percent (TODO:
+benchmark metadata missing: hardware, software environment, code version,
+problem size, command), so use ``--repeat`` before believing a small
+difference.
 """
 
 import argparse

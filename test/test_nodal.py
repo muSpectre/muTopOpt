@@ -1,12 +1,17 @@
 """
 Nodal phase-field variant: the fused scalar FE-Laplacian regularization.
 
-Two levels of validation:
+Validated here:
   1. the extracted FE-Laplacian stencil (applied matrix-free via
      GenericLinearOperator) reproduces the direct BᵀWB action of muGrid's
-     FEMGradientOperator, for P1 and Q1 in 2D and 3D; and
+     FEMGradientOperator, for P1 and Q1 in 2D and 3D;
   2. the full topology-optimization gradient (stress adjoint + nodal FE
-     regularization) matches finite differences.
+     regularization) matches finite differences;
+  3. the nodal design space (design="nodal"): the element-average gather and
+     its transpose scatter, the consistent Galerkin double-well (value and
+     gradient), and the full nodal-design gradient; and
+  4. a target built from the solid's (E, nu) equals the response of the fully
+     dense cell.
 """
 
 import numpy as np
@@ -100,6 +105,8 @@ def _make_nodal_problem(dim, n, element, comm):
 @pytest.mark.parametrize("element", ELEMENTS, ids=ELEMENT_NAMES.get)
 @pytest.mark.parametrize("dim", [2, 3])
 def test_gradient_nodal(dim, element, comm):
+    """FD check of the element-design objective with the nodal FE
+    regularization: g_i ~ (f(rho + d e_i) - f(rho - d e_i)) / (2 d)."""
     n = 6 if dim == 2 else 4
     problem = _make_nodal_problem(dim, n, element, comm)
     rng = np.random.default_rng(1)
@@ -117,6 +124,7 @@ def test_gradient_nodal(dim, element, comm):
         rm[idx] -= d
         fm, _ = problem.objective_and_gradient(rm)
         fd = (fp - fm) / (2 * d)
+        # TODO: rationale for tolerance rtol=2e-4, atol=1e-7?
         assert np.isclose(g[idx], fd, rtol=2e-4, atol=1e-7), (
             f"{ELEMENT_NAMES[element]} {dim}D pixel {idx}: "
             f"analytic {g[idx]:.6e} vs FD {fd:.6e}"
@@ -143,8 +151,8 @@ def _homog(dim, n, element, comm):
 @pytest.mark.parametrize("element", ELEMENTS, ids=ELEMENT_NAMES.get)
 @pytest.mark.parametrize("dim", [2, 3])
 def test_gather_scatter_adjoint(comm, dim, element):
-    """<scatter_mean(s), r> must equal <s, gather_mean(r)> -- the scatter is
-    the exact transpose of the gather (also across the periodic boundary)."""
+    """<scatter_mean(s), r> = <s, gather_mean(r)> -- the scatter is the exact
+    transpose of the gather (also across the periodic boundary)."""
     n = 6 if dim == 2 else 4
     h = _homog(dim, n, element, comm)
     m = NodalElementMap(h)
@@ -219,7 +227,7 @@ def _dwell_reference(rho, element_name, dim, vol_pixel, nsub=48):
 def test_consistent_dwell_value(comm, dim, element):
     """The consistent double-well matches a brute-force integration of the
     interpolant (the Galerkin quadrature is exact; the midpoint reference
-    carries an O(nsub^-2) error)."""
+    carries an O(nsub^-2) error; nsub^-2 = 3.9e-3 at nsub = 16 in 3D)."""
     if comm.size > 1:
         pytest.skip("brute-force reference is serial")
     n = 4
@@ -238,7 +246,8 @@ def test_consistent_dwell_value(comm, dim, element):
 @pytest.mark.parametrize("element", ELEMENTS, ids=ELEMENT_NAMES.get)
 @pytest.mark.parametrize("dim", [2, 3])
 def test_consistent_dwell_gradient(comm, dim, element):
-    """FD check of the consistent double-well gradient."""
+    """FD check of the consistent double-well gradient,
+    g_i ~ (W(rho + d e_i) - W(rho - d e_i)) / (2 d)."""
     n = 4
     h = _homog(dim, n, element, comm)
     dw = ConsistentDoubleWell(NodalElementMap(h))
@@ -291,6 +300,7 @@ def test_nodal_design_gradient_2d(comm, element):
 
 
 def test_nodal_design_gradient_3d(comm):
+    """FD check of the full nodal-design objective gradient in 3D (P1)."""
     n = 4
     problem = _nodal_design_problem(3, n, ELEMENTS[0], comm)  # p1
     rng = np.random.default_rng(1)

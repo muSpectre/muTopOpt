@@ -1,18 +1,18 @@
 """Precision-dependent accuracy limits.
 
-Single precision does not merely make the solve less accurate, it puts a hard
-floor under the inner CG tolerance: float32 eps is 1.19e-7, so the *true*
-residual ``b - Kx`` stagnates around 1e-6 relative even while the recursively
-updated CG residual keeps shrinking below it. A tolerance under that floor
-cannot be met by arithmetic, so the solve runs to ``cg_maxiter`` and is
-salvaged by the stagnation guard -- slow, and with a worse iterate than a
-tolerance the solve could actually reach.
+Single precision puts a hard floor under the inner CG tolerance: float32
+machine epsilon is 1.19e-7, so the *true* residual ``r = b − K u`` stagnates
+around 1e-6 relative to ``‖b‖`` even while the recursively updated CG residual
+keeps shrinking below it. A tolerance under that floor cannot be met in that
+arithmetic; the solve then runs to ``cg_maxiter`` and is salvaged by the
+stagnation guard of :meth:`muTopOpt.homogenization.Homogenization.solve_rhs`
+-- slower, and with a worse iterate than a reachable tolerance gives.
 
-The floor used to be spelled out in ``simulate.py`` alone, which is how it
-came to be applied on three of that driver's five code paths, on none of
-``simulate_conduction.py``'s, and on neither library default (``cg_tol=1e-8``
-and ``cg_tol_min=1e-10``, both unreachable in float32). Everything that
-consumes a tolerance now clamps it here instead.
+The floor is therefore defined once, here, and every consumer of an inner
+tolerance (the :class:`~muTopOpt.homogenization.Homogenization` solves, the
+adaptive tolerance controller, the command-line drivers) clamps against
+:func:`cg_rtol_floor`, so no code path and no library default (``cg_tol``,
+``cg_tol_min``) can request an unreachable tolerance.
 """
 
 import numpy as np

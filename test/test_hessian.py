@@ -42,6 +42,7 @@ def _make_problem(dim, n, comm, design="element", with_reg=True,
                                design=design, hessian=True)
 
 
+# TODO: rationale for tolerance rtol=1e-5 (relative to max|fd|)?
 def _check_hv(problem, rho, v, d=1e-6, rtol=1e-5):
     problem.ensure_state(rho)
     hv = problem.hessian_vector_product(v)
@@ -83,7 +84,7 @@ def test_hv_matches_fd_nodal(comm, with_reg):
 
 
 def test_hv_symmetry(comm):
-    """The reduced Hessian is symmetric: u.(H v) == v.(H u)."""
+    """The reduced Hessian is symmetric: <u, H v> = <v, H u>."""
     n = 6
     problem = _make_problem(2, n, comm)
     rng = np.random.default_rng(3)
@@ -169,7 +170,8 @@ def test_warm_start_guard_survives_bad_guess(comm):
     iterate with different, less ill-conditioned material) must not derail the
     Hv solves: the guard rejects any guess that does not beat a cold start, so
     the product still converges to the correct value in a bounded iteration
-    count. Regression for the high-contrast CG stall."""
+    count. Without the guard, CG started from such a guess on a high-contrast
+    design stalls."""
     n = 6
     problem = _make_problem(2, n, comm)
     rng = np.random.default_rng(7)

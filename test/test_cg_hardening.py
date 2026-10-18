@@ -47,6 +47,7 @@ def test_maxiter_returns_best_iterate(homog):
     # ...and the reported residual is the true b - K u of the returned u.
     Ku = h.vector_field("test_Ku")
     h._hessp(u, Ku)
+    # TODO: rationale for tolerance rtol=1e-5?
     np.testing.assert_allclose(
         h.to_host(res.p), h.to_host(h._rhs.p) - h.to_host(Ku.p),
         rtol=1e-5, atol=1e-12)
@@ -67,7 +68,9 @@ def test_stagnation_cuts_solve_short(homog):
 
 
 def test_converging_solve_unaffected(homog):
-    """A healthy solve converges to its tolerance as before."""
+    """The safeguards do not interfere with a healthy solve: it reaches its
+    requested tolerance: the true relative residual ``|b - K u| / |b|`` of a
+    solve at rtol=1e-8 is below 1e-7."""
     h = homog
     E = np.array([[0.01, 0.005], [0.005, -0.01]])
     u = h.vector_field("test_u")

@@ -42,17 +42,16 @@ which :func:`test_under_resolved_interface_is_pinned` pins down, so that this
 file demonstrably *can* detect trapping rather than passing vacuously.
 
 The bounds below are the worst case over the element x quadrature matrix, with
-roughly an order of magnitude of headroom. They were cross-checked against a
-fully relaxed landscape (each sub-pixel position re-minimized under fixed
-volume and fixed first moment, so nothing depends on the analytic profile being
-the discrete minimizer); relaxed and analytic agree to 2% at ``eta >= h``
-(9.0e-7 vs 9.2e-7), which is what licenses the cheap analytic profile used
-here. That relaxed computation needs a constrained solve per sample and is too
-slow for this suite.
+roughly an order of magnitude of headroom. The analytic profile is a valid
+stand-in for the discrete minimizer: in a fully relaxed landscape (each
+sub-pixel position re-minimized under fixed volume and fixed first moment)
+relaxed and analytic barriers agree to 2% at ``eta >= h`` (9.0e-7 vs 9.2e-7).
+That relaxed computation needs a constrained solve per sample and is too slow
+for this suite.
 
 Note that P1 and Q1 give identical numbers: the fixture varies along one axis
 only, where both elements reduce to the same 1-D stencil. Both are kept in the
-matrix so that a regression in either code path is caught.
+matrix so that a fault in either code path is caught.
 """
 
 import numpy as np
@@ -69,8 +68,8 @@ from muTopOpt.regularization import PhaseFieldRegularization
 # constant there, and dE/E is independent of the interface length).
 NX, NY = 128, 8
 H = 1.0 / NX
-# Slab edges. 48 px to the nearest periodic image, so at eta <= 2h the two
-# interfaces do not interact at double precision.
+# Slab edges, at pixels 48 and 80: the two interfaces are 32 px apart inside
+# the slab and 96 px apart across the periodic boundary.
 X1, X2 = 0.375, 0.625
 # Samples across one pixel of translation. The ripple is resolved to three
 # digits already at 9; 17 and 33 give the same answer.

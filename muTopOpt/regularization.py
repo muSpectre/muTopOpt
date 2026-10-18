@@ -6,45 +6,55 @@
 """
 Phase-field regularization of the density.
 
-Following Bourdin/phase-field topology optimization, the density is regularized
-by penalizing interfacial area with a normalized Modica-Mortola functional,
+Following Bourdin's phase-field approach to topology optimization, the
+density is regularized by penalizing interfacial area with a normalized
+Modica-Mortola functional,
 
-    f_reg(rho) = weight / (c_W * V^((D-1)/D))
-                 * [ eta * ∫ |∇rho|^2 dx  +  (1/eta) * ∫ W(rho) dx ],
+    f_reg(ρ) = w / (c_W V^((d−1)/d)) · [ η ∫ |∇ρ|² dx + (1/η) ∫ W(ρ) dx ],
 
-    c_W = 2 ∫_0^1 sqrt(W(s)) ds,
+    c_W = 2 ∫_0^1 √W(s) ds,
 
-with the double-well ``W(rho) = rho^2 (1 - rho)^2``, for which ``c_W = 1/3``
-(:data:`C_W`), and ``V`` the volume of the unit cell. The gradient penalty
-smooths the design and removes mesh dependence; the double-well (prefactor
-``1/eta``) drives rho toward {0, 1}. As ``eta -> 0`` the bracket
-Gamma-converges to ``c_W`` times the interfacial area (Modica-Mortola), so
-``f_reg / weight`` converges to the interfacial area measured in units of
-``L^(D-1)``, with ``L = V^(1/D)`` the linear size of the cell
-(:func:`perimeter_prefactor`). It is dimensionless, and the optimized design
-does not depend on the absolute size of the cell as long as ``eta / L`` is
-held fixed. ``eta`` **is** the interface width, in the *physical length units
-of the unit cell*: the equilibrium profile is the logistic
-``rho(x) = 1 / (1 + exp(-x / eta))``. It defaults to one grid spacing; choosing
-it much larger than a few grid spacings makes the gradient penalty dominate and
-the design collapses to a constant density. ``weight`` is the penalty per unit
-relative interfacial area, in units of the (normalized) stress objective.
+with the double well ``W(ρ) = ρ² (1 − ρ)²``, for which ``c_W = 1/3``
+(:data:`C_W`), ``V`` the volume of the unit cell and ``w`` the weight. The
+gradient term smooths the design and removes mesh dependence; the double
+well drives ``ρ`` toward {0, 1}.
 
-Two variants of the gradient penalty are provided:
+Normalization. As ``η → 0`` the bracket Γ-converges to ``c_W`` times the
+interfacial area (Modica-Mortola), so ``f_reg / w`` converges to the
+interfacial area measured in units of ``L^(d−1)``, with ``L = V^(1/d)`` the
+linear size of the cell (:func:`perimeter_prefactor`). ``f_reg`` is thus
+dimensionless, and the optimized design does not depend on the absolute size
+of the cell as long as ``η / L`` is held fixed. ``w`` is the penalty per unit
+relative interfacial area, in units of the (normalized) stress objective of
+:mod:`muTopOpt.problem`.
 
-* :class:`PhaseFieldRegularization` (element-wise density) discretizes it with a
-  finite-difference Laplacian on the pixel grid (:class:`muGrid.LaplaceOperator`
-  with the grid spacing of every axis; with a muGrid before 1.5.0, whose
-  Laplacian has a single scale, it assumes cubic voxels and warns otherwise).
+Interface width. ``η`` is the interface width, in the *physical length
+units of the unit cell*: in 1D the minimizer of the bracket across an
+interface satisfies ``η ρ' = √W(ρ)``, whose solution is the logistic profile
+``ρ(x) = 1 / (1 + exp(−x/η))``. It defaults to one grid spacing. Choosing it
+much larger than a few grid spacings makes the gradient penalty dominate and
+the design collapses to a constant density.
+
+Discretizations of the gradient term:
+
+* :class:`PhaseFieldRegularization` (element-wise density) uses the
+  finite-difference Laplacian on the pixel grid,
+  ``∫ |∇ρ|² ≈ h^d ρᵀ(−Δ_h)ρ`` with ``h^d = ∏_α h_α`` the pixel volume
+  (:class:`muGrid.LaplaceOperator` with the spacing of every axis; a muGrid
+  older than 1.5.0 has a single-scale Laplacian, in which case cubic voxels
+  are assumed and a warning is issued if they are not).
 * :class:`NodalPhaseFieldRegularization` (nodal FE density) uses the
-  element-consistent H¹ seminorm ``rhoᵀ L rho`` with the scalar FE-Laplacian
-  ``L = Bᵀ W B`` of the mechanics element (P1 or Q1). ``L`` is a constant
-  ``3^dim`` stencil (recovered once from the element geometry) applied
-  matrix-free by :class:`muGrid.GenericLinearOperator` -- no resident
-  ``dim × nb_quad`` gradient field, so it is memory-lean at scale and handles
-  anisotropic spacing.
+  element-consistent H¹ seminorm ``∫ |∇ρ|² = ρᵀ L ρ`` with the scalar
+  FE-Laplacian ``L = Bᵀ W B`` of the mechanics element (P1 or Q1). ``L`` is a
+  constant ``3^d`` stencil (computed once from the element geometry by
+  :func:`fe_laplacian_stencil`) applied matrix-free by
+  :class:`muGrid.GenericLinearOperator`, so no ``d × nb_quad`` gradient field
+  is resident and anisotropic spacing is handled.
 
-The double-well term is pointwise (lumped nodal) in both.
+The double-well term is a lumped (pointwise) quadrature for the element-wise
+density; for the nodal density it is either the exact integral of the
+interpolant (default, :class:`muTopOpt.nodal.ConsistentDoubleWell`) or the
+lumped quadrature.
 """
 
 import numpy as np
@@ -52,16 +62,16 @@ import numpy as np
 import muGrid
 
 #: Interfacial energy per unit area of the quartic double well
-#: ``W(rho) = rho^2 (1 - rho)^2`` in the Modica-Mortola functional
-#: ``∫ [eta |∇rho|^2 + W(rho) / eta] dx``:
-#: ``c_W = 2 ∫_0^1 sqrt(W(s)) ds = 2 ∫_0^1 s (1 - s) ds = 1/3``.
+#: ``W(ρ) = ρ² (1 − ρ)²`` in the Modica-Mortola functional
+#: ``∫ [η |∇ρ|² + W(ρ)/η] dx``:
+#: ``c_W = 2 ∫_0^1 √W(s) ds = 2 ∫_0^1 s (1 − s) ds = 1/3``.
 C_W = 1.0 / 3.0
 
 
 def perimeter_prefactor(homogenization):
-    """``1 / (c_W V^((D-1)/D))``: the factor that turns the raw Modica-Mortola
-    functional into the interfacial area in units of ``L^(D-1)``, with ``V``
-    the cell volume (``homogenization.domain_volume``) and ``L = V^(1/D)`` its
+    """``1 / (c_W V^((d−1)/d))``: the factor that turns the raw Modica-Mortola
+    functional into the interfacial area in units of ``L^(d−1)``, with ``V``
+    the cell volume (``homogenization.domain_volume``) and ``L = V^(1/d)`` its
     linear size."""
     dim = homogenization.dim
     V = homogenization.domain_volume
@@ -82,6 +92,29 @@ def _laplace_takes_grid_spacing():
 
 class PhaseFieldRegularization:
     def __init__(self, homogenization, eta=None, weight=1.0):
+        """Phase-field regularization of an element-wise (per-pixel) density.
+
+        Evaluates the normalized Modica-Mortola functional of the module
+        docstring with a finite-difference Laplacian for the gradient term
+        and a lumped double well.
+
+        Parameters
+        ----------
+        homogenization : Homogenization
+            Provides the grid, its spacing, the cell volume, the
+            communicator and the field collection.
+        eta : float, optional
+            Interface width ``η`` in the length units of the cell (default:
+            ``homogenization.grid_spacing[0]``).
+        weight : float, optional
+            Penalty ``w`` per unit relative interfacial area (default 1).
+
+        Warns
+        -----
+        RuntimeWarning
+            If muGrid's ``LaplaceOperator`` has no per-axis spacing (muGrid
+            older than 1.5.0) and the voxels are not cubic.
+        """
         self.h = homogenization
         h0 = self.h.grid_spacing[0]
         # eta IS the interface width (Modica-Mortola normalization); it
@@ -94,9 +127,10 @@ class PhaseFieldRegularization:
         # interfacial area.
         self.prefactor = perimeter_prefactor(self.h)
 
-        # -Δ (positive definite) as a finite-difference stencil, with the
-        # grid spacing of every axis: muGrid's LaplaceOperator takes it from
-        # 1.5.0 on; before, it had one scale for all axes.
+        # -Δ (positive semi-definite on the periodic grid) as a
+        # finite-difference stencil with the grid spacing of every axis.
+        # muGrid's LaplaceOperator accepts per-axis spacing from 1.5.0 on;
+        # older versions take a single scale for all axes.
         grid_spacing = [float(h) for h in self.h.grid_spacing]
         if _laplace_takes_grid_spacing():
             self.laplace = muGrid.LaplaceOperator(
@@ -120,11 +154,16 @@ class PhaseFieldRegularization:
 
     @property
     def scale(self):
-        """``weight / (c_W V^((D-1)/D))``, applied to the raw functional."""
+        """``w / (c_W V^((d−1)/d))``, applied to the raw functional."""
         return self.weight * self.prefactor
 
     def value_and_gradient(self, rho):
-        """Return (f_reg, df_reg/drho) for an element-wise density array."""
+        """Return ``(f_reg, ∂f_reg/∂ρ)`` for an element-wise density array.
+
+        The value is MPI-reduced; the gradient is the local slice,
+        ``w/(c_W V^((d−1)/d)) · h^d [2η (−Δ_h ρ) + W'(ρ)/η]`` with
+        ``W'(ρ) = 2ρ(1 − ρ)(1 − 2ρ)``.
+        """
         rho = np.asarray(rho)
         self._rho.p[...] = self.h.to_device(rho)
         self.h.engine.communicate_ghosts(self._rho)
@@ -152,11 +191,11 @@ class PhaseFieldRegularization:
     def hessian_vector_product(self, rho, v):
         """Return ``H_reg v`` for a density direction ``v`` (exact).
 
-        The gradient-penalty Hessian is the (constant, linear) Laplacian
-        operator; the double-well Hessian is the pointwise diagonal
-        ``W''(rho) = 2 (1 - 6 rho + 6 rho^2)`` -- note ``W''(1/2) < 0``: the
-        regularization Hessian is genuinely indefinite in the interfacial
-        region."""
+        The gradient-penalty Hessian is the constant operator
+        ``2η h^d (−Δ_h)``; the double-well Hessian is the pointwise diagonal
+        ``h^d W''(ρ)/η`` with ``W''(ρ) = 2 (1 − 6ρ + 6ρ²)`` (both times the
+        normalization :attr:`scale`). Since ``W''(1/2) < 0``, the
+        regularization Hessian is indefinite in the interfacial region."""
         rho = np.asarray(rho)
         v = np.asarray(v)
         self._rho.p[...] = self.h.to_device(v)
@@ -174,8 +213,8 @@ class PhaseFieldRegularization:
 
 def fe_laplacian_stencil(dim, grid_spacing, element):
     r"""Constant-coefficient stencil of the scalar FE-Laplacian
-    ``L = Bᵀ W B`` (``∫ ∇φ_i · ∇φ_j``) for the given element (P1 or Q1) on a
-    uniform grid with the given spacing.
+    ``L = Bᵀ W B`` (``L_ij = ∫ ∇φ_i · ∇φ_j``) for the given element (P1 or Q1)
+    on a uniform grid with the given spacing.
 
     On a uniform periodic grid the assembled FE-Laplacian is translation-
     invariant, so it is a single ``3^dim`` stencil (a node couples only to
@@ -187,6 +226,22 @@ def fe_laplacian_stencil(dim, grid_spacing, element):
     ``(offset, stencil)`` are then applied on the full grid by a
     :class:`muGrid.GenericLinearOperator` -- a matrix-free, scalar-in/scalar-out
     convolution (host/GPU/MPI) that never allocates a full-grid quad field.
+
+    Parameters
+    ----------
+    dim : int
+        Spatial dimension (2 or 3).
+    grid_spacing : sequence of float
+        Grid spacing ``h_α`` per axis.
+    element : muGrid.FEMElement
+        ``muGrid.FEMElement.p1`` or ``muGrid.FEMElement.q1``.
+
+    Returns
+    -------
+    offset : list of int
+        ``[-1] * dim``, the stencil offset for ``GenericLinearOperator``.
+    stencil : numpy.ndarray
+        Contiguous array of shape ``(3,) * dim``.
     """
     n = 5  # > stencil width (3); impulses stay in the interior, clear of ghosts
     ghosts = (1,) * dim
@@ -226,29 +281,40 @@ class NodalPhaseFieldRegularization:
 
     Same functional as :class:`PhaseFieldRegularization`,
 
-        f_reg = weight / (c_W V^((D-1)/D))
-                * [ eta * ∫|∇rho|^2 + (1/eta) * ∫ rho^2 (1 - rho)^2 ],
+        f_reg = w / (c_W V^((d−1)/d)) · [ η ∫ |∇ρ|² + (1/η) ∫ ρ² (1 − ρ)² ],
 
-    but the density is a *nodal* finite-element field and the gradient penalty
-    is the element-consistent H¹ seminorm ``eta * rhoᵀ L rho`` with the fused
-    scalar FE-Laplacian ``L = Bᵀ W B`` of the mechanics element (P1 or Q1),
-    rather than an ad-hoc finite-difference Laplacian. ``L`` is applied
-    matrix-free by a :class:`muGrid.GenericLinearOperator` (no resident
-    ``dim × nb_quad`` gradient field -- the memory-lean "fused" form), so the
-    per-iteration memory is two scalar fields regardless of dimension or
-    element. The double-well is a lumped nodal quadrature (pointwise), which
-    needs no shape-function-value interpolation.
+    but the density is a *nodal* finite-element field ``ρ_h`` and the
+    gradient term is the element-consistent H¹ seminorm ``η ρᵀ L ρ`` with the
+    scalar FE-Laplacian ``L = Bᵀ W B`` of the mechanics element (P1 or Q1).
+    ``L`` carries the physical ``∫ ∇φ·∇φ`` scaling, so ``ρᵀ L ρ`` is
+    ``∫ |∇ρ_h|²`` evaluated with the element quadrature, and it uses the
+    *same* element as the stiffness operator (``homogenization.element``), so
+    regularization and mechanics share one discretization. ``L`` is applied
+    matrix-free by a :class:`muGrid.GenericLinearOperator`; no
+    ``d × nb_quad`` gradient field is resident, so the gradient term needs two
+    scalar fields regardless of dimension or element.
 
-    ``L`` already carries the physical ``∫∇φ·∇φ`` scaling, so
-    ``rhoᵀ L rho = ∫|∇rho|^2`` directly. The regularization is consistent with
-    the mechanics discretization: it uses the *same* element as the stiffness
-    operator (``homogenization.element``).
+    The double-well term is, by default, the exact Galerkin integral
+    ``∫ W(ρ_h) dx`` of the interpolant (see
+    :class:`muTopOpt.nodal.ConsistentDoubleWell`); ``dwell='lumped'`` selects
+    the pointwise (lumped nodal) quadrature ``h^d Σ_n W(ρ_n)`` instead.
 
-    The double-well term is, by default, the **fully consistent Galerkin**
-    integral of the interpolant (exact closed form on P1 simplices, exact
-    3-point tensor Gauss quadrature on Q1 elements; see
-    :class:`muTopOpt.nodal.ConsistentDoubleWell`). Pass ``dwell='lumped'``
-    for the previous pointwise (lumped nodal) quadrature.
+    Parameters
+    ----------
+    homogenization : Homogenization
+        Provides the grid, element, cell volume, communicator and fields.
+    eta : float, optional
+        Interface width ``η`` in the length units of the cell (default:
+        ``homogenization.grid_spacing[0]``).
+    weight : float, optional
+        Penalty ``w`` per unit relative interfacial area (default 1).
+    dwell : {"consistent", "lumped"}, optional
+        Quadrature of the double-well term (default ``"consistent"``).
+
+    Raises
+    ------
+    ValueError
+        If ``dwell`` is neither ``"consistent"`` nor ``"lumped"``.
     """
 
     def __init__(self, homogenization, eta=None, weight=1.0,
@@ -285,18 +351,20 @@ class NodalPhaseFieldRegularization:
 
     @property
     def scale(self):
-        """``weight / (c_W V^((D-1)/D))``, applied to the raw functional."""
+        """``w / (c_W V^((d−1)/d))``, applied to the raw functional."""
         return self.weight * self.prefactor
 
     def value_and_gradient(self, rho):
-        """Return (f_reg, df_reg/drho) for a nodal density array."""
+        """Return ``(f_reg, ∂f_reg/∂ρ)`` for a nodal density array (value
+        MPI-reduced, gradient the local nodal slice)."""
         rho = np.asarray(rho)
         self._rho.p[...] = self.h.to_device(rho)
         self.h.engine.communicate_ghosts(self._rho)
         self.laplace.apply(self._rho, self._Lrho)  # L rho
         Lrho = self.h.to_host(self._Lrho.p)
 
-        # eta * rhoᵀ L rho  (L already includes the physical volume weighting).
+        # rhoᵀ L rho = ∫|∇rho|² (L already includes the physical volume
+        # weighting); multiplied by eta below.
         grad_pen = self.h.comm.sum(float(np.sum(rho * Lrho)))
 
         if self._dwell is not None:
@@ -322,13 +390,14 @@ class NodalPhaseFieldRegularization:
     def hessian_vector_product(self, rho, v):
         """Return ``H_reg v`` for a nodal density direction ``v``.
 
-        The gradient-penalty Hessian is the (constant, linear) FE-Laplacian
-        ``2 eta L``; the double-well Hessian uses the *lumped* pointwise
-        diagonal ``W''(rho) = 2 (1 - 6 rho + 6 rho^2)`` even when the
-        value/gradient use the consistent Galerkin quadrature -- an
-        approximate model Hessian is admissible in a trust-region method
-        (only boundedness is required) and the lumped diagonal captures the
-        sign structure (indefinite in the interface) exactly."""
+        The gradient-penalty Hessian is the constant FE-Laplacian ``2η L``;
+        the double-well Hessian uses the *lumped* pointwise diagonal
+        ``h^d W''(ρ)/η`` with ``W''(ρ) = 2 (1 − 6ρ + 6ρ²)`` even when the
+        value and gradient use the consistent quadrature, so the product is
+        exact for ``dwell='lumped'`` and an approximation otherwise. A
+        trust-region method only requires a bounded model Hessian, and the
+        lumped diagonal retains the indefiniteness in the interface
+        (``W''(1/2) < 0``)."""
         rho = np.asarray(rho)
         v = np.asarray(v)
         self._rho.p[...] = self.h.to_device(v)

@@ -5,12 +5,15 @@ Normalization of the phase-field regularization.
 the linear cell size (see :mod:`muTopOpt.regularization`). Two consequences
 are pinned down here:
 
-* a flat slab with the analytic logistic profile carries ``2 * (NY * H) / L``,
-  i.e. two interfaces of length ``NY * H`` on a cell of volume ``NY * H``
-  (the raw Modica-Mortola bracket gives ``c_W = 1/3`` times the length);
-* scaling the cell by ``lambda`` together with ``eta`` leaves ``f_reg`` and
-  the density gradient unchanged, so the optimized design does not depend on
-  the absolute size of the cell.
+* a flat slab with the analytic logistic profile on a unit-length cell
+  (grid spacing ``h = 1/NX``) carries ``2 * (NY * h) / L``, i.e. two
+  interfaces of length ``NY * h`` on a cell of volume ``NY * h`` with
+  ``L = sqrt(V)`` (the raw Modica-Mortola bracket gives ``c_W = 1/3`` times
+  the length);
+* scaling the cell by ``lambda`` together with ``eta``,
+  ``f_reg(lambda x; lambda eta) = f_reg(x; eta)``, leaves ``f_reg`` and the
+  density gradient unchanged, so the optimized design does not depend on the
+  absolute size of the cell.
 """
 
 import numpy as np
@@ -66,11 +69,14 @@ def _slab(scale, eta):
 
 
 def test_c_w_is_interface_energy_of_quartic_well():
+    """c_W = 2 int_0^1 sqrt(W(s)) ds = 2 int_0^1 s (1 - s) ds = 1/3 for
+    W(s) = s^2 (1 - s)^2 (trapezoid rule on 20001 points)."""
     s = np.linspace(0.0, 1.0, 20001)
     assert C_W == pytest.approx(2.0 * np.trapezoid(s * (1.0 - s), s), rel=1e-8)
 
 
 def test_prefactor(comm):
+    """perimeter_prefactor = 1 / (c_W V^((D-1)/D)) = 1 / (c_W V^(1/2)) in 2D."""
     hom = _homogenization(2.0, comm)
     V = hom.domain_volume
     assert perimeter_prefactor(hom) == pytest.approx(1.0 / (C_W * V**0.5))
@@ -78,6 +84,9 @@ def test_prefactor(comm):
 
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_slab_energy_is_relative_interface_length(comm, variant):
+    """f_reg / weight = (interfacial length) / L = 2 (NY h) / sqrt(V) at
+    eta = 1.5 h, to 5%: a coarse check, since a malformed (e.g. non-periodic)
+    profile is off by orders of magnitude."""
     scale = 1.0
     hom = _homogenization(scale, comm)
     eta = 1.5 * scale / NX

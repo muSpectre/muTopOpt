@@ -5,7 +5,29 @@
 #
 """
 FFT-accelerated FE homogenization of steady-state heat conduction (scalar
-diffusion) on a regular grid, for topology optimization.
+diffusion) on a regular periodic grid, for topology optimization.
+
+Mathematical setup
+------------------
+On the periodic cell of volume ``V`` the temperature is split into an affine
+part and a periodic nodal fluctuation ``u``, so the temperature gradient at
+quadrature point ``q`` is ``Ē + (B u)_q`` for a prescribed macro gradient
+``Ē`` (a ``d``-vector). ``B`` is muGrid's ``FEMGradientOperator.apply``
+(nodal scalar -> gradient at the quadrature points of each P1/Q1 pixel) and
+``Bᵀ W`` its ``transpose``, which applies the physical quadrature weights
+``W_q`` (``Σ_q W_q`` over one pixel equals the pixel volume). With the
+per-pixel SIMP conductivity ``κ(ρ)`` broadcast to all quadrature points of a
+pixel, the discrete equilibrium is
+
+    K(ρ) u = -Bᵀ W κ(ρ) Ē,      K(ρ) = Bᵀ W κ(ρ) B,
+
+and the homogenized flux is
+
+    q̄ = (1/V) Σ_q W_q κ_q (Ē + B u)_q.
+
+``K`` is symmetric positive semi-definite for ``κ > 0`` (its null space is
+the constant field), so the forward and adjoint problems are solved by
+preconditioned CG with the same operator.
 
 :class:`HomogenizationConductivity` is the scalar-diffusion sibling of
 :class:`muTopOpt.homogenization.Homogenization`: same muGrid engine, same
@@ -13,17 +35,16 @@ periodic-domain / ghost / CG-solve machinery, but the system matrix ``K`` is
 assembled from muGrid's dimension-templated, physics-agnostic
 ``FEMGradientOperator`` (nodal scalar field -> gradient at quadrature points,
 and its quadrature-weighted transpose) instead of the fused
-``IsotropicStiffnessOperator`` elasticity kernel -- there is no fused
-conductivity operator in muGrid (yet), but none is needed: the heterogeneous
-operator is exactly
+``IsotropicStiffnessOperator`` elasticity kernel. muGrid has no fused
+conductivity operator; the composition
 
     K(rho) u = transpose(kappa(rho) * apply(u))
 
-with a per-quadrature-point (piecewise-constant per pixel) scalar
-conductivity ``kappa``, and ``transpose``'s default weighting already applies
-the physical (volume-scaled) quadrature weights, verified against the
-weighted weak form ``<v, K u> == sum_q w_q <grad v, grad u>_q`` for a random
-heterogeneous ``kappa`` field, including self-adjointness.
+is exactly the FE operator ``Bᵀ W κ B`` above, because ``transpose``'s
+default weighting already applies the physical (volume-scaled) quadrature
+weights, so that ``vᵀ K u = Σ_q W_q κ_q (B v)_q · (B u)_q``. It costs one
+``apply``, one ``transpose`` and two ghost exchanges per product, and is
+symmetric by construction.
 
 Only an isotropic base material is supported (see :class:`SimpConductivity`):
 the *target* conductivity tensor in a topology-optimization objective may
@@ -32,8 +53,8 @@ physical solid/void material itself is isotropic.  Both a plain Green's-
 function (``'green'``) and the Green-Jacobi (``'green-jacobi'``) preconditioner
 are available.  The Jacobi diagonal of the conductivity operator is assembled
 via a ``2**dim``-colour graph-colouring scheme (applying the operator to one
-bitmask colour at a time), which avoids the need for a fused
-``assemble_diagonal`` kernel.
+bitmask colour at a time, see :meth:`HomogenizationConductivity.
+_assemble_diagonal`), so no dedicated diagonal-assembly kernel is needed.
 """
 
 import inspect as _inspect
@@ -62,14 +83,16 @@ class _CGStagnation(Exception):
 
 
 def kappa_from_conductivity(k):
-    """Identity helper kept for symmetry with
-    :func:`muTopOpt.material.lame_from_E_nu` -- the conductivity material has
-    only one parameter, so there is nothing to convert."""
+    """Return ``float(k)``: the counterpart of
+    :func:`muTopOpt.material.lame_from_E_nu` for the conductivity material,
+    which has a single parameter and therefore nothing to convert."""
     return float(k)
 
 
 class SimpConductivity:
-    """Power-law (SIMP) interpolation of an isotropic scalar conductivity.
+    """Power-law (SIMP) interpolation of an isotropic scalar conductivity,
+
+        κ(ρ) = κ_void + ρ^p (κ_solid - κ_void),   κ_void = void_ratio · κ_solid.
 
     Parameters
     ----------
@@ -120,10 +143,48 @@ class HomogenizationConductivity:
             cg_verbose=False,
             dtype=np.float64,
     ):
-        """See :class:`muTopOpt.homogenization.Homogenization` for the shared
-        conventions (grid, MPI, dtype, CG hardening).  Two preconditioners are
-        supported: ``'green-jacobi'`` (default, J-FFT Green-Jacobi) and
-        ``'green'`` (plain reference-stiffness Green operator)."""
+        """Homogenization engine for scalar conduction on a periodic grid.
+
+        See :class:`muTopOpt.homogenization.Homogenization` for the shared
+        conventions (grid, MPI, dtype, CG hardening). Unlike that class there
+        is no ``device`` argument: fields live wherever muGrid's default
+        allocation puts them.
+
+        Parameters
+        ----------
+        nb_grid_pts : sequence of int
+            Global grid ``(N_1, ..., N_d)``, ``d`` in {2, 3}.
+        material : SimpConductivity
+            Density-to-conductivity interpolation.
+        comm : muGrid.Communicator, optional
+            Communicator of the domain decomposition (default: serial).
+        domain_lengths : sequence of float, optional
+            Physical cell edge lengths (default: 1 per axis); grid spacing
+            ``h_α = L_α / N_α``.
+        element : {'q1', 'p1'}, optional
+            Finite element (default ``'q1'``); any value other than
+            ``'q1'`` selects P1.
+        preconditioner : {'green-jacobi', 'green'}, optional
+            ``'green-jacobi'`` (default, J-FFT: Green operator of the mean
+            conductivity combined with the Jacobi diagonal of ``K``) or
+            ``'green'`` (Green operator of the mean conductivity alone).
+        cg_tol : float, optional
+            Default inner relative tolerance; ``None`` gives
+            ``max(1e-8, cg_rtol_floor(dtype))``. An explicit value below the
+            precision floor is raised to it with a ``RuntimeWarning``.
+        cg_maxiter : int, optional
+            Maximum CG iterations per solve (default 2000).
+        cg_verbose : bool, optional
+            Print every CG iteration on rank 0 (default False).
+        dtype : {np.float64, np.float32}, optional
+            Scalar type of all fields and solves (default float64).
+
+        Raises
+        ------
+        ValueError
+            For a grid that is not 2D/3D, an unsupported ``dtype`` or an
+            unknown ``preconditioner``.
+        """
         self.dim = len(nb_grid_pts)
         if self.dim not in (2, 3):
             raise ValueError("nb_grid_pts must be 2- or 3-dimensional")
@@ -158,11 +219,11 @@ class HomogenizationConductivity:
         self.grad = muGrid.FEMGradientOperator(
             self.dim, self.grid_spacing, elem)
         self.nb_quad = self.grad.nb_quad_pts
-        # Physical (volume-scaled) quadrature weights -- muGrid's
-        # FEMGradientOperator.quadrature_weights already bakes in the cell
-        # volume from the grid_spacing given at construction (Wfrac * vol_pixel,
-        # verified empirically: sum(quadrature_weights) == prod(grid_spacing)),
-        # so no extra volume factor is applied anywhere below.
+        # Physical (volume-scaled) quadrature weights W_q: muGrid's
+        # FEMGradientOperator.quadrature_weights already include the pixel
+        # volume from the grid_spacing given at construction
+        # (sum(quadrature_weights) == prod(grid_spacing)), so no extra volume
+        # factor is applied anywhere below.
         self.quad_weights = np.asarray(self.grad.quadrature_weights)
         self.fc.set_nb_sub_pts("quad", self.nb_quad)
 
@@ -192,7 +253,7 @@ class HomogenizationConductivity:
         # muTopOpt.precision.
         self._rtol_floor = cg_rtol_floor(self.dtype)
         self._rtol_clamp_warned = False
-        # Default is dtype-aware: 1e-8 is meaningless in float32, and a
+        # Default is dtype-aware: 1e-8 is below the float32 floor, and a
         # default the caller never chose should not produce a warning.
         # An explicit value that cannot be reached does warn (_clamp_rtol).
         self.cg_tol = (max(1e-8, self._rtol_floor) if cg_tol is None
@@ -270,7 +331,11 @@ class HomogenizationConductivity:
         Nodes coloured the same colour are not coupled by any element, so
         applying ``K`` to the characteristic vector of one colour selects
         exactly the diagonal entries of that colour: ``(K chi_c)[i] = K[i,i]``
-        for every node ``i`` of colour ``c``."""
+        for every node ``i`` of colour ``c``. Colour ``c`` is the per-axis
+        parity of the node index. This requires every ``N_α`` to be even:
+        for odd ``N_α`` the nodes ``0`` and ``N_α - 1`` share a parity and
+        are coupled across the periodic boundary, so their entries then
+        include off-diagonal contributions."""
         import itertools
         # Allocate scratch fields lazily (once) and reuse across calls.
         if self._diag_u is None:
@@ -481,9 +546,11 @@ class HomogenizationConductivity:
     def solve_macro(self, E_macro, x, rtol=None, maxiter=None, residual=None,
                     label=None):
         """Solve the periodic homogenization problem
-        ``K u = -transpose(kappa * E_macro)`` for the fluctuation temperature
-        ``u`` under macro temperature gradient ``E_macro`` (a length-``dim``
-        vector)."""
+        ``K u = -Bᵀ W κ Ē`` (``-transpose(kappa * E_macro)``) for the
+        periodic temperature fluctuation ``u`` under the macro temperature
+        gradient ``Ē = E_macro`` (a length-``dim`` vector), cold-started.
+        Returns ``x`` (holding ``u``); the other arguments are as in
+        :meth:`solve_rhs`."""
         E_arr = np.asarray(E_macro, dtype=float)
         self.macro_rhs_vector(E_arr, self._rhs, scale=-1.0)
         scale = getattr(self, "_mat_scale", 1.0) * max(
@@ -498,9 +565,10 @@ class HomogenizationConductivity:
         return getattr(self, "_mat_scale", 1.0)
 
     def macro_rhs_vector(self, E_macro, out, scale=1.0):
-        """Assemble ``out = scale * transpose(kappa * E_macro)`` for a
-        constant macro gradient vector ``E_macro`` (used to build the
-        homogenization/adjoint right-hand sides)."""
+        """Assemble ``out = scale · Bᵀ W κ E_macro`` (i.e.
+        ``scale * transpose(kappa * E_macro)``) for a constant vector
+        ``E_macro``, used to build the homogenization and adjoint right-hand
+        sides. Returns ``out``."""
         E = self.to_device(np.asarray(E_macro, dtype=float))
         shape = (self.dim,) + (1,) * (self._flux.s.ndim - 1)
         self._flux.s[...] = self.kappa.s * E.reshape(shape)
@@ -511,8 +579,10 @@ class HomogenizationConductivity:
         return out
 
     def homogenized_flux(self, u, E_macro):
-        """Cell-averaged flux ``<q> = (1/V) int kappa (E_macro + grad u) dV``
-        as a length-``dim`` array (MPI-reduced).
+        """Cell-averaged flux
+        ``q̄ = (1/V) Σ_q W_q κ_q (E_macro + B u)_q``, the quadrature of
+        ``(1/V) ∫ κ (E_macro + ∇u) dV``, as a length-``dim`` host array
+        (MPI-reduced).
 
         Sign convention: ``q`` is the *constitutive* flux ``kappa * grad T``
         (no Fourier's-law minus sign), matching the stress analogy
@@ -542,9 +612,9 @@ class HomogenizationConductivity:
             g = sum_q w_q  (forward_macro + grad(forward_disp))_q
                           . (costate_macro + grad(costate_disp))_q
 
-        The material-derivative sensitivity of a SIMP-interpolated
-        conductivity is then ``dkappa/drho * g`` (the caller applies the
-        chain rule) -- there being only one material coefficient here, unlike
+        The sensitivity of ``vᵀ (Bᵀ W κ (Ē + B u))`` with respect to the
+        density of a pixel is then ``dkappa/drho * g`` (the caller applies
+        the chain rule); there is only one material coefficient here, unlike
         elasticity's shear/volumetric split."""
         self.engine.communicate_ghosts(forward_disp)
         self.engine.communicate_ghosts(costate_disp)
@@ -561,19 +631,15 @@ class HomogenizationConductivity:
         return np.einsum("q,q...->...", self.quad_weights, dot)
 
     def homogenized_tangent(self):
-        """Cell-averaged material data ``<A[i,:]> = (1/V) int kappa (E_macro + grad u) dV``
-        as a length-``dim`` array (MPI-reduced).
+        """Effective conductivity tensor of the current density, as a
+        ``(dim, dim)`` host array ``A`` whose row ``i`` is the homogenized
+        flux :meth:`homogenized_flux` for the unit macro gradient
+        ``Ē = e_i``, i.e. ``A[i, j] = q̄_j(e_i) = κ_eff[j, i]``.
 
-        This is just sequesnce of :meth:`homogenized_flux`
-
-        Sign convention: ``q`` is the *constitutive* flux ``kappa * grad T``
-        (no Fourier's-law minus sign), matching the stress analogy
-        ``sigma = C:(E_macro + grad u)`` this module mirrors, so that
-        ``target_flux = kappa_target @ macro_gradient`` (see
-        :mod:`muTopOpt.loadcases_conduction`) is the response you would
-        actually measure.
-
-        target_flux is one column of the target material tangent matrix."""
+        Each of the ``dim`` forward problems is solved with ``rtol=1e-8``
+        (raised to the precision floor in float32), independent of
+        :attr:`cg_tol`. Same sign convention as :meth:`homogenized_flux`.
+        Uses the scratch field ``to_prob_u_homogenization``."""
 
         macro_gradients = np.eye(self.dim)
         _u = self.temperature_field("to_prob_u_homogenization")

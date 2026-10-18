@@ -6,10 +6,27 @@
 """
 muTopOpt -- FFT-accelerated FE topology optimization of mechanical metamaterials.
 
-Element-wise (per-pixel) density formulation with phase-field regularization and
-a stress-matching objective, built on the fused, GPU-capable operators and the
-J-FFT (Green-Jacobi) preconditioner of muGrid. Dimension-agnostic: the same code
-runs 2D and 3D unit cells.
+Designs a periodic unit cell whose effective stiffness matches a target. The
+design variable is a density ``ρ ∈ [0, 1]``, either per element (pixel) or
+per node; the material is a SIMP interpolation of the Lamé parameters, the
+objective a stress misfit over macro-strain load cases plus a Modica-Mortola
+phase-field regularization, and the gradient comes from the discrete adjoint
+method. Forward and adjoint problems are solved with the fused, GPU-capable
+stiffness operator and the J-FFT (Green-Jacobi) preconditioned CG of muGrid.
+Dimension-agnostic: the same code runs 2D and 3D unit cells.
+
+The theory is documented where it is implemented:
+
+* :mod:`muTopOpt.material` -- SIMP interpolation;
+* :mod:`muTopOpt.homogenization` -- the cell problem ``K u = −Bᵀ C:Ē``, the
+  homogenized stress, CG safeguards and GPU memory policy;
+* :mod:`muTopOpt.loadcases` -- macro-strain load cases and isotropic targets;
+* :mod:`muTopOpt.problem` -- the stress-matching objective, its adjoint
+  gradient, the adjoint-corrected Lagrangian and Hessian-vector products;
+* :mod:`muTopOpt.regularization` -- the Modica-Mortola functional;
+* :mod:`muTopOpt.nodal` -- nodal design fields and exact double-well
+  integration;
+* :mod:`muTopOpt.bounds` -- Voigt and Hashin-Shtrikman feasibility bounds.
 
 Typical use::
 

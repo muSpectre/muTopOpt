@@ -13,16 +13,32 @@ Minimize, over the per-pixel density ``rho in [0, 1]``,
 
 subject to thermal equilibrium for each load case Γ (a prescribed macro
 temperature gradient ``Ē^Γ``), solved by the FFT-accelerated FE solver of
-:class:`muTopOpt.conduction.HomogenizationConductivity`. This is the scalar-
-diffusion sibling of :class:`muTopOpt.problem.StressTargetProblem` -- same
-adjoint construction (the operator is self-adjoint, so the adjoint solve
-reuses the forward operator and preconditioner; its right-hand side is
-``-(1/V) transpose(kappa * S^Γ)`` with ``S^Γ = ∂f/∂⟨q^Γ⟩``), same
-Lagrangian-correction trick for the *consistent* objective under a truncated
-inner solve, same :class:`muTopOpt.optimize.AdaptiveInnerTolerance` hook --
-minus the nodal-density and Hessian-vector-product support
-``StressTargetProblem`` also offers (not yet implemented for this physics;
-see :mod:`muTopOpt.conduction`'s module docstring for the scope notes).
+:class:`muTopOpt.conduction.HomogenizationConductivity`. Here ``a_Γ`` is the
+load-case weight and ``⟨q^Γ⟩ = q̄^Γ`` the homogenized flux.
+
+Forward problem (per load case, see :mod:`muTopOpt.conduction`)::
+
+    K(ρ) u_Γ = b_Γ = -Bᵀ W κ(ρ) Ē^Γ,
+    q̄^Γ = (1/V) Σ_q W_q κ_q (Ē^Γ + B u_Γ)_q.
+
+Adjoint. With ``S^Γ = ∂f/∂q̄^Γ = 2 a_Γ (q̄^Γ - q_target^Γ) / ‖q_target^Γ‖²``
+and ``K`` symmetric, the adjoint ``v_Γ`` solves the forward system with the
+forward preconditioner::
+
+    K(ρ) v_Γ = -(1/V) Bᵀ W κ(ρ) S^Γ,
+
+and the gradient with respect to the density ``ρ_e`` of pixel ``e`` is::
+
+    ∂f/∂ρ_e = Σ_Γ κ'(ρ_e) Σ_{q ∈ e} W_q (Ē^Γ + B u_Γ)_q · (S^Γ/V + B v_Γ)_q
+              + ∂f_reg/∂ρ_e.
+
+This is the scalar-diffusion sibling of
+:class:`muTopOpt.problem.StressTargetProblem`, with the same adjoint
+construction, the same Lagrangian correction for the *consistent* objective
+under a truncated inner solve, and the same
+:class:`muTopOpt.optimize.AdaptiveInnerTolerance` hook. It has no
+nodal-density design and no Hessian-vector product, so it is driven by the
+L-BFGS optimizers only.
 """
 
 from dataclasses import dataclass
@@ -33,8 +49,10 @@ from muGrid import linalg
 
 @dataclass
 class FluxLoadCase:
-    """A prescribed macro temperature gradient and the flux it should
-    produce."""
+    """A prescribed macro temperature gradient ``Ē`` (``macro_gradient``,
+    shape ``(dim,)``), the homogenized flux it should produce
+    (``target_flux``, shape ``(dim,)``, must be non-zero because the misfit
+    is normalized by its norm) and the load-case weight ``a``."""
     macro_gradient: np.ndarray  # (dim,)
     target_flux: np.ndarray  # (dim,)
     weight: float = 1.0
@@ -43,14 +61,31 @@ class FluxLoadCase:
 class FluxTargetProblem:
     def __init__(self, homogenization, load_cases, regularization=None,
                  consistent_objective=True):
-        """``consistent_objective=True`` (default) reports the *Lagrangian*
-        ``L = f + Σ_Γ λ_Γᵀ (K u_Γ - b_Γ)`` instead of the raw objective, for
-        the same reason as :class:`muTopOpt.problem.StressTargetProblem`: the
-        adjoint-weighted residual of each (possibly truncated) forward solve
-        cancels the first-order effect of the solve error, so the reported
-        value is second-order accurate in the CG tolerance and consistent
-        with the adjoint gradient. See that class's docstring for the full
-        caveat about comparing values across different inner tolerances."""
+        """Flux-target objective on a conduction homogenization.
+
+        Parameters
+        ----------
+        homogenization : HomogenizationConductivity
+            Forward/adjoint solver; its density is overwritten on every
+            evaluation.
+        load_cases : sequence
+            Objects with ``macro_gradient``, ``target_flux`` and ``weight``
+            (e.g. :class:`FluxLoadCase`, see
+            :func:`muTopOpt.loadcases_conduction.target_load_cases`).
+        regularization : object, optional
+            Provides ``value_and_gradient(rho) -> (f_reg, g_reg)``.
+        consistent_objective : bool, optional
+            If true (default) report the *Lagrangian*
+            ``L = f + Σ_Γ v_Γᵀ (K u_Γ - b_Γ)`` instead of the raw objective,
+            for the same reason as
+            :class:`muTopOpt.problem.StressTargetProblem`: the
+            adjoint-weighted residual of each (possibly truncated) forward
+            solve cancels the first-order effect of the solve error, so the
+            reported value is second-order accurate in the CG tolerance and
+            consistent with the adjoint gradient. See that class's docstring
+            for the caveat about comparing values across different inner
+            tolerances.
+        """
         self.h = homogenization
         self.dim = homogenization.dim
         self.load_cases = [self._as_case(lc) for lc in load_cases]
@@ -81,8 +116,19 @@ class FluxTargetProblem:
         return FluxLoadCase(E, q, float(lc.weight))
 
     def objective_and_gradient(self, rho):
-        """Return (f, df/drho) for a density array of shape
-        :attr:`HomogenizationConductivity.nb_pixels`."""
+        """Return ``(f, df/drho)`` for a density array of shape
+        :attr:`HomogenizationConductivity.nb_pixels`.
+
+        Costs one forward and one adjoint CG solve per load case. Also sets
+        :attr:`last` to a dict with ``objective``, ``fluxes`` (``q̄^Γ`` per
+        load case), ``flux_diff`` (the normalized misfit
+        ``‖q̄ - q_target‖²/‖q_target‖²`` of the *last* load case, unweighted),
+        ``cg_iters`` (forward and adjoint iterations, interleaved),
+        ``corrections`` (the Lagrangian terms ``-v_Γᵀ r_Γ``; empty without
+        the consistent objective) and ``cg_rtol`` (the inner tolerance used,
+        ``None`` for the fixed default). With an adaptive tolerance attached,
+        the box-KKT gradient norm in ``ĝ`` units is passed to its
+        :meth:`~muTopOpt.optimize.AdaptiveInnerTolerance.observe`."""
         rho = np.asarray(rho, dtype=float)
         h = self.h
         V = h.domain_volume
@@ -111,7 +157,7 @@ class FluxTargetProblem:
             flux_diff = float(np.sum(diff**2)) / norm
             f += lc.weight * flux_diff
 
-            # Adjoint: S = df/d<q>; rhs = -(1/V) transpose(kappa * S);
+            # Adjoint: S = df/dq̄; rhs = -(1/V) transpose(kappa * S);
             # solve K adj = rhs.
             S = 2.0 * lc.weight * diff / norm
             h.macro_rhs_vector(S, self._adj_rhs, scale=-1.0 / V)
@@ -121,12 +167,12 @@ class FluxTargetProblem:
             cg_iters.append(h.last_cg_iters)
 
             if self.consistent_objective:
-                # vecdot reduces the interior in double and needs no
-                # temporary; `xp.sum(adj.p * res.p)` built a full-size float32
-                # product array and summed it in float32, which at 512^3 costs
-                # both accuracy and ~dim*N*4 bytes. This value is the reported
-                # objective *and* feeds the trust region's accuracy control,
-                # so its error budget is the tightest in the package.
+                # vecdot reduces the interior in double precision without a
+                # temporary; an elementwise product summed with xp.sum would
+                # allocate a full-size array and accumulate in the field
+                # precision (float32 in single precision). This value enters
+                # the reported objective, so it needs the accuracy of the
+                # objective itself.
                 corr = -h.comm.sum(float(linalg.vecdot(adj, self._res_u)))
                 f += corr
                 corrections.append(corr)

@@ -57,6 +57,8 @@ def test_objective_zero_when_target_is_realized(comm):
 
 
 def test_lbfgs_reduces_objective_2d(comm):
+    """15 bounded L-BFGS iterations on a 16x16 grid lower the objective
+    below its value at the uniform start and keep rho in [0, 1]."""
     n = 16
     material = SimpConductivity(kappa_solid=1.0, penalty=3.0, void_ratio=1e-3)
     homog = HomogenizationConductivity((n, n), material, comm=comm,

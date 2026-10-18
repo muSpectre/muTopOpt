@@ -13,6 +13,12 @@ from muTopOpt.bounds import (
 
 @pytest.mark.parametrize("dim", [2, 3])
 def test_bound_limits_and_ordering(dim):
+    """Limits and ordering of the Hashin-Shtrikman upper bound of a porous
+    solid (void of zero stiffness) at solid volume fraction phi:
+
+        K_HS(1) = K0, G_HS(1) = G0,  K_HS(0) = G_HS(0) = 0,
+        K_HS(phi) <= phi K0 and G_HS(phi) <= phi G0  (Voigt),
+        K_HS, G_HS strictly increasing in phi."""
     K0, G0 = solid_moduli(dim, 1.0, 0.3)
     # phi = 1 recovers the solid, phi = 0 the void
     np.testing.assert_allclose(
@@ -30,6 +36,9 @@ def test_bound_limits_and_ordering(dim):
 
 
 def test_feasibility_inverts_bound():
+    """The minimum volume fractions reported by target_feasibility invert the
+    bound: K_HS(phi_hs_K) = K_target and G_HS(phi_hs_G) = G_target (bisection
+    to well below the asserted rtol=1e-6)."""
     dim = 3
     K0, G0 = solid_moduli(dim, 1.0, 0.3)
     feas = target_feasibility(dim, 0.3, 0.15, 1.0, 0.3)
@@ -57,7 +66,8 @@ def test_auxetic_high_g_target_warns_high_density():
 
 
 def test_target_exceeding_solid_is_unreachable():
-    feas = target_feasibility(3, 1.0, 1.0, 1.0, 0.3)  # K0 = 0.83, G0 = 0.38
+    # Solid with E=1, nu=0.3: K0 = 0.83, G0 = 0.38, both below the target.
+    feas = target_feasibility(3, 1.0, 1.0, 1.0, 0.3)
     assert np.isinf(feas["phi_min"])
     assert len(feas["warnings"]) == 2
     assert all("unreachable" in w for w in feas["warnings"])

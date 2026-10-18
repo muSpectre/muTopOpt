@@ -9,26 +9,30 @@ of freedom per grid node) rather than an element-wise (per-pixel) constant.
 
 Two ingredients live here:
 
-* :class:`NodalElementMap` -- the Galerkin-consistent coupling between the
-  nodal density and the per-element material the fused stiffness operator
-  consumes. The element density is the exact element average of the FE
-  interpolant, ``rho_e = (1/|e|) \\int_e rho(x) dx = sum_c w_c rho_{n(e,c)}``,
-  with weights ``w_c`` computed from the element decomposition (uniform corner
-  weights for Q1; sub-simplex volume weights for P1). Because every nodal
-  degree of freedom influences its ``2^dim`` adjacent elements, this coupling
-  acts as an implicit sensitivity filter -- the property that lets the
-  optimizer merge or dissolve features instead of locking in the initial
-  topology. The adjoint (``scatter``) is the exact transpose of the gather and
-  is MPI-correct: contributions to ghost nodes are folded back onto their
-  owners by muGrid's ghost reduction.
+* :class:`NodalElementMap` -- the coupling between the nodal density and the
+  per-element material the fused stiffness operator consumes. The element
+  density is the exact element average of the FE interpolant,
 
-* :class:`ConsistentDoubleWell` -- the double-well energy
-  ``\\int W(rho) dx``, ``W = rho^2 (1-rho)^2``, of the nodal interpolant,
-  integrated *exactly* (fully consistent Galerkin, not lumped): in closed form
-  on P1 simplices via complete homogeneous symmetric polynomials
-  (``\\int_T rho^k = d! |T| k!/(k+d)! h_k(a)`` for corner values ``a``), and by
-  3-point tensor Gauss quadrature (exact for the degree-4-per-axis integrand)
-  on Q1 elements.
+      ρ_e = (1/|e|) ∫_e ρ_h(x) dx = Σ_c w_c ρ_{n(e,c)},
+
+  with weights ``w_c = (1/|e|) ∫_e N_c dx`` per corner ``c`` (uniform
+  ``2^(−d)`` for Q1; sub-simplex volume weights for P1). Every nodal degree of
+  freedom influences its ``2^d`` adjacent elements, so this map acts as an
+  implicit sensitivity filter -- the gradient with respect to a node
+  averages the element sensitivities around it, which lets the optimizer
+  merge or dissolve features instead of locking in the initial topology. The
+  gradient is obtained with the exact transpose of the gather,
+  ``∂f/∂ρ_n = Σ_{(e,c): n(e,c)=n} w_c ∂f/∂ρ_e``, which is MPI-correct:
+  contributions to ghost nodes are folded back onto their owners by
+  muGrid's ghost reduction (the adjoint of the ghost fill).
+
+* :class:`ConsistentDoubleWell` -- the double-well energy ``∫ W(ρ_h) dx``,
+  ``W = ρ² (1 − ρ)²``, of the nodal interpolant, integrated *exactly*
+  (consistent Galerkin, not lumped). The interpolant is multilinear on a Q1
+  cell and linear on each P1 sub-simplex, so ``W(ρ_h)`` is a polynomial of
+  degree at most 4 per axis and a fixed-order quadrature integrates it
+  without error: the 3-point-per-axis tensor Gauss rule on Q1 cells and a
+  3-point-per-axis Gauss-Jacobi rule on each P1 sub-simplex.
 """
 
 import muGrid
@@ -52,8 +56,26 @@ def _node_offset(n, d):
 
 
 def element_average_weights(element_name, dim):
-    """Exact element-average weights ``w_c = (1/|e|) \\int_e N_c dx`` of the FE
-    interpolant, per binary corner node."""
+    """Exact element-average weights ``w_c = (1/|e|) ∫_e N_c dx`` of the FE
+    interpolant, per binary corner node.
+
+    Parameters
+    ----------
+    element_name : {"q1", "p1"}
+        Element type.
+    dim : int
+        Spatial dimension (2 or 3).
+
+    Returns
+    -------
+    numpy.ndarray
+        ``2^dim`` weights summing to 1.
+
+    Raises
+    ------
+    ValueError
+        For an unknown ``element_name``.
+    """
     nb_nodes = 2 ** dim
     if element_name == "q1":
         # Multilinear shape functions: every corner integrates to |e|/2^dim.
@@ -113,7 +135,7 @@ class NodalElementMap:
 
     # -- gather / scatter -----------------------------------------------------
     def gather_mean(self, rho):
-        """Element averages ``rho_e = sum_c w_c rho_{n(e,c)}`` as a host NumPy
+        """Element averages ``ρ_e = Σ_c w_c ρ_{n(e,c)}`` as a host NumPy
         array shaped like the element grid."""
         views = self.corner_values(rho)
         acc = self.avg_weights[0] * views[0]
@@ -133,29 +155,30 @@ class NodalElementMap:
         return self.h.to_host(self._acc.p).copy()
 
     def scatter_mean(self, s_e):
-        """Adjoint of :meth:`gather_mean` for an element array ``s_e``:
-        ``grad_n = sum_e w_c s_e`` over the adjacent elements."""
+        """Adjoint (transpose) of :meth:`gather_mean` for an element array
+        ``s_e``: ``g_n = Σ_{(e,c): n(e,c)=n} w_c s_e`` over the elements
+        adjacent to node ``n``. Returns a host NumPy nodal array."""
         s = self.h.to_device(np.asarray(s_e, dtype=float))
         return self.scatter([w * s for w in self.avg_weights])
 
 
 class ConsistentDoubleWell:
-    """Exact Galerkin integral of ``W(rho) = rho^2 (1-rho)^2`` of the nodal FE
+    """Exact Galerkin integral of ``W(ρ) = ρ² (1 − ρ)²`` of the nodal FE
     interpolant, with its exact nodal gradient.
 
     ``W`` is quartic, so its cell integral is a fixed combination of the
-    moments ``M_k = int_e rho(x)^k dx`` of the interpolant:
-    ``rho^2 (1-rho)^2 = rho^2 - 2 rho^3 + rho^4``, hence
-    ``int_e W = M2 - 2 M3 + M4``, and the nodal gradient is the same
-    combination of the moment gradients.
+    moments ``M_k = ∫_e ρ_h(x)^k dx`` of the interpolant:
+    ``ρ² (1 − ρ)² = ρ² − 2ρ³ + ρ⁴``, hence ``∫_e W = M_2 − 2 M_3 + M_4``, and
+    the nodal gradient is the same combination of the moment gradients.
 
     muGrid's fused :class:`NodalMomentOperator` computes both in a single
-    pass, exactly for either element (3-point-per-axis tensor Gauss on Q1, the
-    same rule per sub-simplex on P1). Evaluating the quadrature
-    array-at-a-time instead -- the previous implementation here -- materialises
-    the interpolant at every quadrature point of every cell at once, which in
-    3D is a 27-fold copy of the grid plus a temporary per polynomial term, and
-    made this term the dominant memory consumer of a whole optimisation.
+    pass, exactly for either element (3-point-per-axis tensor Gauss on Q1,
+    3-point-per-axis Gauss-Jacobi on each P1 sub-simplex), holding each
+    quadrature-point value only as a temporary. An array-at-a-time evaluation
+    of the same quadrature would materialise the interpolant at every
+    quadrature point of every cell at once -- in 3D a 27-fold copy of the
+    grid plus a temporary per polynomial term, more memory than the
+    mechanics solve itself.
     """
 
     #: Number of moments the operator returns, and the coefficients of W on
@@ -172,8 +195,8 @@ class ConsistentDoubleWell:
                   else muGrid.NodalMomentOperator3D)
         self.op = op_cls(list(self.h.grid_spacing), element)
         # Scratch: the nodal input (ghosts filled per call) and the operator's
-        # two multi-component outputs. Three scalar-field-sized buffers in
-        # total, replacing the transient 27-fold grid copies.
+        # two NB_MOMENTS-component outputs -- 1 + 2 * NB_MOMENTS = 7
+        # scalar-field equivalents, independent of the quadrature order.
         self._rho = self.h.scalar_field("to_dwell_rho")
         self._moments = self.h.fc.real_field(
             "to_dwell_moments", (self.NB_MOMENTS,), dtype=self.h.dtype)
@@ -181,7 +204,7 @@ class ConsistentDoubleWell:
             "to_dwell_moment_grads", (self.NB_MOMENTS,), dtype=self.h.dtype)
 
     def value_and_gradient(self, rho):
-        """Return ``(int W dx, d/drho)`` for a nodal density array; the value
+        """Return ``(∫ W(ρ_h) dx, ∂/∂ρ)`` for a nodal density array; the value
         is MPI-reduced, the gradient is the local nodal slice.
 
         The kernel gives each thread its own node, so it writes the nodal

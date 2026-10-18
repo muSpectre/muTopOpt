@@ -6,10 +6,11 @@ below it. A tolerance under that floor cannot be met: the solve burns
 ``cg_maxiter`` iterations and is rescued by the stagnation guard, returning a
 worse iterate than the reachable tolerance would have.
 
-The floor used to live only in ``simulate.py``, which is how it came to be
-applied on some of that driver's paths, none of ``simulate_conduction.py``'s,
-and neither library default (``cg_tol=1e-8``, ``cg_tol_min=1e-10``). These
-tests pin it at every point that consumes a tolerance.
+The floor is enforced in the library, so it holds for every driver and caller.
+These tests pin it at every point that consumes a tolerance: the
+``Homogenization`` default (``cg_tol=1e-8``), an explicit ``cg_tol``, a
+per-solve ``rtol``, and the adaptive controller's floor (``cg_tol_min``,
+library default ``1e-10``).
 """
 
 import warnings

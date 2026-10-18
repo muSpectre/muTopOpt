@@ -16,9 +16,9 @@ from muTopOpt.restart import (
 
 
 def _harmonic_field(nb_grid_pts):
-    """Smooth periodic test field from a few low harmonics: band-limited well
-    below the Nyquist of an 8-point grid, so trigonometric interpolation is
-    exact on every grid used in the tests."""
+    """Smooth periodic test field from harmonics 1 and 2 only: band-limited
+    below the Nyquist frequency of any grid with at least 5 points per axis,
+    where trigonometric interpolation reproduces it exactly."""
     x = np.meshgrid(
         *[np.arange(n) / n for n in nb_grid_pts], indexing="ij")
     f = 0.5 * np.ones(tuple(nb_grid_pts))
@@ -40,6 +40,8 @@ def test_fourier_resample_band_limited_exact(shape_new):
 
 
 def test_fourier_resample_constant_and_roundtrip_3d():
+    """A constant stays constant, and downsampling an upsampled field
+    returns the original: resample(resample(a, up), a.shape) = a."""
     rng = np.random.default_rng(0)
     # A constant field stays constant on any grid.
     c = np.full((6, 7, 8), 0.42)
@@ -101,7 +103,7 @@ def test_read_final_density(tmp_path, comm, dtype):
 
 
 def test_read_final_density_command_line_fallback(tmp_path, comm):
-    """Files from before the explicit nb_grid_pts/precision attributes: the
+    """Files without the explicit nb_grid_pts/precision attributes: the
     metadata is recovered from the recorded command line."""
     rng = np.random.default_rng(2)
     frames = [rng.random((4, 6, 5)).astype(np.float32)]

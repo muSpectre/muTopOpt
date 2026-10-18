@@ -5,21 +5,52 @@
 # MIT License (see LICENSE)
 #
 """
-Command-line driver for muTopOpt: optimize a density unit cell for a target
-isotropic effective conductivity, in 2D or 3D.
+Command-line driver for muTopOpt heat conduction: optimize the density of a
+periodic unit cell, in 2D or 3D, so that its homogenized conductivity tensor
+matches a target, isotropic (one ``--target-kappa`` value) or anisotropic
+(d*d values, row-major; the default is the anisotropic 2D tensor
+diag(0.4, 0.2), so a 3D run needs ``--target-kappa``). The default grid is
+32 x 32.
 
-By default the density is an *element-wise* finite-element field with the
-phase-field regularization.
+Mathematical setup
+------------------
+The design is a per-pixel density rho in [0, 1] (``--density`` selects only
+the regularization variant; the flux-target problem has no nodal design),
+mapped to a conductivity by SIMP,
+kappa(rho) = kappa_void + rho^p (kappa_solid - kappa_void), with
+kappa_void = ``--void-ratio`` * ``--kappa-solid`` and p = ``--penalty``. Each
+of the d load cases G applies the unit macro temperature gradient E_G = e_G;
+the periodic temperature fluctuation solves the FE equilibrium
+
+    K(rho) u_G = B^T W kappa(rho) B u_G = -B^T W kappa(rho) E_G
+
+(B the FE gradient at the quadrature points, W the quadrature weights) by
+FFT-preconditioned CG, and the homogenized flux
+<q_G> = (1/V) sum_q W_q kappa_q (E_G + B u_G)_q is compared with the target
+flux kappa* E_G:
+
+    f(rho) = sum_G a |<q_G> - kappa* E_G|^2 / |kappa* E_G|^2 + f_reg(rho),
+
+with a = ``--load-weight`` and f_reg the Modica-Mortola phase-field
+regularization with interface width ``--eta`` (default one grid spacing) and
+weight ``--reg-weight``. The gradient comes from the discrete adjoint (one
+extra solve per load case), and the outer optimizer is NuMPI's
+MPI-distributed projected L-BFGS with an adaptive inner CG tolerance (see
+muTopOpt.optimize). The run starts from a filtered random field (``--init``)
+or from the last frame of a previous output file, Fourier-resampled if its
+grid differs from ``-n``.
+
+The density and, per load case, the total temperature field (fluctuation
+plus the affine part E_G . x), its gradient and its flux are written to the
+NetCDF file ``--output`` through muGrid. At the end the effective
+conductivity tensor from the fluxes of the last objective evaluation is
+printed next to the target.
 
 Examples
 --------
     python simulate_conduction.py -n 64 64 --target-kappa 0.5
     python simulate_conduction.py -n 96 96 96 --target-kappa 0.3 --penalty 4.0
-    mpirun -np 4 python simulate_conduction.py -n 128 128 128     # (serial optimizer; see notes)
-
-The solve/sensitivity are FFT-accelerated, J-FFT-preconditioned and (with a GPU
-build of muGrid + ``--device gpu``) run on device. The outer L-BFGS optimizer is
-currently serial.
+    mpirun -np 4 python simulate_conduction.py -n 128 128 128 --target-kappa 0.3
 """
 
 import argparse
@@ -324,7 +355,10 @@ def main():
     bfgs_gtol = (args.bfgs_gtol if args.bfgs_gtol is not None
                  else (25.0 if rtol_floor > 0.0 else 2.5))
 
-    # Adaptive inner CG tolerance is on by default (<= 0 disables it).
+    # Adaptive inner CG tolerance is on by default (<= 0 disables it). The
+    # default floor bfgs_gtol/_KAPPA_EFF uses the gradient-error-per-unit-
+    # rtol bound measured for the elasticity problem (see simulate.py).
+    # TODO: rationale for reusing the elasticity _KAPPA_EFF for conduction?
     _KAPPA_EFF = 1e4
     cg_tol_start = (args.cg_tol_start
                     if args.cg_tol_start and args.cg_tol_start > 0 else None)
@@ -400,7 +434,7 @@ def main():
             result[i] = q / flux_magnitude
         return result
 
-    # The interface width defaults to two grid spacings.
+    # The interface width defaults to one grid spacing (the largest h_α).
     eta = max(homog.grid_spacing) if args.eta is None else args.eta
     Reg = (
         NodalPhaseFieldRegularization
@@ -481,11 +515,10 @@ def main():
     gradient_fields = {}
     flux_fields = {}
     # Every field written on each frame. muGrid opens a new frame per
-    # append_frame() call, so all of these must go into a *single* write() --
-    # one append_frame() per field would scatter density and temperatures
-    # across separate frames, leaving each frame's other variables at their
-    # NetCDF fill value (which is what "the temperatures are empty" looked
-    # like on read-back).
+    # append_frame() call, so all of these must go into a *single* write():
+    # one append_frame() per field would spread density and temperatures
+    # over separate frames, each holding the NetCDF fill value for the
+    # variables it was not written with.
     frame_fields = ["density"]
     frame_iters = []
     _MSG_LEN = 256
@@ -528,8 +561,8 @@ def main():
         fio.write_global_attribute("converged", [0])
         fio.write_global_attribute("optimizer_message", " " * _MSG_LEN)
         # Accepted iterates (the index the histories and `frame_iterations`
-        # share) and the optimizer's raw step count, which for the trust
-        # region also counts rejected trial steps.
+        # share) and the optimizer's raw step count (info["nit"]); the same
+        # attribute pair as simulate.py writes.
         fio.write_global_attribute("nb_iterations", [0])
         fio.write_global_attribute("nb_optimizer_steps", [0])
         fio.write_global_attribute("final_objective", [0.0])
@@ -543,8 +576,9 @@ def main():
 
     # Physical node positions x, for the affine part T_macro = g . x that
     # solve_macro does not include (it returns the periodic fluctuation only).
-    # engine.coords is (dim, *nb_subdomain_grid_pts): integer grid indices in
-    # some muFFT versions, normalized [0, 1) coordinates in others.
+    # engine.coords is (dim, *nb_subdomain_grid_pts); muGrid returns
+    # fractional coordinates in [0, 1) (scaled by domain_lengths here), and
+    # an integer-valued array of grid indices is scaled by grid_spacing.
     _coords = np.asarray(homog.engine.coords)
     _scale = np.asarray(
         homog.grid_spacing if np.issubdtype(_coords.dtype, np.integer)
@@ -679,8 +713,9 @@ def main():
     if args.output is not None:
         # Always include the final iterate as the last frame, labelled with
         # the accepted-iterate index that `write_frame` uses for the
-        # intermediate dumps (the raw step count mixes two counters and makes
-        # the duplicate-check below miss).
+        # intermediate dumps, so that `frame_iterations` holds a single
+        # counter and the duplicate check below recognizes an iterate that
+        # was already dumped.
         final_it = len(hist["objective"])
         if not frame_iters or frame_iters[-1] != final_it:
             write_frame(final_it, rho)

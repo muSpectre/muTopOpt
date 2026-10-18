@@ -54,14 +54,16 @@ def test_uniform_density_recovers_material_stiffness_2d(comm, element, c):
 
 def test_objective_zero_when_target_is_realized(comm):
     """If the target stresses are exactly those produced by the current design,
-    the stress part of the objective is zero and its gradient (stress part) too
+    the objective (no regularization) and its gradient are zero
     — an end-to-end consistency check of objective + adjoint wiring."""
     material = SimpMaterial(1.0, 0.3, penalty=3.0, void_ratio=1e-3)
     homog = Homogenization((12, 12), material, comm=comm, element="q1",
                            cg_tol=1e-12)
     rho = np.full(homog.nb_pixels, 0.7)
 
-    # Targets = the design's own homogenized stresses at the unit strains.
+    # Targets = the stresses of the uniform material C(0.7), which is the
+    # homogenized stiffness of this uniform design: an isotropic tensor with
+    # K = lambda + 2 mu / dim = lambda + mu (2D) and G = mu.
     C = effective_stiffness(homog, rho)
     lam, mu = material.lame(np.array(0.7))
     cases = target_load_cases(
@@ -101,8 +103,9 @@ def test_optimizer_recovers_reachable_effective_stiffness(comm):
     targets = [h.homogenized_stress(h.solve_macro(E, u), E) for E in strains]
     cases = [LoadCase(E, t, 1.0) for E, t in zip(strains, targets)]
 
-    # Same penalty as weight=1e-2 before the 1/(c_W V^((D-1)/D))
-    # normalization of the regularization (unit cell: factor c_W = 1/3).
+    # The regularization is normalized by 1/(c_W V^((D-1)/D)); on the unit
+    # cell (V = 1) weight = 1e-2 * c_W makes the absolute prefactor of the
+    # raw Modica-Mortola functional 1e-2.
     reg = PhaseFieldRegularization(h, weight=1e-2 * C_W)
     problem = StressTargetProblem(h, cases, regularization=reg)
     rho0 = initial_density(h.nb_pixels, kind="random", seed=99,
