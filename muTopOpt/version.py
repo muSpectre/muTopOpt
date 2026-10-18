@@ -6,8 +6,8 @@
 """Provenance of a run: which muTopOpt and which muGrid produced it.
 
 muGrid reports a git-derived version (``1.1.1-5-g493f675d``) because its build
-system stamps one in; muTopOpt's ``__version__`` is a hand-written string that
-does not move between commits, so on its own it identifies nothing. The commit
+system stamps one in; muTopOpt's ``__version__`` comes from the git tag at
+install time and does not move with later commits to an editable checkout. The commit
 is what distinguishes two runs, and muGrid's is what explains a change in
 solver behaviour -- the numerics live there -- so both belong next to every
 result.

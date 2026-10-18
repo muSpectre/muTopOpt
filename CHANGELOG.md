@@ -16,6 +16,12 @@ Style for this changelog (keep to it so entries stay uniform):
 Change log for muTopOpt
 =======================
 
+v1.2.1 (not yet released)
+-------------------------
+
+- BUILD: The package version is taken from the git tag; the 1.2.0 source archive
+  wrongly reported itself as 1.1.0
+
 v1.2.0 (18Oct26)
 ----------------
 

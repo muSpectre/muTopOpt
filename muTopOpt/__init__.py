@@ -58,7 +58,12 @@ the same optimizer drivers and phase-field regularization::
     rho, info = optimize_bounded_lbfgs(problem, initial_density(homog.nb_pixels))
 """
 
-__version__ = "1.1.0"
+try:
+    # Written from the git tag by hatch-vcs when the package is built or installed.
+    from ._version import __version__
+except ImportError:
+    # Plain source checkout that was never installed.
+    __version__ = "unknown"
 
 from .conduction import HomogenizationConductivity, SimpConductivity
 from .conduction_problem import FluxLoadCase, FluxTargetProblem
