@@ -52,14 +52,16 @@ still be anisotropic (see :mod:`muTopOpt.loadcases_conduction`), only the
 physical solid/void material itself is isotropic.  Both a plain Green's-
 function (``'green'``) and the Green-Jacobi (``'green-jacobi'``) preconditioner
 are available.  The Jacobi diagonal of the conductivity operator is assembled
-via a ``2**dim``-colour graph-colouring scheme (applying the operator to one
-bitmask colour at a time, see :meth:`HomogenizationConductivity.
-_assemble_diagonal`), so no dedicated diagonal-assembly kernel is needed.
+in closed form from the element shape-function gradients and the conductivity
+(see :meth:`HomogenizationConductivity._assemble_diagonal`), exactly for every
+grid and subdomain size.
 """
 
 import inspect as _inspect
 
 import warnings
+
+import itertools
 
 import numpy as np
 
@@ -71,6 +73,7 @@ from muGrid.Preconditioners import (
 )
 from muGrid.Solvers import ConvergenceError, conjugate_gradients
 
+from .homogenization import _resolve_device
 from .precision import cg_rtol_floor
 
 _CG_HAS_RESIDUAL = "residual" in _inspect.signature(
@@ -142,13 +145,12 @@ class HomogenizationConductivity:
             cg_maxiter=2000,
             cg_verbose=False,
             dtype=np.float64,
+            device=None,
     ):
         """Homogenization engine for scalar conduction on a periodic grid.
 
         See :class:`muTopOpt.homogenization.Homogenization` for the shared
-        conventions (grid, MPI, dtype, CG hardening). Unlike that class there
-        is no ``device`` argument: fields live wherever muGrid's default
-        allocation puts them.
+        conventions (grid, MPI, dtype, CG hardening).
 
         Parameters
         ----------
@@ -178,6 +180,11 @@ class HomogenizationConductivity:
             Print every CG iteration on rank 0 (default False).
         dtype : {np.float64, np.float32}, optional
             Scalar type of all fields and solves (default float64).
+        device : str or muGrid.Device, optional
+            Where fields live and the solves run, with the conventions of
+            :class:`~muTopOpt.homogenization.Homogenization`: ``None`` or
+            ``"cpu"`` for the host, ``"gpu"`` for this rank's accelerator,
+            ``"gpu:N"`` for a specific one, or a ``muGrid.Device``.
 
         Raises
         ------
@@ -204,10 +211,16 @@ class HomogenizationConductivity:
         ]
         self.domain_volume = float(np.prod(self.domain_lengths))
 
+        self.device = _resolve_device(device, self.comm)
+        if self.device is not None and self.device.is_device:
+            import cupy
+
+            cupy.cuda.Device(self.device.device_id).use()
         ghosts = (1,) * self.dim
         self.engine = muGrid.FFTEngine(
             self.nb_grid_pts, self.comm,
             nb_ghosts_left=ghosts, nb_ghosts_right=ghosts,
+            device=self.device,
         )
         self.fc = self.engine.real_space_collection
 
@@ -276,9 +289,6 @@ class HomogenizationConductivity:
             )
         self.preconditioner_kind = preconditioner
         self._prec = None
-        # Scratch fields for _assemble_diagonal; allocated lazily on first use.
-        self._diag_u = None
-        self._diag_Ku = None
         self._nb_pixels = tuple(self.engine.nb_subdomain_grid_pts)
 
     @property
@@ -325,32 +335,40 @@ class HomogenizationConductivity:
 
     def _assemble_diagonal(self, diag_field):
         """Assemble the diagonal of the conductivity stiffness matrix
-        ``diag(K)`` into ``diag_field`` using a ``2**dim``-colour graph-
-        colouring scheme.
+        ``K = Bᵀ W κ B`` into ``diag_field``, exactly and in closed form.
 
-        Nodes coloured the same colour are not coupled by any element, so
-        applying ``K`` to the characteristic vector of one colour selects
-        exactly the diagonal entries of that colour: ``(K chi_c)[i] = K[i,i]``
-        for every node ``i`` of colour ``c``. Colour ``c`` is the per-axis
-        parity of the node index. This requires every ``N_α`` to be even:
-        for odd ``N_α`` the nodes ``0`` and ``N_α - 1`` share a parity and
-        are coupled across the periodic boundary, so their entries then
-        include off-diagonal contributions."""
-        import itertools
-        # Allocate scratch fields lazily (once) and reuse across calls.
-        if self._diag_u is None:
-            self._diag_u = self.fc.real_field(
-                "to_diag_u", dtype=self.dtype)
-            self._diag_Ku = self.fc.real_field(
-                "to_diag_Ku", dtype=self.dtype)
-        diag_field.set_zero()
+        Node ``i`` is corner ``o ∈ {0,1}^d`` of the element (pixel) ``i − o``,
+        so
+
+        .. math::
+
+            K_{ii} = \\sum_{o} \\sum_q W_q\\, \\kappa_{q,\\,i-o}
+                     \\sum_\\alpha B_{q\\alpha o}^2,
+
+        with ``B`` the shape-function gradients of the element (already
+        divided by the grid spacing). This needs only one left ghost layer of
+        ``κ``, so it is exact for every grid and subdomain size, including odd
+        ones, where a two-colour probing of ``K`` would let the periodic or
+        rank-boundary neighbours of a node share its colour. Cost: one ghost
+        exchange of ``κ`` and ``2^d · nb_quad`` fused multiply-adds per node.
+        """
+        xp = self._xp
+        self.engine.communicate_ghosts(self.kappa)
+        coeff = np.asarray(self.grad.coefficients)  # (d, nb_quad, 1, 2,..,2)
+        # per (quad point, corner): W_q Σ_α B_{qαo}²
+        corner_weight = np.einsum(
+            "q,dq...->q...", self.quad_weights, coeff[:, :, 0] ** 2)
+        kappa = self.kappa.sg  # (nb_quad, *pixels with ghosts)
+        left = tuple(self.fc.nb_ghosts_left)
+        n = self._nb_pixels
+        diag = xp.zeros(n, dtype=self.dtype)
         for offsets in itertools.product(range(2), repeat=self.dim):
-            self._diag_u.set_zero()
-            slices = tuple(slice(o, None, 2) for o in offsets)
-            self._diag_u.p[slices] = self._xp.ones(
-                self._diag_u.p[slices].shape, dtype=self.dtype)
-            self._hessp(self._diag_u, self._diag_Ku)
-            diag_field.p[slices] = self._diag_Ku.p[slices]
+            elements = tuple(
+                slice(gl - o, gl - o + m) for gl, o, m in zip(left, offsets, n))
+            for q in range(self.nb_quad):
+                diag += self.dtype.type(corner_weight[(q,) + offsets]) * \
+                    kappa[(q,) + elements]
+        diag_field.p[...] = diag
 
     def _update_preconditioner(self):
         kappa_ref = self._reference_kappa()

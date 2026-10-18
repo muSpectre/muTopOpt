@@ -143,7 +143,7 @@ def main():
         type=float,
         default=None,
         help="phase-field interface width, in physical length units "
-             "(default: two grid spacings)",
+             "(default: one grid spacing, the largest if they differ)",
     )
     p.add_argument(
         "--reg-weight",
@@ -171,7 +171,8 @@ def main():
         default="filtered_random",
         metavar="KIND_OR_FILE",
         help="initial density field: 'uniform' (constant), 'random' "
-             "(white noise), 'filtered_random' (noise smoothed to a correlation "
+             "(noise lightly smoothed by two box-filter sweeps), "
+             "'filtered_random' (noise smoothed to a correlation "
              "length; least prone to locking the initial topology), or the NetCDF "
              "output of a previous run to restart from its last frame (Fourier-"
              "resampled if the stored grid does not match -n)",
@@ -201,14 +202,17 @@ def main():
         help="convergence tolerance on the projected gradient (L-BFGS), "
              "measured on the mesh-invariant volume-fraction derivative "
              "(V/V_pixel)*df/drho -- the same value means the same physical "
-             "stationarity at every resolution. Default: 2.5",
+             "stationarity at every resolution. Default: 2.5 in double "
+             "precision, 25 in single precision (the float32 solve accuracy "
+             "floor makes a tighter gradient tolerance uncertifiable)",
     )
     p.add_argument(
         "--bfgs-xtol",
         type=float,
         default=0.0,
-        help="L-BFGS convergence tolerance on the step size (relative change "
-             "in the density iterate); 0 disables the criterion",
+        help="L-BFGS convergence tolerance on the step size (maximum absolute "
+             "change of the density between iterates); 0 disables the "
+             "criterion",
     )
     p.add_argument(
         "--bfgs-target_tol",
@@ -275,8 +279,8 @@ def main():
         choices=["green-jacobi", "green"],
         default="green-jacobi",
         help="inner-solve preconditioner: 'green-jacobi' (J-FFT, "
-             "Green operator times a per-node Jacobi diagonal assembled "
-             "via a 2^dim-colour scheme) or 'green' (plain reference-"
+             "Green operator times the per-node Jacobi diagonal of the "
+             "stiffness) or 'green' (plain reference-"
              "conductivity Green operator)",
     )
     p.add_argument(
@@ -302,7 +306,10 @@ def main():
         "--density",
         choices=["element", "nodal"],
         default="element",
-        help="density discretization: 'nodal' or 'element'",
+        help="gradient-penalty discretization of the phase-field "
+             "regularization: 'element' (finite-difference Laplacian on "
+             "the pixel grid) or 'nodal' (FE-consistent Laplacian); the "
+             "design variable is the per-pixel density in both cases",
     )
     p.add_argument(
         "--output",
@@ -398,6 +405,7 @@ def main():
         cg_maxiter=args.cg_maxiter,
         cg_verbose=args.output_cg_iters,
         dtype=dtype,
+        device=args.device,
     )
     # Banner first, before the restart read: a run that dies in setup should
     # still say which build it was. muGrid prints from every rank (its banner
@@ -579,7 +587,7 @@ def main():
     # engine.coords is (dim, *nb_subdomain_grid_pts); muGrid returns
     # fractional coordinates in [0, 1) (scaled by domain_lengths here), and
     # an integer-valued array of grid indices is scaled by grid_spacing.
-    _coords = np.asarray(homog.engine.coords)
+    _coords = homog.to_host(homog.engine.coords)
     _scale = np.asarray(
         homog.grid_spacing if np.issubdtype(_coords.dtype, np.integer)
         else homog.domain_lengths, dtype=float)
@@ -613,12 +621,12 @@ def main():
             # grad(T) = g + grad(T_fluct).
             homog.engine.communicate_ghosts(temperature_fields[k])
             homog.grad.apply(temperature_fields[k], homog._g)
-            g_tot = np.asarray(homog._g.s)
+            g_tot = homog.to_host(homog._g.s)
             g_tot = g_tot + macro_gradients[k].reshape(
                 (dim,) + (1,) * (g_tot.ndim - 1))
             gradient_fields[k].s[...] = homog.to_device(g_tot)
             flux_fields[k].s[...] = homog.to_device(
-                np.asarray(homog.kappa.s) * g_tot)
+                homog.to_host(homog.kappa.s) * g_tot)
 
             # Total temperature = periodic fluctuation + g . x. This makes the
             # stored field non-periodic, so it shows a jump across the cell
@@ -690,9 +698,6 @@ def main():
     )
 
     converged = bool(info["success"])
-
-    homog.set_density(rho)
-    homog_data = homog.homogenized_tangent()
 
     if rank0:
         kappa_eff = effective_conductivity(problem.last["fluxes"])
