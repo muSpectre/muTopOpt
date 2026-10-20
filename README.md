@@ -33,7 +33,7 @@ References:
 
 ## Install
 
-Requires `muGrid` (≥ 1.4.0, with FFT support), `NuMPI`, `muTimer` and
+Requires `muGrid` (≥ 1.5.2, with FFT support), `NuMPI`, `muTimer` and
 `numpy`; these are installed as dependencies. Optional extras: `scipy` (for
 the serial `optimize_lbfgs`), `mpi4py` (MPI runs) and `pytest` (tests). For
 GPU support, `muGrid` must be compiled with CUDA or ROCm/HIP support and you
