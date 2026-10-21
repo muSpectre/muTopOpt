@@ -64,10 +64,10 @@ overrides it. The one case that needs this: a multi-rank run on MI300A whose
 fields on one rank exceed the plain window. Either use more ranks or set
 `MUTOPOPT_MANAGED=1` and accept the slower exchanges.
 
-With plain memory on MI300A, muTopOpt also sets `MUGRID_UNIFIED_MEMORY=0`,
-and on Cray MPICH with `MPICH_GPU_SUPPORT_ENABLED=1` also
-`MUGRID_GPU_AWARE_MPI=1`, unless they are already set. muGrid otherwise takes
-plain MI300A memory for host-readable, which it is not.
+muTopOpt sets nothing for MPI or NetCDF for either kind of memory: muGrid asks
+the MPI library whether it takes device buffers, and the GPU runtime whether
+the host can read each buffer, and stages through the host where it cannot.
+The log and the output file (`gpu_aware_mpi` attribute) say which it found.
 
 ## Usage
 
