@@ -27,6 +27,8 @@ from muTopOpt import (
 )
 from muTopOpt.loadcases import isotropic_stiffness_tensor, target_load_cases
 
+from mpi_helpers import check_fd_gradient, local
+
 ELEMENTS = [muGrid.FEMElement.p1, muGrid.FEMElement.q1]
 ELEMENT_NAMES = {muGrid.FEMElement.p1: "p1", muGrid.FEMElement.q1: "q1"}
 
@@ -110,25 +112,15 @@ def test_gradient_nodal(dim, element, comm):
     n = 6 if dim == 2 else 4
     problem = _make_nodal_problem(dim, n, element, comm)
     rng = np.random.default_rng(1)
-    rho = rng.uniform(0.2, 0.8, (n,) * dim)
+    rho = local(problem.h, rng.uniform(0.2, 0.8, (n,) * dim))
     _, g = problem.objective_and_gradient(rho)
-
-    d = 1e-6
     sample = [tuple([0] * dim), tuple([n - 1] * dim),
               tuple([1] + [2] * (dim - 1)), tuple([n // 2] * dim)]
-    for idx in sample:
-        rp = rho.copy()
-        rp[idx] += d
-        fp, _ = problem.objective_and_gradient(rp)
-        rm = rho.copy()
-        rm[idx] -= d
-        fm, _ = problem.objective_and_gradient(rm)
-        fd = (fp - fm) / (2 * d)
-        # TODO: rationale for tolerance rtol=2e-4, atol=1e-7?
-        assert np.isclose(g[idx], fd, rtol=2e-4, atol=1e-7), (
-            f"{ELEMENT_NAMES[element]} {dim}D pixel {idx}: "
-            f"analytic {g[idx]:.6e} vs FD {fd:.6e}"
-        )
+    # TODO: rationale for tolerance rtol=2e-4, atol=1e-7?
+    check_fd_gradient(
+        problem.h, lambda r: problem.objective_and_gradient(r)[0], rho, g,
+        sample, rtol=2e-4, atol=1e-7,
+        label=f"{ELEMENT_NAMES[element]} {dim}D pixel")
 
 
 # ---------------------------------------------------------------------------
@@ -252,19 +244,12 @@ def test_consistent_dwell_gradient(comm, dim, element):
     h = _homog(dim, n, element, comm)
     dw = ConsistentDoubleWell(NodalElementMap(h))
     rng = np.random.default_rng(4)
-    rho = rng.uniform(0.2, 0.8, h.nb_pixels)
+    rho = local(h, rng.uniform(0.2, 0.8, (n,) * dim))
     _, g = dw.value_and_gradient(rho)
-    d = 1e-6
-    for idx in [(0,) * dim, (1,) * dim, tuple(range(1, dim + 1))]:
-        rp = rho.copy()
-        rp[idx] += d
-        fp, _ = dw.value_and_gradient(rp)
-        rm = rho.copy()
-        rm[idx] -= d
-        fm, _ = dw.value_and_gradient(rm)
-        fd = (fp - fm) / (2 * d)
-        assert np.isclose(g[idx], fd, rtol=1e-5, atol=1e-10), (
-            f"node {idx}: analytic {g[idx]:.6e} vs FD {fd:.6e}")
+    check_fd_gradient(
+        h, lambda r: dw.value_and_gradient(r)[0], rho, g,
+        [(0,) * dim, (1,) * dim, tuple(range(1, dim + 1))],
+        rtol=1e-5, atol=1e-10, label="node")
 
 
 def _nodal_design_problem(dim, n, element, comm):
@@ -284,19 +269,12 @@ def test_nodal_design_gradient_2d(comm, element):
     n = 6
     problem = _nodal_design_problem(2, n, element, comm)
     rng = np.random.default_rng(0)
-    rho = rng.uniform(0.2, 0.8, (n, n))
+    rho = local(problem.h, rng.uniform(0.2, 0.8, (n, n)))
     _, g = problem.objective_and_gradient(rho)
-    d = 1e-6
-    for idx in [(0, 0), (0, 3), (3, 0), (2, 2), (n - 1, n - 1)]:
-        rp = rho.copy()
-        rp[idx] += d
-        fp, _ = problem.objective_and_gradient(rp)
-        rm = rho.copy()
-        rm[idx] -= d
-        fm, _ = problem.objective_and_gradient(rm)
-        fd = (fp - fm) / (2 * d)
-        assert np.isclose(g[idx], fd, rtol=2e-4, atol=1e-7), (
-            f"node {idx}: analytic {g[idx]:.6e} vs FD {fd:.6e}")
+    check_fd_gradient(
+        problem.h, lambda r: problem.objective_and_gradient(r)[0], rho, g,
+        [(0, 0), (0, 3), (3, 0), (2, 2), (n - 1, n - 1)],
+        rtol=2e-4, atol=1e-7, label="node")
 
 
 def test_nodal_design_gradient_3d(comm):
@@ -304,19 +282,12 @@ def test_nodal_design_gradient_3d(comm):
     n = 4
     problem = _nodal_design_problem(3, n, ELEMENTS[0], comm)  # p1
     rng = np.random.default_rng(1)
-    rho = rng.uniform(0.2, 0.8, (n, n, n))
+    rho = local(problem.h, rng.uniform(0.2, 0.8, (n, n, n)))
     _, g = problem.objective_and_gradient(rho)
-    d = 1e-6
-    for idx in [(0, 0, 0), (1, 2, 3), (n - 1, n - 1, n - 1)]:
-        rp = rho.copy()
-        rp[idx] += d
-        fp, _ = problem.objective_and_gradient(rp)
-        rm = rho.copy()
-        rm[idx] -= d
-        fm, _ = problem.objective_and_gradient(rm)
-        fd = (fp - fm) / (2 * d)
-        assert np.isclose(g[idx], fd, rtol=2e-4, atol=1e-7), (
-            f"node {idx}: analytic {g[idx]:.6e} vs FD {fd:.6e}")
+    check_fd_gradient(
+        problem.h, lambda r: problem.objective_and_gradient(r)[0], rho, g,
+        [(0, 0, 0), (1, 2, 3), (n - 1, n - 1, n - 1)],
+        rtol=2e-4, atol=1e-7, label="node")
 
 
 @pytest.mark.parametrize("dim", [2, 3])

@@ -30,6 +30,8 @@ from muTopOpt.regularization import (
     perimeter_prefactor,
 )
 
+from mpi_helpers import assert_allclose_on_all_ranks, local
+
 NX, NY = 64, 8
 X1, X2 = 0.375, 0.625
 
@@ -90,7 +92,8 @@ def test_slab_energy_is_relative_interface_length(comm, variant):
     scale = 1.0
     hom = _homogenization(scale, comm)
     eta = 1.5 * scale / NX
-    f, _ = _regularization(hom, variant, eta).value_and_gradient(_slab(scale, eta))
+    f, _ = _regularization(hom, variant, eta).value_and_gradient(
+            local(hom, _slab(scale, eta)))
     L = hom.domain_volume**0.5
     assert f == pytest.approx(2.0 * (NY * scale / NX) / L, rel=0.05)
 
@@ -104,7 +107,8 @@ def test_invariant_under_cell_rescaling(comm, variant):
         hom = _homogenization(scale, comm)
         eta = 1.5 * scale / NX
         results.append(
-            _regularization(hom, variant, eta).value_and_gradient(_slab(scale, eta)))
+            _regularization(hom, variant, eta).value_and_gradient(
+            local(hom, _slab(scale, eta))))
     (f1, g1), (f2, g2) = results
     assert f1 == pytest.approx(f2, rel=1e-10)
-    np.testing.assert_allclose(g1, g2, rtol=1e-10, atol=1e-14)
+    assert_allclose_on_all_ranks(comm, g1, g2, rtol=1e-10, atol=1e-14)

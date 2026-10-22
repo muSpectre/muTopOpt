@@ -23,6 +23,8 @@ from muTopOpt.loadcases import (
     unit_strains,
 )
 from muTopOpt.optimize import initial_density, optimize_bounded_lbfgs
+
+from mpi_helpers import local, optimizer_comm
 from muTopOpt.regularization import C_W
 
 
@@ -94,7 +96,7 @@ def test_optimizer_recovers_reachable_effective_stiffness(comm):
             r = (r + np.roll(r, 1, ax) + np.roll(r, -1, ax)) / 3
     r = (r - r.min()) / (r.max() - r.min())
     ref = 0.2 + 0.6 * r
-    C_ref = effective_stiffness(h, ref)
+    C_ref = effective_stiffness(h, local(h, ref))
 
     # Targets = the reference design's homogenized stresses at the unit strains.
     m = 0.01
@@ -108,13 +110,16 @@ def test_optimizer_recovers_reachable_effective_stiffness(comm):
     # raw Modica-Mortola functional 1e-2.
     reg = PhaseFieldRegularization(h, weight=1e-2 * C_W)
     problem = StressTargetProblem(h, cases, regularization=reg)
-    rho0 = initial_density(h.nb_pixels, kind="random", seed=99,
-                           volume_fraction=0.5)
+    rho0 = initial_density(h.nb_grid_pts, kind="random", seed=99,
+                           volume_fraction=0.5,
+                           subdomain_locations=h.engine.subdomain_locations,
+                           nb_subdomain_grid_pts=h.nb_pixels)
     f0, _ = problem.objective_and_gradient(rho0)
     # Reachable target: drive to near-complete stationarity (the default
     # mesh-invariant gtol is calibrated for production stopping, not for
     # this collapse-to-zero check).
-    rho, info = optimize_bounded_lbfgs(problem, rho0, maxiter=300, gtol=0.01)
+    rho, info = optimize_bounded_lbfgs(
+        problem, rho0, comm=optimizer_comm(comm), maxiter=300, gtol=0.01)
 
     C_got = effective_stiffness(h, rho)
     rel = np.linalg.norm(C_got - C_ref) / np.linalg.norm(C_ref)

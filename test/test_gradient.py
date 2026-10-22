@@ -21,6 +21,8 @@ from muTopOpt import (
 )
 from muTopOpt.loadcases import isotropic_stiffness_tensor, target_load_cases
 
+from mpi_helpers import check_fd_gradient, local
+
 
 def _make_problem(dim, n, with_reg, comm):
     material = SimpMaterial(E_solid=1.0, nu=0.3, penalty=3.0, void_ratio=1e-2)
@@ -40,18 +42,11 @@ def _make_problem(dim, n, with_reg, comm):
 
 # TODO: rationale for tolerance rtol=2e-4, atol=1e-7?
 def _check_gradient(problem, rho, sample, d=1e-6, rtol=2e-4, atol=1e-7):
+    """``sample`` holds global pixel indices; ``rho`` is the local slab."""
     _, g = problem.objective_and_gradient(rho)
-    for idx in sample:
-        rp = rho.copy()
-        rp[idx] += d
-        fp, _ = problem.objective_and_gradient(rp)
-        rm = rho.copy()
-        rm[idx] -= d
-        fm, _ = problem.objective_and_gradient(rm)
-        fd = (fp - fm) / (2 * d)
-        assert np.isclose(g[idx], fd, rtol=rtol, atol=atol), (
-            f"pixel {idx}: analytic {g[idx]:.6e} vs FD {fd:.6e}"
-        )
+    check_fd_gradient(
+        problem.h, lambda r: problem.objective_and_gradient(r)[0], rho, g,
+        sample, d=d, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("with_reg", [False, True])
@@ -59,7 +54,7 @@ def test_gradient_2d(comm, with_reg):
     n = 6
     problem = _make_problem(2, n, with_reg, comm)
     rng = np.random.default_rng(0)
-    rho = rng.uniform(0.2, 0.8, (n, n))
+    rho = local(problem.h, rng.uniform(0.2, 0.8, (n, n)))
     # Sample interior and boundary pixels (the element-wise sensitivity is
     # gather-based, so boundary pixels must match too).
     sample = [(0, 0), (0, 3), (3, 0), (2, 2), (n - 1, n - 1), (n - 1, 2)]
@@ -70,6 +65,6 @@ def test_gradient_3d(comm):
     n = 4
     problem = _make_problem(3, n, True, comm)
     rng = np.random.default_rng(1)
-    rho = rng.uniform(0.2, 0.8, (n, n, n))
+    rho = local(problem.h, rng.uniform(0.2, 0.8, (n, n, n)))
     sample = [(0, 0, 0), (1, 2, 3), (2, 2, 2), (n - 1, n - 1, n - 1)]
     _check_gradient(problem, rho, sample)

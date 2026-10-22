@@ -53,7 +53,10 @@ def _build(comm, cg_tol, hessian):
     reg = PhaseFieldRegularization(homog)
     problem = StressTargetProblem(homog, cases, regularization=reg,
                                   hessian=hessian)
-    rho0 = initial_density(homog.nb_pixels, kind="random", seed=0)
+    rho0 = initial_density(
+        homog.nb_grid_pts, kind="random", seed=0,
+        subdomain_locations=homog.engine.subdomain_locations,
+        nb_subdomain_grid_pts=homog.nb_pixels)
     return problem, rho0
 
 
