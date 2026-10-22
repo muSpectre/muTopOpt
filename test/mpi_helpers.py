@@ -91,10 +91,3 @@ def assert_allclose_on_all_ranks(comm, actual, desired, **kwargs):
     except AssertionError as err:
         failures = [str(err)]
     assert_on_all_ranks(comm, failures)
-
-
-def optimizer_comm(comm):
-    """The mpi4py communicator NuMPI's optimizers reduce over, matching the
-    muGrid communicator ``comm`` the problem was built with (None when
-    serial, as in simulate.py)."""
-    return getattr(comm, "mpi4py_comm", None) if comm.size > 1 else None

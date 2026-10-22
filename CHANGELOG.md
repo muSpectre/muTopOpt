@@ -22,9 +22,12 @@ v1.3.0 (not yet released)
 - ENH: Each rank picks its GPU from its rank on the node as MPI reports it, so GPU
   placement works with any MPI library and launcher
 - MAINT: No settings specific to an MPI library or machine are made for muGrid any
-  more; muGrid 1.5.2 or newer detects GPU-aware MPI and host-readable memory itself
+  more; muGrid detects GPU-aware MPI and host-readable memory itself
 - ENH: The log and the NetCDF output say whether MPI takes device buffers directly
-- BUILD: Requires muGrid 1.5.2 or newer
+- API: MPI runs no longer need mpi4py: muGrid starts MPI, and the optimizers reduce
+  over the muGrid communicator; an mpi4py communicator is still accepted
+- TST: The tests run on the real MPI decomposition under mpirun
+- BUILD: Requires muGrid 1.6.0 or newer and a NuMPI release newer than 0.15.2
 
 v1.2.1 (18Oct26)
 ----------------

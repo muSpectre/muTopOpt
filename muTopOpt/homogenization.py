@@ -87,27 +87,12 @@ class _CGStagnation(Exception):
 def _local_rank(comm):
     """Node-local rank of this process, used to pick a per-rank GPU.
 
-    Asked of MPI itself: the rank within the communicator of the processes
-    that share this node's memory (``MPI_Comm_split_type`` with
-    ``MPI_COMM_TYPE_SHARED``, MPI-3), so it holds for any MPI library and
-    launcher. Collective over ``comm``. A serial run, or a communicator without
-    an mpi4py handle, falls back to the communicator rank (correct on a single
-    node).
+    muGrid's communicator knows it (``node_rank``, the rank among the
+    processes sharing this node's memory, found when the communicator is
+    made), so it holds for any MPI library and launcher. A serial run has
+    node rank 0.
     """
-    if comm is None:
-        return 0
-    mpi_comm = getattr(comm, "mpi4py_comm", None)
-    if mpi_comm is None and hasattr(comm, "Split_type"):
-        mpi_comm = comm  # an mpi4py communicator itself
-    if mpi_comm is None or mpi_comm.Get_size() == 1:
-        return comm.rank
-    from mpi4py import MPI
-
-    node_comm = mpi_comm.Split_type(MPI.COMM_TYPE_SHARED)
-    try:
-        return node_comm.Get_rank()
-    finally:
-        node_comm.Free()
+    return 0 if comm is None else comm.node_rank
 
 
 def _gpu_device_count():
@@ -205,7 +190,7 @@ def _resolve_device(device, comm=None):
 # slower exchanges -- gets it running.
 #
 # MPI and NetCDF need nothing from muTopOpt for either kind of memory: muGrid
-# (1.5.2 and newer) asks the MPI library whether it takes device buffers, and
+# (1.6.0 and newer) asks the MPI library whether it takes device buffers, and
 # the GPU runtime whether the host can read each buffer, and stages through
 # the host where it cannot.
 # --------------------------------------------------------------------------- #
@@ -338,7 +323,9 @@ class Homogenization:
         material : SimpMaterial
             Maps the density to the Lamé parameters and their derivatives.
         comm : muGrid.Communicator, optional
-            Communicator of the domain decomposition (default: serial).
+            Communicator of the domain decomposition, typically
+            ``muGrid.Communicator.world()`` (default: serial). An mpi4py
+            communicator is accepted too and wrapped.
         domain_lengths : sequence of float, optional
             Cell size per axis (default 1 per axis); the grid spacing is
             ``h_α = L_α / N_α``.
@@ -418,7 +405,9 @@ class Homogenization:
                 f"dtype must be float64 or float32, got {self.dtype}")
         self.nb_grid_pts = tuple(int(n) for n in nb_grid_pts)
         self.material = material
-        self.comm = comm if comm is not None else muGrid.Communicator()
+        # A muGrid communicator whatever was passed (None, an mpi4py
+        # communicator): node_rank and the NuMPI protocol need one
+        self.comm = muGrid.Communicator(comm)
 
         if domain_lengths is None:
             domain_lengths = [1.0] * self.dim

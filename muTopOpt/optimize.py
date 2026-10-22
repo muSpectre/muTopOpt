@@ -432,10 +432,12 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         designs start at ``||ĝ||_inf ~ O(100)``), so the same value means the
         same physical stationarity at every resolution. ``info['max_grad']``
         is reported in the same units.
-    comm : mpi4py.MPI.Comm, optional
+    comm : muGrid.Communicator, optional
         The communicator over which the density is distributed (the *same*
-        decomposition as the muGrid fields, typically ``MPI.COMM_WORLD``).
-        ``None`` runs serially. Density stays in ``bounds`` by projection.
+        decomposition as the muGrid fields, i.e. ``problem.h.comm``); NuMPI
+        reduces over it through its communicator protocol, so mpi4py is not
+        needed. An mpi4py communicator works too. ``None`` runs serially.
+        Density stays in ``bounds`` by projection.
     ftol : float, optional
         Stop when ``|f_new - f| < ftol · max(1, |f_new|, |f|)``; 0 (default)
         disables the test.
@@ -573,7 +575,7 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         Convergence tolerance on the box-projected gradient, in the same
         mesh-invariant units as :func:`optimize_bounded_lbfgs` (the
         volume-fraction derivative ``ĝ = (V/V_e) ∂f/∂ρ``; default 2.5).
-    comm : mpi4py.MPI.Comm, optional
+    comm : muGrid.Communicator, optional
         Communicator of the domain decomposition (as for
         :func:`optimize_bounded_lbfgs`).
     bounds : tuple of float, optional

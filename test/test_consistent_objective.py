@@ -31,7 +31,6 @@ from muTopOpt.optimize import initial_density, optimize_bounded_lbfgs
 from mpi_helpers import (
     local,
     local_index,
-    optimizer_comm,
     perturbed,
 )
 
@@ -164,7 +163,7 @@ def test_loose_tolerance_optimization_quality(comm):
     for label, tol in [("tight", 1e-8), ("loose", 1e-3)]:
         problem = _problem(2, n, comm, tol, True)
         rho_opt, info = optimize_bounded_lbfgs(
-            problem, local(problem.h, rho0), comm=optimizer_comm(comm),
+            problem, local(problem.h, rho0), comm=comm,
             maxiter=40)
         results[label] = rho_opt
 

@@ -34,15 +34,6 @@ pytestmark = pytest.mark.skipif(
     not HAS_TR, reason="NuMPI without tr_newton_bounded")
 
 
-def _mpi_comm():
-    try:
-        from mpi4py import MPI
-
-        return MPI.COMM_WORLD if MPI.COMM_WORLD.size > 1 else None
-    except ImportError:
-        return None
-
-
 def _build(comm, cg_tol, hessian):
     n = 16
     material = SimpMaterial(E_solid=1.0, nu=0.3, penalty=3.0, void_ratio=1e-3)
@@ -67,7 +58,7 @@ def test_tr_reduces_objective_and_respects_bounds(comm):
     f0, _ = problem.objective_and_gradient(rho0)
 
     rho, info = optimize_trust_region(
-        problem, rho0, comm=_mpi_comm(), maxiter=30)
+        problem, rho0, comm=problem.h.comm, maxiter=30)
 
     assert info["objective"] < f0
     assert np.all(rho >= 0.0) and np.all(rho <= 1.0)
@@ -80,11 +71,11 @@ def test_tr_comparable_to_lbfgs(comm):
     maxiter = 30
     prob_lb, rho0 = _build(comm, cg_tol=1e-6, hessian=False)
     _, info_lb = optimize_bounded_lbfgs(
-        prob_lb, rho0, comm=_mpi_comm(), maxiter=maxiter)
+        prob_lb, rho0, comm=prob_lb.h.comm, maxiter=maxiter)
 
     prob_tr, rho0b = _build(comm, cg_tol=1e-6, hessian=True)
     _, info_tr = optimize_trust_region(
-        prob_tr, rho0b, comm=_mpi_comm(), maxiter=maxiter,
+        prob_tr, rho0b, comm=prob_tr.h.comm, maxiter=maxiter,
         cg_tol_start=1e-2, cg_tol_min=1e-8)
 
     assert info_tr["objective"] <= info_lb["objective"] * 1.05
@@ -100,7 +91,7 @@ def test_tr_robust_at_loose_tolerance(comm):
     f0, _ = problem.objective_and_gradient(rho0)
 
     rho, info = optimize_trust_region(
-        problem, rho0, comm=_mpi_comm(), maxiter=40,
+        problem, rho0, comm=problem.h.comm, maxiter=40,
         cg_tol_start=1e-2, cg_tol_min=1e-8)
 
     # Accepted-iterate objective history is monotone non-increasing (each

@@ -24,7 +24,7 @@ from muTopOpt.loadcases import (
 )
 from muTopOpt.optimize import initial_density, optimize_bounded_lbfgs
 
-from mpi_helpers import local, optimizer_comm
+from mpi_helpers import local
 from muTopOpt.regularization import C_W
 
 
@@ -119,7 +119,7 @@ def test_optimizer_recovers_reachable_effective_stiffness(comm):
     # mesh-invariant gtol is calibrated for production stopping, not for
     # this collapse-to-zero check).
     rho, info = optimize_bounded_lbfgs(
-        problem, rho0, comm=optimizer_comm(comm), maxiter=300, gtol=0.01)
+        problem, rho0, comm=comm, maxiter=300, gtol=0.01)
 
     C_got = effective_stiffness(h, rho)
     rel = np.linalg.norm(C_got - C_ref) / np.linalg.norm(C_ref)

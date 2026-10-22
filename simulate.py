@@ -295,14 +295,9 @@ def main():
     if cg_tol_start is not None:
         cg_tol_start = max(cg_tol_start, cg_tol_min)
 
-    if muGrid.has_mpi:
-        from mpi4py import MPI
-
-        mpi_comm = MPI.COMM_WORLD
-        comm = muGrid.Communicator(mpi_comm)
-    else:
-        mpi_comm = None
-        comm = muGrid.Communicator()
+    # MPI_COMM_WORLD under a launcher (muGrid starts MPI itself, no mpi4py
+    # needed); serial otherwise
+    comm = muGrid.Communicator.world()
     rank0 = comm.rank == 0
 
     material = SimpMaterial(args.solid_E, args.solid_nu, args.penalty, args.void_ratio)
@@ -761,7 +756,7 @@ def main():
             rho, info = optimize_trust_region(
                 problem,
                 rho0,
-                comm=mpi_comm,
+                comm=comm,
                 maxiter=args.bfgs_maxiter,
                 gtol=bfgs_gtol,
                 delta0=args.tr_delta0,
@@ -776,7 +771,7 @@ def main():
             rho, info = optimize_bounded_lbfgs(
                 problem,
                 rho0,
-                comm=mpi_comm,
+                comm=comm,
                 maxiter=args.bfgs_maxiter,
                 gtol=bfgs_gtol,
                 xtol=args.bfgs_xtol,

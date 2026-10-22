@@ -65,27 +65,14 @@ def test_request_from_argument_or_environment(argument, environ, expected):
     assert _requested_managed_memory(argument, environ) is expected
 
 
-class _SerialComm:
-    """A communicator with a rank but no mpi4py handle, like muGrid's serial
-    one."""
-
-    rank = 0
-    mpi4py_comm = None
-
-
-def test_local_rank_without_mpi():
+def test_local_rank_without_communicator():
     assert _local_rank(None) == 0
-    assert _local_rank(_SerialComm()) == 0
 
 
-def test_local_rank_is_mpi_shared_memory_rank():
-    MPI = pytest.importorskip("mpi4py.MPI")
-    import muGrid
-
-    comm = muGrid.Communicator(MPI.COMM_WORLD)
-    node = MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED)
-    try:
-        assert _local_rank(comm) == node.Get_rank()
-        assert _local_rank(MPI.COMM_WORLD) == node.Get_rank()
-    finally:
-        node.Free()
+def test_local_rank_is_node_rank(comm):
+    """GPU placement uses muGrid's node-local rank: one GPU per rank on the
+    node, whatever the MPI library and launcher."""
+    assert _local_rank(comm) == comm.node_rank
+    assert 0 <= comm.node_rank < comm.node_size
+    if comm.node_size == comm.size:  # all ranks on one node
+        assert sorted(comm.allgather(comm.node_rank)) == list(range(comm.size))

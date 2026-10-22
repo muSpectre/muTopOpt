@@ -33,14 +33,17 @@ References:
 
 ## Install
 
-Requires `muGrid` (≥ 1.5.2, with FFT support), `NuMPI`, `muTimer` and
-`numpy`; these are installed as dependencies. Optional extras: `scipy` (for
-the serial `optimize_lbfgs`), `mpi4py` (MPI runs) and `pytest` (tests). For
+Requires `muGrid` (≥ 1.6.0, with FFT support), `NuMPI` (newer than 0.15.2),
+`muTimer` and `numpy`; these are installed as dependencies. MPI runs need
+muGrid built with MPI, but not `mpi4py`: muGrid starts MPI itself
+(`muGrid.Communicator.world()`). Optional extras: `scipy` (for the serial
+`optimize_lbfgs`), `mpi4py` (only for tools that use it directly) and
+`pytest` (tests). For
 GPU support, `muGrid` must be compiled with CUDA or ROCm/HIP support and you
 additionally need `cupy`.
 
 ```bash
-pip install -e ".[test,scipy]"      # add ,mpi for mpi4py
+pip install -e ".[test,scipy]"
 ```
 
 ### GPU memory
