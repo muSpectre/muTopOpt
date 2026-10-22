@@ -15,6 +15,20 @@ from muTopOpt.restart import (
 )
 
 
+@pytest.fixture
+def comm():
+    """A serial communicator, overriding the MPI one from conftest.py: these
+    tests write a whole-grid file into pytest's per-process tmp_path and read
+    it back serially. Under mpirun each rank does that on its own; with the
+    MPI communicator the ranks would open different files collectively."""
+    import warnings
+
+    with warnings.catch_warnings():
+        # muGrid warns about a serial communicator under an MPI launcher
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return muGrid.Communicator()
+
+
 def _harmonic_field(nb_grid_pts):
     """Smooth periodic test field from harmonics 1 and 2 only: band-limited
     below the Nyquist frequency of any grid with at least 5 points per axis,

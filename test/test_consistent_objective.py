@@ -28,6 +28,13 @@ from muTopOpt import (
 from muTopOpt.loadcases import isotropic_stiffness_tensor, target_load_cases
 from muTopOpt.optimize import initial_density, optimize_bounded_lbfgs
 
+from mpi_helpers import (
+    local,
+    local_index,
+    optimizer_comm,
+    perturbed,
+)
+
 
 def _problem(dim, n, comm, cg_tol, consistent, design="nodal", seed=0):
     material = SimpMaterial(E_solid=1.0, nu=0.3, penalty=3.0, void_ratio=1e-3)
@@ -53,17 +60,22 @@ def _smooth_rho(n, dim, seed=0):
     return np.clip(0.5 + 0.3 * rho, 0.05, 0.95)
 
 
+def _objective(problem, rho):
+    """Objective at the global design ``rho`` (each rank passes its slab)."""
+    return problem.objective_and_gradient(local(problem.h, rho))[0]
+
+
 def test_superconvergence_of_corrected_objective(comm):
     """|L(loose) - f(tight)| must be much smaller than |f_raw(loose) -
     f(tight)|: the correction removes the first-order solve-error effect.
     (Measured on this problem: ratio 0.03 at cg_tol=1e-2, 0.009 at 1e-3.)"""
     n = 16
     rho = _smooth_rho(n, 2)
-    f_exact, _ = _problem(2, n, comm, 1e-12, True).objective_and_gradient(rho)
+    f_exact = _objective(_problem(2, n, comm, 1e-12, True), rho)
 
     loose = 1e-2
-    f_corr, _ = _problem(2, n, comm, loose, True).objective_and_gradient(rho)
-    f_raw, _ = _problem(2, n, comm, loose, False).objective_and_gradient(rho)
+    f_corr = _objective(_problem(2, n, comm, loose, True), rho)
+    f_raw = _objective(_problem(2, n, comm, loose, False), rho)
 
     err_corr = abs(f_corr - f_exact)
     err_raw = abs(f_raw - f_exact)
@@ -79,11 +91,10 @@ def test_corrected_error_scales_superlinearly(comm):
     by much more than 10x."""
     n = 16
     rho = _smooth_rho(n, 2)
-    f_exact, _ = _problem(2, n, comm, 1e-12, True).objective_and_gradient(rho)
+    f_exact = _objective(_problem(2, n, comm, 1e-12, True), rho)
 
     def err(tol):
-        f, _ = _problem(2, n, comm, tol, True).objective_and_gradient(rho)
-        return abs(f - f_exact)
+        return abs(_objective(_problem(2, n, comm, tol, True), rho) - f_exact)
 
     e_loose, e_tight = err(1e-2), err(1e-3)
     assert e_tight < 0.02 * e_loose, (
@@ -97,7 +108,7 @@ def test_correction_vanishes_at_tight_tolerance(comm):
     n = 12
     rho = _smooth_rho(n, 2, seed=1)
     problem = _problem(2, n, comm, 1e-12, True)
-    problem.objective_and_gradient(rho)
+    _objective(problem, rho)
     corrections = problem.last["corrections"]
     assert len(corrections) == 3
     scale = abs(problem.last["objective"]) + 1e-30
@@ -108,22 +119,21 @@ def _fd_mismatch(problem, rho, sample, d=1e-5):
     """Worst relative mismatch between the assembled gradient and central
     finite differences of the reported objective,
     max_i |g_i - fd_i| / max(|g_i|, |fd_i|) with
-    fd_i = (f(rho + d e_i) - f(rho - d e_i)) / (2 d)."""
-    _, g = problem.objective_and_gradient(rho)
+    fd_i = (f(rho + d e_i) - f(rho - d e_i)) / (2 d), over the global pixels
+    ``sample`` of the global design ``rho``."""
+    h = problem.h
+    x = local(h, rho)
+    _, g = problem.objective_and_gradient(x)
     worst = 0.0
-    for idx in sample:
-        rp = rho.copy()
-        rp[idx] += d
-        fp, _ = problem.objective_and_gradient(rp)
-        rm = rho.copy()
-        rm[idx] -= d
-        fm, _ = problem.objective_and_gradient(rm)
+    for gi in sample:
+        fp, _ = problem.objective_and_gradient(perturbed(h, x, gi, d))
+        fm, _ = problem.objective_and_gradient(perturbed(h, x, gi, -d))
         fd = (fp - fm) / (2 * d)
-        denom = max(abs(g[idx]), abs(fd), 1e-12)
-        worst = max(worst, abs(g[idx] - fd) / denom)
-    return worst
-
-
+        idx = local_index(h, gi)
+        if idx is not None:
+            denom = max(abs(g[idx]), abs(fd), 1e-12)
+            worst = max(worst, abs(g[idx] - fd) / denom)
+    return h.comm.max(worst)
 def test_fd_consistency_at_loose_tolerance(comm):
     """The (objective, gradient) pair must remain usably FD-consistent at a
     loose inner tolerance. Note the correction makes the *value* second-order
@@ -153,8 +163,9 @@ def test_loose_tolerance_optimization_quality(comm):
     results = {}
     for label, tol in [("tight", 1e-8), ("loose", 1e-3)]:
         problem = _problem(2, n, comm, tol, True)
-        rho_opt, info = optimize_bounded_lbfgs(problem, rho0.copy(),
-                                               maxiter=40)
+        rho_opt, info = optimize_bounded_lbfgs(
+            problem, local(problem.h, rho0), comm=optimizer_comm(comm),
+            maxiter=40)
         results[label] = rho_opt
 
     judge = _problem(2, n, comm, 1e-12, True)
