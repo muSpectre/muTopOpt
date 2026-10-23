@@ -19,6 +19,8 @@ from muTopOpt import (
 )
 from muTopOpt.loadcases import isotropic_stiffness_tensor, target_load_cases
 
+from mpi_helpers import local
+
 
 def _rho(h):
     return np.random.default_rng(0).uniform(0.2, 0.8, h.nb_pixels)
@@ -67,7 +69,7 @@ def test_single_matches_double(comm):
     stresses = {}
     for dt in (np.float64, np.float32):
         h = Homogenization((16, 16), mat, comm=comm, cg_tol=1e-5, dtype=dt)
-        h.set_density(rho)
+        h.set_density(local(h, rho))
         u = h.vector_field("probe_u")
         h.solve_macro(cases[0].macro_strain, u, rtol=1e-5)
         stresses[dt] = h.homogenized_stress(u, cases[0].macro_strain)

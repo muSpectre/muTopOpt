@@ -64,6 +64,8 @@ from muTopOpt import (
 )
 from muTopOpt.regularization import PhaseFieldRegularization
 
+from mpi_helpers import local
+
 # Grid: long in x (the direction the interface moves), thin in y (the field is
 # constant there, and dE/E is independent of the interface length).
 NX, NY = 128, 8
@@ -146,7 +148,7 @@ def _slab(eta, shift):
 def _energy_vs_shift(reg, eta):
     """Regularization energy at ``NB_SHIFTS`` sub-pixel offsets over one pixel."""
     return np.array([
-        reg.value_and_gradient(_slab(eta, s))[0]
+        reg.value_and_gradient(local(reg.h, _slab(eta, s)))[0]
         for s in np.linspace(0.0, 1.0, NB_SHIFTS)
     ])
 

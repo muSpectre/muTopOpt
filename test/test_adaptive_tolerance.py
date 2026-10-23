@@ -24,6 +24,8 @@ from muTopOpt.optimize import (
     optimize_bounded_lbfgs,
 )
 
+from mpi_helpers import check_fd_gradient, local
+
 
 def _mpi_comm():
     try:
@@ -117,7 +119,10 @@ def _build(comm, cg_tol):
     # A heterogeneous start: a uniform density stays uniform (symmetric
     # gradient) and its fluctuation rhs is negligible, so CG would be skipped
     # entirely -- a random field gives genuine forward/adjoint solves.
-    rho0 = initial_density(homog.nb_pixels, kind="random", seed=0)
+    rho0 = initial_density(
+        homog.nb_grid_pts, kind="random", seed=0,
+        subdomain_locations=homog.engine.subdomain_locations,
+        nb_subdomain_grid_pts=homog.nb_pixels)
     return problem, rho0
 
 
@@ -196,14 +201,10 @@ def test_gradient_accurate_at_floor(comm):
         rtol_start=1e-10, rtol_min=1e-10)
 
     rng = np.random.default_rng(0)
-    rho = rng.uniform(0.2, 0.8, (n, n))
+    rho = local(homog, rng.uniform(0.2, 0.8, (n, n)))
     _, g = problem.objective_and_gradient(rho)
-    for idx in [(0, 0), (0, 3), (3, 0), (2, 2), (n - 1, n - 1)]:
-        rp = rho.copy(); rp[idx] += 1e-6
-        fp, _ = problem.objective_and_gradient(rp)
-        rm = rho.copy(); rm[idx] -= 1e-6
-        fm, _ = problem.objective_and_gradient(rm)
-        fd = (fp - fm) / 2e-6
-        # TODO: rationale for tolerance rtol=2e-4, atol=1e-7?
-        assert np.isclose(g[idx], fd, rtol=2e-4, atol=1e-7), (
-            f"pixel {idx}: analytic {g[idx]:.6e} vs FD {fd:.6e}")
+    # TODO: rationale for tolerance rtol=2e-4, atol=1e-7?
+    check_fd_gradient(
+        homog, lambda r: problem.objective_and_gradient(r)[0], rho, g,
+        [(0, 0), (0, 3), (3, 0), (2, 2), (n - 1, n - 1)],
+        rtol=2e-4, atol=1e-7)
