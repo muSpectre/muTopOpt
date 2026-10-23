@@ -16,10 +16,10 @@ requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
     "numpy",
-    # 1.4.0 is the first release whose float32 reductions return double
-    # instead of narrowing to inf, and the first to export
-    # muGrid.Solvers.FLOAT32_RTOL_FLOOR, which muTopOpt.precision reuses.
-    "muGrid>=1.4.0",
+    # 1.5.2 is the first release that detects GPU-aware MPI with any MPI
+    # library that reports it and stages plain device memory on an APU by
+    # itself, which muTopOpt used to arrange through environment variables.
+    "muGrid>=1.5.2",
     "muTimer",
     "NuMPI",
 ]

@@ -15,7 +15,7 @@ import pytest
 
 from muTopOpt.homogenization import (
     _device_memory_policy,
-    _mugrid_settings_for_plain_memory,
+    _local_rank,
     _requested_managed_memory,
 )
 
@@ -65,32 +65,27 @@ def test_request_from_argument_or_environment(argument, environ, expected):
     assert _requested_managed_memory(argument, environ) is expected
 
 
-def test_mugrid_settings_only_for_plain_memory_on_an_apu():
-    for unified, managed in [(False, False), (False, True), (True, True)]:
-        env = {"MPICH_GPU_SUPPORT_ENABLED": "1"}
-        assert _mugrid_settings_for_plain_memory(unified, managed, 4, env) == {}
-        assert env == {"MPICH_GPU_SUPPORT_ENABLED": "1"}
+class _SerialComm:
+    """A communicator with a rank but no mpi4py handle, like muGrid's serial
+    one."""
+
+    rank = 0
+    mpi4py_comm = None
 
 
-def test_mugrid_settings_for_plain_memory_on_an_apu():
-    # One rank: only the host-readability correction.
-    env = {}
-    assert _mugrid_settings_for_plain_memory(True, False, 1, env) == {
-        "MUGRID_UNIFIED_MEMORY": "0"}
-    # Several ranks under Cray MPICH with GPU support: device pointers to MPI.
-    env = {"MPICH_GPU_SUPPORT_ENABLED": "1"}
-    assert _mugrid_settings_for_plain_memory(True, False, 4, env) == {
-        "MUGRID_UNIFIED_MEMORY": "0", "MUGRID_GPU_AWARE_MPI": "1"}
-    assert env["MUGRID_GPU_AWARE_MPI"] == "1"
-    # Several ranks, but no sign of a GPU-aware MPI: muGrid stages instead.
-    env = {}
-    assert "MUGRID_GPU_AWARE_MPI" not in _mugrid_settings_for_plain_memory(
-        True, False, 4, env)
+def test_local_rank_without_mpi():
+    assert _local_rank(None) == 0
+    assert _local_rank(_SerialComm()) == 0
 
 
-def test_mugrid_settings_never_override_the_user():
-    env = {"MUGRID_UNIFIED_MEMORY": "1", "MUGRID_GPU_AWARE_MPI": "0",
-           "MPICH_GPU_SUPPORT_ENABLED": "1"}
-    assert _mugrid_settings_for_plain_memory(True, False, 4, env) == {}
-    assert env["MUGRID_UNIFIED_MEMORY"] == "1"
-    assert env["MUGRID_GPU_AWARE_MPI"] == "0"
+def test_local_rank_is_mpi_shared_memory_rank():
+    MPI = pytest.importorskip("mpi4py.MPI")
+    import muGrid
+
+    comm = muGrid.Communicator(MPI.COMM_WORLD)
+    node = MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED)
+    try:
+        assert _local_rank(comm) == node.Get_rank()
+        assert _local_rank(MPI.COMM_WORLD) == node.Get_rank()
+    finally:
+        node.Free()

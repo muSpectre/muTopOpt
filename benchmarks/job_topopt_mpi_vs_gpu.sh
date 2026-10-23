@@ -85,7 +85,7 @@ echo ">>> GPU wall time: ${t_gpu}s"
 echo
 
 # --- Multi-GPU via MPI ----------------------------------------------------- #
-# One rank per GPU; UCX_TLS=^rocm_ipc (set in _env.sh) is required here.
+# One rank per GPU.
 echo ">>> [3/3] ${GPU_RANKS} GPUs via MPI (device=gpu)"
 t0=$SECONDS
 mpirun -np "$GPU_RANKS" python3 simulate.py topopt_gpu.json

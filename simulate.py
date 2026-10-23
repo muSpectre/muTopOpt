@@ -83,6 +83,7 @@ from muTopOpt import (
     StressTargetProblem,
 )
 from muTopOpt.bounds import target_feasibility
+from muTopOpt.homogenization import gpu_aware_mpi
 from muTopOpt.control import (
     ControlError,
     defaults,
@@ -330,9 +331,10 @@ def main():
         print(mutopopt_version())
         if homog.device_memory != "host":
             line = f"device memory: {homog.device_memory_reason}"
-            if homog.mugrid_environment:
-                line += "; set " + " ".join(
-                    f"{k}={v}" for k, v in homog.mugrid_environment.items())
+            if homog.comm.size > 1:
+                line += ("; MPI takes device buffers" if gpu_aware_mpi()
+                         else "; MPI does not take device buffers, so they "
+                              "are staged through the host")
             print(line)
     if args.target_E is not None:
         target = isotropic_stiffness_from_E_nu(dim, args.target_E, args.target_nu)
@@ -555,6 +557,10 @@ def main():
         # "managed", "plain" or "host": it changes the speed of a multi-GPU
         # run several-fold, so it belongs next to the other run parameters.
         fio.write_global_attribute("device_memory", homog.device_memory)
+        # Whether muGrid hands device buffers to MPI or stages them through
+        # the host: the other half of a multi-GPU run's speed.
+        fio.write_global_attribute("gpu_aware_mpi",
+                                   "yes" if gpu_aware_mpi() else "no")
         # Full invocation that produced this file, quoted so it can be pasted
         # back into a shell to reproduce the run. Known up front, so written
         # with its final value here (no placeholder/update). `sys.argv` is

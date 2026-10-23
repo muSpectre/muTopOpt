@@ -87,16 +87,27 @@ class _CGStagnation(Exception):
 def _local_rank(comm):
     """Node-local rank of this process, used to pick a per-rank GPU.
 
-    Prefers the launcher-provided local-rank env var (OpenMPI, MPICH/Hydra,
-    MVAPICH, Slurm); falls back to the global communicator rank (correct on a
-    single node, and the best available guess otherwise).
+    Asked of MPI itself: the rank within the communicator of the processes
+    that share this node's memory (``MPI_Comm_split_type`` with
+    ``MPI_COMM_TYPE_SHARED``, MPI-3), so it holds for any MPI library and
+    launcher. Collective over ``comm``. A serial run, or a communicator without
+    an mpi4py handle, falls back to the communicator rank (correct on a single
+    node).
     """
-    for var in ("OMPI_COMM_WORLD_LOCAL_RANK", "MPI_LOCALRANKID",
-                "MV2_COMM_WORLD_LOCAL_RANK", "SLURM_LOCALID"):
-        val = os.environ.get(var)
-        if val is not None:
-            return int(val)
-    return comm.rank if comm is not None else 0
+    if comm is None:
+        return 0
+    mpi_comm = getattr(comm, "mpi4py_comm", None)
+    if mpi_comm is None and hasattr(comm, "Split_type"):
+        mpi_comm = comm  # an mpi4py communicator itself
+    if mpi_comm is None or mpi_comm.Get_size() == 1:
+        return comm.rank
+    from mpi4py import MPI
+
+    node_comm = mpi_comm.Split_type(MPI.COMM_TYPE_SHARED)
+    try:
+        return node_comm.Get_rank()
+    finally:
+        node_comm.Free()
 
 
 def _gpu_device_count():
@@ -166,7 +177,7 @@ def _resolve_device(device, comm=None):
 #   managed  mapped for CPU and GPU, from the whole 128 GB.
 #
 #   Measured on Hunter (HLRS; 4x MI300A per node, ROCm 7.0.2, Cray MPICH
-#   9.1 with MPICH_GPU_SUPPORT_ENABLED=1), muGrid's homogenization example
+#   9.1 with its GPU support enabled), muGrid's homogenization example
 #   at 256^3, ms per CG iteration, plain -> managed:
 #
 #                     1 GPU                4 GPUs (MPI)
@@ -178,7 +189,9 @@ def _resolve_device(device, comm=None):
 #   the reference solve's all-to-all went from 1.6 to 13 ms per FFT. The
 #   likely cause is that the MPI's GPU transport treats managed memory as host
 #   memory and copies it with the CPU instead of over its device path; that
-#   is an inference from the timings, not a confirmed mechanism.
+#   is an inference from the timings, not a confirmed mechanism, and it was
+#   measured with one MPI only; other MPI libraries may differ, which is
+#   what the overrides below are for.
 #
 #   So on an APU: managed memory for a single rank, where it removes the
 #   62.8 GiB limit for (nearly) nothing; plain device memory as soon as there
@@ -191,17 +204,18 @@ def _resolve_device(device, comm=None):
 # and either more ranks (smaller slabs) or MUTOPOPT_MANAGED=1 -- accepting the
 # slower exchanges -- gets it running.
 #
-# Plain memory on an APU, and muGrid. muGrid decides "can the CPU read this
-# GPU's memory?" once per device, from the device's `integrated` flag, and an
-# MI300A says yes -- true for managed memory, false for plain hipMalloc
-# memory. With plain memory it would then hand device pointers to an MPI it
-# does not know to be GPU-aware (and stop with an error), and read fields in
-# place for NetCDF output. Because muGrid makes this decision per device and
-# not per allocation, muTopOpt sets muGrid's switches for this case
-# (_mugrid_settings_for_plain_memory). They take effect only if no earlier
-# muGrid object in the process has already exchanged ghosts or written
-# NetCDF, since muGrid reads both once.
+# MPI and NetCDF need nothing from muTopOpt for either kind of memory: muGrid
+# (1.5.2 and newer) asks the MPI library whether it takes device buffers, and
+# the GPU runtime whether the host can read each buffer, and stages through
+# the host where it cannot.
 # --------------------------------------------------------------------------- #
+
+
+def gpu_aware_mpi():
+    """Whether muGrid hands device buffers to MPI directly (True) or stages
+    them through the host (False): the MPI library's own answer, or
+    ``MUGRID_GPU_AWARE_MPI`` when set. Ask after MPI is initialised."""
+    return bool(getattr(muGrid._muGrid.Communicator, "gpu_aware_mpi", False))
 
 
 def _device_has_unified_memory(device_id=0):
@@ -256,37 +270,6 @@ def _device_memory_policy(on_device, unified, nb_ranks, requested=None):
                        f"buffers")
     return True, ("managed memory: unified-memory GPU, single rank -- the "
                   "full memory at no compute cost")
-
-
-def _mugrid_settings_for_plain_memory(unified, managed, nb_ranks,
-                                      environ=os.environ):
-    """Set muGrid's switches for plain device memory on a unified-memory GPU.
-
-    Returns the variables it set; ones already in the environment are left
-    alone, so an explicit setting always wins. See the notes above for why
-    they are needed.
-
-    * ``MUGRID_UNIFIED_MEMORY=0``: plain memory is not host-readable, whatever
-      the device flag says. muGrid then stages through the host where it would
-      otherwise have read the memory in place -- NetCDF output, and MPI if it
-      is not GPU-aware -- which is correct for any MPI.
-    * ``MUGRID_GPU_AWARE_MPI=1``, only with more than one rank and
-      ``MPICH_GPU_SUPPORT_ENABLED=1``: that is Cray MPICH's switch for taking
-      device memory, which muGrid's probe (asking through the OpenMPI
-      extension) cannot see. Without it the exchanges above would be staged
-      too: correct, but 3-6x slower for the reference solve on Hunter.
-    """
-    if not unified or managed:
-        return {}
-    wanted = {"MUGRID_UNIFIED_MEMORY": "0"}
-    if nb_ranks > 1 and environ.get("MPICH_GPU_SUPPORT_ENABLED") == "1":
-        wanted["MUGRID_GPU_AWARE_MPI"] = "1"
-    applied = {}
-    for name, value in wanted.items():
-        if name not in environ:
-            environ[name] = value
-            applied[name] = value
-    return applied
 
 
 # Process-global guard: the managed allocator, and muGrid's routing to it, must
@@ -454,8 +437,8 @@ class Homogenization:
 
             cupy.cuda.Device(self.device.device_id).use()
         # Plain or managed device memory: see the notes above
-        # _device_has_unified_memory. Decided, and muGrid's switches set,
-        # before the engine allocates its first device field.
+        # _device_has_unified_memory. Decided before the engine allocates its
+        # first device field.
         on_device = self.device is not None and self.device.is_device
         unified = on_device and _device_has_unified_memory(
             self.device.device_id)
@@ -476,13 +459,6 @@ class Homogenization:
                               else "plain" if on_device else "host")
         #: One line saying why, for the run's log.
         self.device_memory_reason = reason
-        #: muGrid environment variables set for plain memory on an APU. From
-        #: what is actually allocated, not from the policy: a policy of
-        #: managed memory that could not be installed leaves plain memory,
-        #: which needs them, and managed memory left by an earlier
-        #: Homogenization does not.
-        self.mugrid_environment = _mugrid_settings_for_plain_memory(
-            unified, self.managed_memory, self.comm.size)
         ghosts = (1,) * self.dim
         self.engine = muGrid.FFTEngine(
             self.nb_grid_pts, self.comm,

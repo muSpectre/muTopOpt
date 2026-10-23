@@ -57,10 +57,9 @@ print(f'  extension {ext}')
 # job_topopt_mpi_vs_gpu.sh reports.
 export ROCFFT_RTC_CACHE_PATH="${ROCFFT_RTC_CACHE_PATH:-$HOME/.cache/rocfft_kernels.db}"
 
-# UCX_TLS=^rocm_ipc: the ROCm IPC rendezvous transport fails with an
-# rkey-size assertion between ranks on this toolchain; excluding it makes UCX
-# use rocm_copy / shared-memory transfers. It does not affect the pure-CPU
-# MPI run.
-export UCX_TLS="^rocm_ipc"
+# UCX transports are left at UCX's default. The mi300a toolchain used to
+# exclude rocm_ipc (UCX_TLS=^rocm_ipc) for an rkey-size assertion; measured
+# 2026-10-21 rocm_ipc is correct between MI300A GPUs and 50-100x faster for
+# GPU-to-GPU messages, and excluding it made muGrid's multi-GPU FFT tests abort.
 
 cd "$MUTOPOPT"
