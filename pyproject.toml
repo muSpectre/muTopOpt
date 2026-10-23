@@ -32,6 +32,9 @@ test = ["pytest"]
 scipy = ["scipy"]  # for the alternative serial optimize_lbfgs
 mpi = ["mpi4py"]  # not needed for MPI runs; for tools that use it directly
 
+[project.scripts]
+mutopopt = "muTopOpt.simulate:main"
+
 [tool.hatch.version]
 source = "vcs"
 
