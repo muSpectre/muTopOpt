@@ -13,15 +13,6 @@ from muTopOpt.loadcases import isotropic_stiffness_tensor, target_load_cases
 from muTopOpt.optimize import initial_density, optimize_bounded_lbfgs
 
 
-def _mpi_comm():
-    try:
-        from mpi4py import MPI
-
-        return MPI.COMM_WORLD if MPI.COMM_WORLD.size > 1 else None
-    except ImportError:
-        return None
-
-
 def test_mesh_invariant_gradient_norm(comm):
     """The convergence criterion is mesh-independent: ``info['max_grad']`` is
     measured on the volume-fraction derivative ``ĝ = (V/V_e) ∂f/∂ρ``, so the
@@ -48,7 +39,7 @@ def test_mesh_invariant_gradient_norm(comm):
         # A gtol far above any gradient makes the optimizer certify
         # convergence immediately and report the *initial* norm.
         _, info = optimize_bounded_lbfgs(
-            problem, rho0, comm=_mpi_comm(), maxiter=1, gtol=1e9)
+            problem, rho0, comm=problem.h.comm, maxiter=1, gtol=1e9)
         assert info["nit"] == 0
         max_grads.append(info["max_grad"])
     # Same design, same norm -- across a 4x change in pixel count (per-pixel
@@ -76,7 +67,7 @@ def test_lbfgs_reduces_objective_2d(comm):
     f0, _ = problem.objective_and_gradient(rho0)
 
     rho, info = optimize_bounded_lbfgs(
-        problem, rho0, comm=_mpi_comm(), maxiter=15
+        problem, rho0, comm=problem.h.comm, maxiter=15
     )
 
     assert info["objective"] < f0

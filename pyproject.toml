@@ -16,18 +16,21 @@ requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
     "numpy",
-    # 1.5.2 is the first release that detects GPU-aware MPI with any MPI
-    # library that reports it and stages plain device memory on an APU by
-    # itself, which muTopOpt used to arrange through environment variables.
-    "muGrid>=1.5.2",
+    # 1.6.0 is the first release that starts MPI itself
+    # (Communicator.world(), node_rank for GPU placement, no mpi4py needed),
+    # detects GPU-aware MPI with any MPI library that reports it, and stages
+    # plain device memory on an APU by itself.
+    "muGrid>=1.6.0",
     "muTimer",
-    "NuMPI",
+    # The optimizers reduce over the muGrid communicator through NuMPI's
+    # communicator protocol, which releases after 0.15.2 provide.
+    "NuMPI>0.15.2",
 ]
 
 [project.optional-dependencies]
 test = ["pytest"]
 scipy = ["scipy"]  # for the alternative serial optimize_lbfgs
-mpi = ["mpi4py"]
+mpi = ["mpi4py"]  # not needed for MPI runs; for tools that use it directly
 
 [tool.hatch.version]
 source = "vcs"

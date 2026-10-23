@@ -159,7 +159,9 @@ class HomogenizationConductivity:
         material : SimpConductivity
             Density-to-conductivity interpolation.
         comm : muGrid.Communicator, optional
-            Communicator of the domain decomposition (default: serial).
+            Communicator of the domain decomposition, typically
+            ``muGrid.Communicator.world()`` (default: serial). An mpi4py
+            communicator is accepted too and wrapped.
         domain_lengths : sequence of float, optional
             Physical cell edge lengths (default: 1 per axis); grid spacing
             ``h_α = L_α / N_α``.
@@ -201,7 +203,9 @@ class HomogenizationConductivity:
                 f"dtype must be float64 or float32, got {self.dtype}")
         self.nb_grid_pts = tuple(int(n) for n in nb_grid_pts)
         self.material = material
-        self.comm = comm if comm is not None else muGrid.Communicator()
+        # A muGrid communicator whatever was passed (None, an mpi4py
+        # communicator): node_rank and the NuMPI protocol need one
+        self.comm = muGrid.Communicator(comm)
 
         if domain_lengths is None:
             domain_lengths = [1.0] * self.dim

@@ -102,14 +102,9 @@ def provenance(homog):
 
 
 def _communicator():
-    """MPI communicator under a parallel launch, the serial one otherwise."""
-    try:
-        from mpi4py import MPI
-    except ImportError:
-        return muGrid.Communicator()
-    if MPI.COMM_WORLD.size == 1:
-        return muGrid.Communicator()
-    return muGrid.Communicator(MPI.COMM_WORLD)
+    """MPI_COMM_WORLD under a parallel launch, the serial one otherwise
+    (muGrid starts MPI itself; mpi4py is not needed)."""
+    return muGrid.Communicator.world()
 
 
 def build(args, timer=None):

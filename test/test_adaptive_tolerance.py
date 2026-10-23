@@ -27,15 +27,6 @@ from muTopOpt.optimize import (
 from mpi_helpers import check_fd_gradient, local
 
 
-def _mpi_comm():
-    try:
-        from mpi4py import MPI
-
-        return MPI.COMM_WORLD if MPI.COMM_WORLD.size > 1 else None
-    except ImportError:
-        return None
-
-
 def test_controller_clips_and_freezes():
     """The relative forcing term
 
@@ -139,7 +130,7 @@ def _run(problem, rho0, maxiter, **cg_kwargs):
 
     problem.objective_and_gradient = counting
     rho, info = optimize_bounded_lbfgs(
-        problem, rho0, comm=_mpi_comm(), maxiter=maxiter, **cg_kwargs)
+        problem, rho0, comm=problem.h.comm, maxiter=maxiter, **cg_kwargs)
     return rho, info, total["cg"]
 
 
