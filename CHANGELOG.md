@@ -19,6 +19,8 @@ Change log for muTopOpt
 v1.3.0 (not yet released)
 -------------------------
 
+- ENH: Installing the package provides the `mutopopt` command, which runs the
+  elasticity driver; `python simulate.py` from the repository keeps working
 - ENH: Each rank picks its GPU from its rank on the node as MPI reports it, so GPU
   placement works with any MPI library and launcher
 - MAINT: No settings specific to an MPI library or machine are made for muGrid any

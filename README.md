@@ -94,14 +94,15 @@ rho, info = optimize_lbfgs(problem, rho0, maxiter=200)
 
 ### Command line
 
-`simulate.py` (elasticity) reads a JSON control file. Write one with every key
-at its default, edit it, and run it:
+The elasticity driver is installed as the `mutopopt` command (from a source
+checkout, `python simulate.py` runs the same driver). It reads a JSON control
+file. Write one with every key at its default, edit it, and run it:
 
 ```bash
-python simulate.py --write-defaults run.json   # also writes simulate.schema.json
-python simulate.py run.json
-mpirun -np 4 python simulate.py run.json
-python simulate.py --help                      # every key, its default and meaning
+mutopopt --write-defaults run.json   # also writes simulate.schema.json
+mutopopt run.json
+mpirun -np 4 mutopopt run.json
+mutopopt --help                      # every key, its default and meaning
 ```
 
 A control file only needs the keys that differ from the defaults; `null`
