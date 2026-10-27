@@ -16,8 +16,8 @@ Style for this changelog (keep to it so entries stay uniform):
 Change log for muTopOpt
 =======================
 
-v1.3.0 (not yet released)
--------------------------
+v1.3.0 (27Oct26)
+----------------
 
 - ENH: Installing the package provides the `mutopopt` command, which runs the
   elasticity driver; `python simulate.py` from the repository keeps working
