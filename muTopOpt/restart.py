@@ -19,6 +19,10 @@ run (or vice versa). Sample ``j`` sits at ``x_j = j h`` on both grids, so the
 interpolant does not shift interfaces, and it preserves the mean (the
 volume fraction) exactly. :func:`restart_density` combines the two.
 
+:func:`restart_control` derives, from a run's control, the control of the run
+that continues it from its output file; the driver writes it as the restart
+control file.
+
 muGrid's Python API does not expose the grid shape or the scalar type of a
 variable stored in a file, but both must be known *before* the field
 collection is registered for reading -- registering a ``float64`` field for a
@@ -28,6 +32,9 @@ the explicit ``nb_grid_pts``/``precision`` attributes when present (both
 drivers write them), else parsed from the ``command_line`` attribute.
 """
 
+import copy
+import os
+import re
 import shlex
 
 import muGrid
@@ -263,3 +270,35 @@ def restart_density(filename, nb_grid_pts):
     if metadata["resampled"]:
         rho = fourier_resample(rho, nb_grid_pts)
     return np.clip(rho, 0.0, 1.0), metadata
+
+
+def next_output_name(path):
+    """The output file name of the run that continues from ``path``.
+
+    A trailing run number in the stem -- after ``.``, ``_`` or ``-`` -- is
+    incremented, keeping its zero padding (``run_009.nc`` -> ``run_010.nc``,
+    ``design.1.nc`` -> ``design.2.nc``); a stem without one gets ``.1``
+    (``design.nc`` -> ``design.1.nc``). The directory and extension are kept.
+    """
+    directory, name = os.path.split(path)
+    stem, ext = os.path.splitext(name)
+    match = re.fullmatch(r"(.*[._-])(\d+)", stem)
+    if match is None:
+        stem = f"{stem}.1"
+    else:
+        prefix, number = match.groups()
+        stem = f"{prefix}{int(number) + 1:0{len(number)}d}"
+    return os.path.join(directory, stem + ext)
+
+
+def restart_control(control):
+    """The control of the run that continues this one: ``control`` with
+    ``initial_density.source`` set to this run's ``output.file`` and
+    ``output.file`` advanced to :func:`next_output_name` of it, so the
+    continuation never overwrites the file it starts from. Every other key,
+    including ``null`` (automatic) ones, is kept as is."""
+    restart = copy.deepcopy(control)
+    output = control["output"]["file"]
+    restart["initial_density"]["source"] = output
+    restart["output"]["file"] = next_output_name(output)
+    return restart

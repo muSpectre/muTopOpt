@@ -314,6 +314,14 @@ ELASTICITY = Section(
                 "bool", True,
                 "Flush every frame to disk as it is written, so the file can "
                 "be inspected during the run."),
+            "restart_control": Key(
+                "string", "restart.json",
+                "Control file written at the start of the run to continue it: "
+                "this run's complete control, starting from the last frame of "
+                "output.file and writing to a new, numbered output file "
+                "(design.nc -> design.1.nc -> design.2.nc). Only frames "
+                "already written can be continued from, so set dump_every for "
+                "runs that may be interrupted."),
         }),
     },
 )
