@@ -16,8 +16,8 @@ Style for this changelog (keep to it so entries stay uniform):
 Change log for muTopOpt
 =======================
 
-v1.3.0 (not yet released)
--------------------------
+v1.3.0 (27Oct26)
+----------------
 
 - ENH: Installing the package provides the `mutopopt` command, which runs the
   elasticity driver; `python simulate.py` from the repository keeps working
@@ -30,6 +30,8 @@ v1.3.0 (not yet released)
   over the muGrid communicator; an mpi4py communicator is still accepted
 - ENH: Optional detailed timing breaks every inner solve down into CG steps, halo
   exchange, stencil and preconditioner phases, synchronized with the GPU if wanted
+- ENH: Every run writes a restart control file that continues it from its output file
+  into a new, numbered one, so a run can be resumed job after job with one command
 - TST: The tests run on the real MPI decomposition under mpirun
 - BUILD: Requires muGrid 1.6.0 or newer and a NuMPI release newer than 0.15.2
 

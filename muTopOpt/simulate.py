@@ -49,7 +49,11 @@ muGrid and ``compute.device`` = "gpu", on the device; the outer optimizer
 always runs on the host. The density, per-frame homogenized stresses and
 effective moduli are written to the NetCDF file ``output.file`` through
 muGrid, together with the resolved control file; it can be used as
-``initial_density.source`` of a later run.
+``initial_density.source`` of a later run. At the start of the run the
+restart control file ``output.restart_control`` is written: the same control,
+continuing from the last frame of ``output.file`` and writing to a numbered
+new output file, so ``mutopopt restart.json`` repeated continues a run job
+after job.
 
 Examples
 --------
@@ -102,7 +106,11 @@ from muTopOpt.optimize import (
     optimize_bounded_lbfgs,
     optimize_trust_region,
 )
-from muTopOpt.restart import INITIAL_DENSITY_KINDS, restart_density
+from muTopOpt.restart import (
+    INITIAL_DENSITY_KINDS,
+    restart_control,
+    restart_density,
+)
 from muTopOpt.timing import timer
 from muTopOpt.version import (
     mugrid_version,
@@ -171,6 +179,23 @@ def _settings(control):
                     else -1),
         no_flush=not c["output"]["flush_frames"],
     )
+
+
+def _write_restart_control(path, control, started_from):
+    """Write the control that continues this run (see
+    :func:`muTopOpt.restart.restart_control`) to `path`.
+
+    The control file this run was started from is replaced only if it is
+    itself a continuation, i.e. starts from a previous output file: that is
+    the job chain ``mutopopt restart.json`` repeated, and a hand-written
+    control file of the same name must not be lost to it. Returns whether
+    the file was written."""
+    if (os.path.exists(path) and os.path.samefile(path, started_from)
+            and control["initial_density"]["source"] in INITIAL_DENSITY_KINDS):
+        return False
+    with open(path, "w") as f:
+        f.write(dumps(restart_control(control)))
+    return True
 
 
 def _write_defaults(path):
@@ -610,6 +635,17 @@ def main():
         for m in _MODULI:
             fio.write_global_attribute(f"effective_{m}_history", [nan] * maxlen)
         fio.write_global_attribute("frame_iterations", [-1] * max_frames)
+
+        # Written now rather than at the end so that a run killed at the
+        # walltime can be continued from the last frame it wrote.
+        if rank0:
+            path = control["output"]["restart_control"]
+            if _write_restart_control(path, control, cli.control):
+                print(f"restart control: {path} (continues from "
+                      f"{args.output})")
+            else:
+                print(f"WARNING: not writing the restart control to {path}, "
+                      "which is the control file of this run")
 
     # Flush each frame to disk as it is written, so the output can be
     # inspected while the (possibly long) optimization is still running. The
