@@ -384,7 +384,11 @@ class Homogenization:
             measure only the cost of queueing their kernels, and the wait for
             that work lands in the next region that reads a reduction back to
             the host. The gap between these numbers and the GPU-busy time
-            from a kernel trace is therefore the pipeline bubble.
+            from a kernel trace is therefore the pipeline bubble. A
+            :class:`muTopOpt.timing.Timer` with ``synchronize`` set waits for
+            the device around every region instead, which charges each phase
+            with its own kernels. The operator apply is split into
+            ``"ghosts"`` and ``"stencil"``.
 
         Raises
         ------
@@ -655,8 +659,16 @@ class Homogenization:
 
     # -- solves -------------------------------------------------------------
     def _hessp(self, u, Au):
-        self.engine.communicate_ghosts(u)
-        self.op.apply(u, self.lam, self.mu, Au)
+        if self.timer is None:
+            self.engine.communicate_ghosts(u)
+            self.op.apply(u, self.lam, self.mu, Au)
+            return
+        # Split the halo exchange (inter-rank communication) from the stencil
+        # (pure local bandwidth) for a solve-time breakdown.
+        with self.timer("ghosts"):
+            self.engine.communicate_ghosts(u)
+        with self.timer("stencil"):
+            self.op.apply(u, self.lam, self.mu, Au)
 
     def _clamp_rtol(self, rtol):
         """Raise ``rtol`` to what this precision can actually reach, warning

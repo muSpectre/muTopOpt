@@ -288,6 +288,18 @@ ELASTICITY = Section(
                 "optimizer stays in double.",
                 choices=("double", "single")),
         }),
+        "timing": Section("Detail of the timing summary printed at the end.", {
+            "detailed": Key(
+                "bool", False,
+                "Break every inner solve down into CG steps, operator apply "
+                "(halo exchange and stencil) and preconditioner phases."),
+            "synchronize": Key(
+                "bool", True,
+                "With detailed timing on a GPU, wait for the device at the "
+                "start and end of every timed region so each is charged with "
+                "its own kernels rather than with the queueing cost; this "
+                "removes host/device overlap and slows the run slightly."),
+        }),
         "output": Section("NetCDF output.", {
             "file": Key(
                 "string", "design.nc",
