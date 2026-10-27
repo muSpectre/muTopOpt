@@ -164,6 +164,8 @@ def _settings(control):
         cg_stall_rel=adaptive["stall_relative_decrease"],
         device=c["compute"]["device"],
         precision=c["compute"]["precision"],
+        detailed_timing=c["timing"]["detailed"],
+        synchronize_timing=c["timing"]["synchronize"],
         output=c["output"]["file"],
         dump_every=(c["output"]["dump_every"] if c["output"]["dump_every"] > 0
                     else -1),
@@ -316,7 +318,14 @@ def main():
             cg_verbose=args.output_cg_iters,
             device=args.device,
             dtype=dtype,
+            timer=timer if args.detailed_timing else None,
         )
+    if (args.detailed_timing and args.synchronize_timing
+            and homog.device is not None and homog.device.is_device):
+        import cupy
+
+        # Homogenization made this rank's GPU cupy's current device.
+        timer.synchronize = cupy.cuda.Device().synchronize
     # Banner first, before the target checks and the restart read: a run that
     # dies in setup should still say which build it was. muGrid prints from
     # every rank (its banner carries the per-rank decomposition); muTopOpt's is
