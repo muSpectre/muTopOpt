@@ -28,6 +28,8 @@ v1.3.0 (27Oct26)
 - ENH: The log and the NetCDF output say whether MPI takes device buffers directly
 - API: MPI runs no longer need mpi4py: muGrid starts MPI, and the optimizers reduce
   over the muGrid communicator; an mpi4py communicator is still accepted
+- ENH: Optional detailed timing breaks every inner solve down into CG steps, halo
+  exchange, stencil and preconditioner phases, synchronized with the GPU if wanted
 - TST: The tests run on the real MPI decomposition under mpirun
 - BUILD: Requires muGrid 1.6.0 or newer and a NuMPI release newer than 0.15.2
 
