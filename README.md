@@ -48,24 +48,23 @@ pip install -e ".[test,scipy]"
 
 ### GPU memory
 
-With `compute.device` set to `"gpu"`, muTopOpt allocates everything on the GPU either as plain
-device memory (`hipMalloc`/`cudaMalloc`) or as managed memory
-(`hipMallocManaged`/`cudaMallocManaged`), and picks one automatically:
+With `compute.device` set to `"gpu"`, muTopOpt allocates everything on the GPU as
+plain device memory (`hipMalloc`/`cudaMalloc`), on every kind of GPU. Managed
+memory (`hipMallocManaged`/`cudaMallocManaged`) is slower everywhere:
 
-| GPU | ranks | memory | why |
-|---|---|---|---|
-| discrete (NVIDIA, AMD MI200/MI300X, …) | any | plain | host and device memories are separate, so managed pages migrate between them whenever the other side touches them |
-| unified-memory APU (AMD MI300A) | 1 | managed | host and device share one physical memory, so nothing migrates; plain allocations are limited to the ~62.8 GiB device window, managed ones reach all 128 GB |
-| unified-memory APU (AMD MI300A) | > 1 | plain | MPI exchanges of managed buffers are much slower than of plain device buffers |
+- on discrete GPUs (NVIDIA, AMD MI200/MI300X, …) host and device memories are
+  separate, so managed pages migrate between them whenever the other side
+  touches them;
+- on unified-memory APUs (AMD MI300A) nothing migrates, but MPI moves managed
+  buffers like host memory, with the CPU: an all-to-all between the four GPUs
+  of a Hunter node is ~40x slower than on plain device buffers.
 
-The measurements behind this choice are in the notes above
-`_device_has_unified_memory` in `muTopOpt/homogenization.py`.
+The measurements are in the device-memory notes in `muTopOpt/homogenization.py`.
 
-The run prints its choice and the reason (`device memory: ...`) and records it
-in the output file (`device_memory` attribute). `MUTOPOPT_MANAGED=1` or `0`
-overrides it. The one case that needs this: a multi-rank run on MI300A whose
-fields on one rank exceed the plain window. Either use more ranks or set
-`MUTOPOPT_MANAGED=1` and accept the slower exchanges.
+The run prints which memory it uses (`device memory: ...`) and records it in
+the output file (`device_memory` attribute). `MUTOPOPT_MANAGED=1` asks for
+managed memory instead, for a system whose plain allocations stop short of
+what one rank's fields need; it makes MPI exchanges slower.
 
 muTopOpt sets nothing for MPI or NetCDF for either kind of memory: muGrid asks
 the MPI library whether it takes device buffers, and the GPU runtime whether
