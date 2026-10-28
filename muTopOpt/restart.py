@@ -275,19 +275,21 @@ def restart_density(filename, nb_grid_pts):
 def next_output_name(path):
     """The output file name of the run that continues from ``path``.
 
-    A trailing run number in the stem -- after ``.``, ``_`` or ``-`` -- is
-    incremented, keeping its zero padding (``run_009.nc`` -> ``run_010.nc``,
-    ``design.1.nc`` -> ``design.2.nc``); a stem without one gets ``.1``
-    (``design.nc`` -> ``design.1.nc``). The directory and extension are kept.
+    The run counter is a ``.restart<N>`` suffix of the stem: it is incremented
+    if present (``design.restart1.nc`` -> ``design.restart2.nc``) and appended
+    as ``.restart1`` otherwise (``design.nc`` -> ``design.restart1.nc``).
+    Numbers elsewhere in the name, such as a parameter value in
+    ``topopt_nu_-0.3.nc``, are never touched. The directory and extension are
+    kept.
     """
     directory, name = os.path.split(path)
     stem, ext = os.path.splitext(name)
-    match = re.fullmatch(r"(.*[._-])(\d+)", stem)
+    match = re.fullmatch(r"(.*)\.restart(\d+)", stem)
     if match is None:
-        stem = f"{stem}.1"
+        stem = f"{stem}.restart1"
     else:
-        prefix, number = match.groups()
-        stem = f"{prefix}{int(number) + 1:0{len(number)}d}"
+        base, number = match.groups()
+        stem = f"{base}.restart{int(number) + 1}"
     return os.path.join(directory, stem + ext)
 
 

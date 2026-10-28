@@ -319,7 +319,8 @@ ELASTICITY = Section(
                 "Control file written at the start of the run to continue it: "
                 "this run's complete control, starting from the last frame of "
                 "output.file and writing to a new, numbered output file "
-                "(design.nc -> design.1.nc -> design.2.nc). Only frames "
+                "(design.nc -> design.restart1.nc -> design.restart2.nc). "
+                "Only frames "
                 "already written can be continued from, so set dump_every for "
                 "runs that may be interrupted."),
         }),

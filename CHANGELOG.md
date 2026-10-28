@@ -16,6 +16,12 @@ Style for this changelog (keep to it so entries stay uniform):
 Change log for muTopOpt
 =======================
 
+v1.4.0 (not yet released)
+-------------------------
+
+- BUG: The restart control file numbers the next output file with a `.restart<N>`
+  suffix; 1.3.0 incremented any trailing number, such as a parameter in the name
+
 v1.3.0 (27Oct26)
 ----------------
 
