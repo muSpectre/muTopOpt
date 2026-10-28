@@ -16,6 +16,8 @@ requires-python = ">=3.10"
 dynamic = ["version"]
 dependencies = [
     "numpy",
+    # TOML control files; the standard library's tomllib from Python 3.11 on
+    "tomli>=1.1.0; python_version < '3.11'",
     # 1.6.0 is the first release that starts MPI itself
     # (Communicator.world(), node_rank for GPU placement, no mpi4py needed),
     # detects GPU-aware MPI with any MPI library that reports it, and stages

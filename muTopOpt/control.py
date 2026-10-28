@@ -3,9 +3,10 @@
 #
 # MIT License (see LICENSE)
 #
-"""JSON control files for ``simulate.py``.
+"""JSON and TOML control files for ``simulate.py``.
 
-A run is described by one JSON object with a fixed set of sections and keys.
+A run is described by one JSON object -- or the equivalent TOML document, with
+the sections as tables -- with a fixed set of sections and keys.
 :data:`ELASTICITY` defines every key once -- type, default, admissible values
 and help text -- and everything else is derived from it: the defaults file
 (:func:`defaults`, :func:`dumps`), the JSON Schema (:func:`json_schema`),
@@ -16,12 +17,20 @@ A control file may set any subset of the keys; the others take their
 defaults. Unknown sections or keys are an error, so a misspelt key cannot
 silently fall back to its default. ``null`` means *determined automatically*
 by the heuristic described in the key's help text; it is only admissible for
-keys that have such a heuristic.
+keys that have such a heuristic. TOML has no ``null``; there, leave the key
+out, since every such key except the alternative target pair defaults to
+``null``, and that pair is cleared by setting the other one.
 """
 
 import json
 import re
+import sys
 from dataclasses import dataclass, field
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 class ControlError(ValueError):
     """A control file that does not satisfy the schema."""
@@ -417,12 +426,20 @@ def _bounds(target, key):
 
 def load(path, schema=ELASTICITY):
     """Read, validate and complete a control file: keys it does not set take
-    their defaults. Raises :class:`ControlError` on any violation."""
-    try:
-        with open(path) as f:
-            given = json.load(f)
-    except json.JSONDecodeError as err:
-        raise ControlError(f"{path}: not valid JSON: {err}") from err
+    their defaults. A file ending in ``.toml`` is read as TOML, anything else
+    as JSON. Raises :class:`ControlError` on any violation."""
+    if str(path).lower().endswith(".toml"):
+        try:
+            with open(path, "rb") as f:
+                given = tomllib.load(f)
+        except tomllib.TOMLDecodeError as err:
+            raise ControlError(f"{path}: not valid TOML: {err}") from err
+    else:
+        try:
+            with open(path) as f:
+                given = json.load(f)
+        except json.JSONDecodeError as err:
+            raise ControlError(f"{path}: not valid JSON: {err}") from err
     return validate(given, schema)
 
 
