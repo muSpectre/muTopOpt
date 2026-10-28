@@ -16,6 +16,15 @@ Style for this changelog (keep to it so entries stay uniform):
 Change log for muTopOpt
 =======================
 
+v1.4.0 (28Oct26)
+----------------
+
+- ENH: Control files can also be written in TOML; a file whose name ends in
+  `.toml` is read as TOML, anything else as JSON
+- BUG: The restart control file numbers the next output file with a `.restart<N>`
+  suffix; 1.3.0 incremented any trailing number, such as a parameter in the name
+- BUILD: Requires tomli on Python 3.10
+
 v1.3.0 (27Oct26)
 ----------------
 

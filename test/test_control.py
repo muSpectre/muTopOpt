@@ -182,3 +182,52 @@ def test_simulate_rejects_a_bad_file(tmp_path):
 def test_key_dataclass_is_frozen():
     with pytest.raises(Exception):
         Key("int", 0, "x").default = 1
+
+
+TOML_MINIMAL = """
+[grid]
+nb_grid_pts = [16, 16, 16]
+
+[target]
+young_modulus = 0.2
+poisson_ratio = -0.3
+
+[optimizer.trust_region]
+initial_radius = 0.5
+"""
+
+JSON_MINIMAL = {
+    "grid": {"nb_grid_pts": [16, 16, 16]},
+    "target": {"young_modulus": 0.2, "poisson_ratio": -0.3},
+    "optimizer": {"trust_region": {"initial_radius": 0.5}},
+}
+
+
+def test_toml_matches_json(tmp_path):
+    """A TOML file is read into the same control as the equivalent JSON,
+    including nested sections and the alternative target pair."""
+    toml_path = tmp_path / "run.toml"
+    toml_path.write_text(TOML_MINIMAL)
+    json_path = tmp_path / "run.json"
+    json_path.write_text(json.dumps(JSON_MINIMAL))
+    control = load(str(toml_path))
+    assert control == load(str(json_path))
+    assert control["target"]["bulk_modulus"] is None
+    assert control["optimizer"]["trust_region"]["initial_radius"] == 0.5
+
+
+def test_toml_is_validated(tmp_path):
+    path = tmp_path / "run.toml"
+    path.write_text("[grid]\nnb_grid_pts = [16, 16, 16]\nspacing = 1.0\n")
+    with pytest.raises(ControlError, match=r"grid: unknown key\(s\) 'spacing'"):
+        load(str(path))
+    path.write_text("[compute]\nprecision = 'half'\n")
+    with pytest.raises(ControlError, match=r"compute.precision: 'half' is not"):
+        load(str(path))
+
+
+def test_invalid_toml_is_reported(tmp_path):
+    path = tmp_path / "run.toml"
+    path.write_text("[grid\nnb_grid_pts = [16, 16, 16]\n")
+    with pytest.raises(ControlError, match="not valid TOML"):
+        load(str(path))

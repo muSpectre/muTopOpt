@@ -11,10 +11,11 @@ stiffness, given either as bulk and shear moduli (``target.bulk_modulus``,
 ``target.shear_modulus``) or as Young's modulus and Poisson's ratio
 (``target.young_modulus``, ``target.poisson_ratio``).
 
-A run is described by a JSON control file; ``--write-defaults FILE`` writes
-one with every key at its default, ready to edit, together with its JSON
-Schema. Keys the file does not set take their defaults; ``null`` means the
-value is determined automatically (the help of each key says how).
+A run is described by a JSON control file, or a TOML one if its name ends in
+``.toml``; ``--write-defaults FILE`` writes a JSON one with every key at its
+default, ready to edit, together with its JSON Schema. Keys the file does not
+set take their defaults; ``null`` means the value is determined automatically
+(the help of each key says how). TOML has no ``null``: leave such a key out.
 
 Mathematical setup
 ------------------
@@ -66,6 +67,19 @@ A minimal control file only sets what differs from the defaults, e.g.
     {"grid": {"nb_grid_pts": [128, 128, 128]},
      "target": {"young_modulus": 0.2, "poisson_ratio": -0.3},
      "compute": {"device": "gpu", "precision": "single"}}
+
+or, as TOML,
+
+    [grid]
+    nb_grid_pts = [128, 128, 128]
+
+    [target]
+    young_modulus = 0.2
+    poisson_ratio = -0.3
+
+    [compute]
+    device = "gpu"
+    precision = "single"
 """
 
 import argparse
@@ -217,8 +231,9 @@ def main():
         + describe(),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
-        "control", nargs="?", metavar="CONTROL.json",
-        help="JSON control file; keys it does not set take their defaults")
+        "control", nargs="?", metavar="CONTROL",
+        help="JSON control file, or TOML if the name ends in .toml; keys it "
+        "does not set take their defaults")
     p.add_argument(
         "--write-defaults", metavar="FILE",
         help=f"write a control file with every key at its default (and the "
