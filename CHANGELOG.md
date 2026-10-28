@@ -16,8 +16,8 @@ Style for this changelog (keep to it so entries stay uniform):
 Change log for muTopOpt
 =======================
 
-v1.4.0 (not yet released)
--------------------------
+v1.4.0 (28Oct26)
+----------------
 
 - ENH: Control files can also be written in TOML; a file whose name ends in
   `.toml` is read as TOML, anything else as JSON
