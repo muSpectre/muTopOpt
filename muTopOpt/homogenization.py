@@ -134,60 +134,44 @@ def _resolve_device(device, comm=None):
 
 
 # --------------------------------------------------------------------------- #
-# Device memory: plain or managed, and why
+# Device memory: plain, unless managed is asked for
 #
 # Every GPU field, the CG scratch and the preconditioner's arrays come from one
 # allocator, chosen once per process before the first field exists. There are
-# two candidates, and which is right depends on the kind of GPU and on whether
-# the run uses MPI:
+# two candidates:
 #
-# * Plain device memory (hipMalloc / cudaMalloc) -- muGrid's own default.
+# * Plain device memory (hipMalloc / cudaMalloc) -- muGrid's own default, and
+#   muTopOpt's on every GPU.
 # * Managed memory (hipMallocManaged / cudaMallocManaged), installed by
-#   _enable_managed_device_allocator.
+#   _enable_managed_device_allocator, only on request.
 #
 # Discrete GPUs (NVIDIA cards, AMD MI100/MI200/MI300X, ...): host and device
 # have separate physical memories, and a managed page lives in one of them at
 # a time; whichever side touches it moves it there, over PCIe or the fabric.
 # A solver that streams every field through the GPU on every iteration then
 # migrates all of them, all the time: measured on an RTX PRO 500, 9x slower
-# per CG iteration at 64^3, and 96^3 made no progress at all. Plain device
-# memory, always.
+# per CG iteration at 64^3, and 96^3 made no progress at all.
 #
 # Unified-memory APUs (AMD MI300A): CPU and GPU share one physical HBM, so
-# nothing ever migrates, and the two allocators differ only in how the memory
-# is mapped and where it is drawn from:
+# nothing migrates, and kernels read managed memory at full speed -- but MPI
+# does not. Measured on Hunter (HLRS; 4x MI300A per node, ROCm 7.0.2, Cray
+# MPICH 9.1 with its GPU support enabled), an all-to-all between the four
+# GPUs of a node, 64 MiB per peer, ms per exchange:
 #
-#   plain    GPU-only mapping (with XNACK off, the default), and limited to
-#            the driver's device window: ~62.8 GiB of the 128 GB package.
-#   managed  mapped for CPU and GPU, from the whole 128 GB.
+#     plain     0.9
+#     managed  39
+#     host     35   (malloc, for comparison)
 #
-#   Measured on Hunter (HLRS; 4x MI300A per node, ROCm 7.0.2, Cray MPICH
-#   9.1 with its GPU support enabled), muGrid's homogenization example
-#   at 256^3, ms per CG iteration, plain -> managed:
+#   MPI moves managed buffers as it moves host memory, with the CPU, ~40x
+#   slower than plain device buffers. In muGrid's homogenization example at
+#   256^3 on 4 GPUs that made a CG iteration 1.8x (hybrid) to 5.4x
+#   (reference FFT) slower. On the same nodes plain hipMalloc reached 120 GiB
+#   of the 128 GB package, with XNACK on or off, so managed memory does not
+#   buy capacity there either.
 #
-#                     1 GPU                4 GPUs (MPI)
-#     reference FFT   10.76 -> 11.17       5.74 ->  30.94   (5.4x)
-#     hybrid          12.31 -> 12.25       5.17 ->   9.18   (1.8x)
-#
-#   Kernels read managed memory at full speed -- on one GPU the choice costs
-#   at most 4% -- but every MPI exchange of a managed buffer is far slower:
-#   the reference solve's all-to-all went from 1.6 to 13 ms per FFT. The
-#   likely cause is that the MPI's GPU transport treats managed memory as host
-#   memory and copies it with the CPU instead of over its device path; that
-#   is an inference from the timings, not a confirmed mechanism, and it was
-#   measured with one MPI only; other MPI libraries may differ, which is
-#   what the overrides below are for.
-#
-#   So on an APU: managed memory for a single rank, where it removes the
-#   62.8 GiB limit for (nearly) nothing; plain device memory as soon as there
-#   is more than one rank. "More than one rank" is the communicator's size,
-#   not whether MPI was compiled in: a one-rank run sends no messages.
-#
-# Overrides. managed_memory=True/False, or MUTOPOPT_MANAGED=1/0, replace the
-# automatic choice. The case that needs one: a multi-rank run on an APU whose
-# fields on one rank do not fit the plain window. It then fails to allocate,
-# and either more ranks (smaller slabs) or MUTOPOPT_MANAGED=1 -- accepting the
-# slower exchanges -- gets it running.
+# Override. managed_memory=True, or MUTOPOPT_MANAGED=1, installs managed
+# memory: for a system whose plain allocations stop short of what one rank's
+# fields need, at the price of slower MPI exchanges.
 #
 # MPI and NetCDF need nothing from muTopOpt for either kind of memory: muGrid
 # (1.6.0 and newer) asks the MPI library whether it takes device buffers, and
@@ -203,25 +187,9 @@ def gpu_aware_mpi():
     return bool(getattr(muGrid._muGrid.Communicator, "gpu_aware_mpi", False))
 
 
-def _device_has_unified_memory(device_id=0):
-    """True when the GPU physically shares memory with the host (an APU such as
-    MI300A); see the notes above.
-
-    ``integrated`` is the portable flag for this in both CUDA and HIP; on a
-    discrete card it is 0. Returns False when the device cannot be queried.
-    """
-    try:
-        import cupy
-
-        props = cupy.cuda.runtime.getDeviceProperties(device_id)
-    except Exception:
-        return False
-    return bool(props.get("integrated", 0))
-
-
 def _requested_managed_memory(managed_memory, environ=os.environ):
-    """The caller's explicit choice -- ``True``, ``False`` -- or ``None`` to
-    let :func:`_device_memory_policy` decide.
+    """The caller's explicit choice -- ``True``, ``False`` -- or ``None`` for
+    the default, plain device memory.
 
     The argument wins over the environment; ``MUTOPOPT_MANAGED=0`` asks for
     plain device memory and any other value for managed memory.
@@ -234,7 +202,7 @@ def _requested_managed_memory(managed_memory, environ=os.environ):
     return env != "0"
 
 
-def _device_memory_policy(on_device, unified, nb_ranks, requested=None):
+def _device_memory_policy(on_device, requested=None):
     """Choose between managed and plain device memory; see the notes above.
 
     Returns ``(managed, reason)``: whether to install the managed allocator,
@@ -242,19 +210,12 @@ def _device_memory_policy(on_device, unified, nb_ranks, requested=None):
     """
     if not on_device:
         return False, "CPU run, no device memory"
-    if requested is not None:
-        return requested, (
-            "managed memory, as requested" if requested
-            else "plain device memory, as requested")
-    if not unified:
-        return False, ("plain device memory: discrete GPU, where managed "
-                       "pages would migrate between host and device")
-    if nb_ranks > 1:
-        return False, (f"plain device memory: unified-memory GPU with "
-                       f"{nb_ranks} MPI ranks, and MPI is slow on managed "
-                       f"buffers")
-    return True, ("managed memory: unified-memory GPU, single rank -- the "
-                  "full memory at no compute cost")
+    if requested:
+        return True, "managed memory, as requested"
+    if requested is None:
+        return False, ("plain device memory: the default, since MPI is much "
+                       "slower on managed buffers")
+    return False, "plain device memory, as requested"
 
 
 # Process-global guard: the managed allocator, and muGrid's routing to it, must
@@ -268,15 +229,10 @@ def _enable_managed_device_allocator():
     """Route muGrid's device allocations (and cupy's) through a *managed*
     memory pool, returning ``True`` on success.
 
-    On a unified-memory accelerator the default device allocator
-    (raw ``hipMalloc``/``cudaMalloc``) is capped at the coarse-grained
-    device-local window -- on an AMD MI300A APU that is ~half the 128 GB
-    package (~62.8 GiB), even though the HBM is physically shared with the
-    host. Managed allocations (``hipMallocManaged``/``cudaMallocManaged``) draw
-    from the whole unified pool instead, so device fields can span the full
-    HBM. Routing cupy's default pool through managed memory and then pointing
-    muGrid at that pool (``use_cupy_allocator``) puts *all* device memory --
-    fields, CG scratch, the preconditioner -- on the managed path.
+    Only on request (see the notes above). Routing cupy's default pool
+    through managed memory and then pointing muGrid at that pool
+    (``use_cupy_allocator``) puts *all* device memory -- fields, CG scratch,
+    the preconditioner -- on the managed path.
 
     Installed once per process (idempotent); a no-op returning ``False`` when
     cupy is unavailable."""
@@ -366,17 +322,14 @@ class Homogenization:
             reductions stay in double precision.
         managed_memory : bool, optional
             Managed instead of plain device memory for everything on the GPU.
-            ``None`` (default) decides from the device and the rank count:
-            managed only on a unified-memory APU (AMD MI300A) with a single
-            rank, where it reaches the full 128 GB instead of the ~62.8 GiB
-            plain window at no compute cost; plain device memory on discrete
-            GPUs, where managed pages migrate, and with more than one MPI
-            rank, where MPI is slow on managed buffers. ``True``/``False``
-            (or ``MUTOPOPT_MANAGED=1``/``0``) override that. The choice and
-            its reason are stored in :attr:`device_memory` and
-            :attr:`device_memory_reason`; the notes above
-            ``_device_has_unified_memory`` give the measurements. Ignored on
-            CPU.
+            ``None`` (default) and ``False`` mean plain device memory, on
+            every GPU: managed pages migrate on discrete GPUs, and MPI is
+            much slower on managed buffers on unified-memory APUs (AMD
+            MI300A). ``True`` (or ``MUTOPOPT_MANAGED=1``) asks for managed
+            memory. The choice and its reason are stored in
+            :attr:`device_memory` and :attr:`device_memory_reason`; the
+            device-memory notes in ``muTopOpt/homogenization.py`` give the
+            measurements. Ignored on CPU.
         timer : muTimer.Timer, optional
             Handed to the CG solver and the preconditioner so a benchmark can
             read back where the *wall* time of a solve goes. On a GPU the
@@ -430,14 +383,11 @@ class Homogenization:
 
             cupy.cuda.Device(self.device.device_id).use()
         # Plain or managed device memory: see the notes above
-        # _device_has_unified_memory. Decided before the engine allocates its
+        # _device_memory_policy. Decided before the engine allocates its
         # first device field.
         on_device = self.device is not None and self.device.is_device
-        unified = on_device and _device_has_unified_memory(
-            self.device.device_id)
         managed, reason = _device_memory_policy(
-            on_device, unified, self.comm.size,
-            _requested_managed_memory(managed_memory))
+            on_device, _requested_managed_memory(managed_memory))
         self.managed_memory = managed and _enable_managed_device_allocator()
         if managed and not self.managed_memory:
             reason += " -- but cupy is unavailable, so plain device memory"
