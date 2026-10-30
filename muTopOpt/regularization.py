@@ -68,7 +68,6 @@ import muGrid
 C_W = 1.0 / 3.0
 
 
-
 def _like(h, a, given):
     """``a`` (in the fields' array module) as an array of the kind `given`
     came in as: kept on the device for a device array, copied to the host
@@ -76,6 +75,7 @@ def _like(h, a, given):
     way, so that a host caller pays one copy of the result and a device
     caller none."""
     return a if isinstance(given, h.xp.ndarray) else h.to_host(a)
+
 
 def perimeter_prefactor(homogenization):
     """``1 / (c_W V^((d−1)/d))``: the factor that turns the raw Modica-Mortola
