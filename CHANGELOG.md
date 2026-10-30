@@ -33,6 +33,10 @@ v1.5.0 (not yet released)
 - PERF: The element-wise sensitivity work of the gradient and of the Hessian-vector
   products runs on the GPU, in double precision, instead of in NumPy on the host;
   only the gradient and the product are copied to the host
+- PERF: The phase-field regularizations, including the consistent double well, also
+  compute on the GPU; their results come back as host or device arrays like their input
+- TST: GPU tests compare gradient, Hessian product and regularization with the CPU;
+  they are skipped without CuPy and a GPU build of muGrid
 
 v1.4.0 (28Oct26)
 ----------------

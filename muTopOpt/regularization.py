@@ -68,6 +68,15 @@ import muGrid
 C_W = 1.0 / 3.0
 
 
+
+def _like(h, a, given):
+    """``a`` (in the fields' array module) as an array of the kind `given`
+    came in as: kept on the device for a device array, copied to the host
+    otherwise. The regularization computes in the fields' module either
+    way, so that a host caller pays one copy of the result and a device
+    caller none."""
+    return a if isinstance(given, h.xp.ndarray) else h.to_host(a)
+
 def perimeter_prefactor(homogenization):
     """``1 / (c_W V^((d−1)/d))``: the factor that turns the raw Modica-Mortola
     functional into the interfacial area in units of ``L^(d−1)``, with ``V``
@@ -164,15 +173,17 @@ class PhaseFieldRegularization:
         ``w/(c_W V^((d−1)/d)) · h^d [2η (−Δ_h ρ) + W'(ρ)/η]`` with
         ``W'(ρ) = 2ρ(1 − ρ)(1 − 2ρ)``.
         """
-        rho = np.asarray(rho)
-        self._rho.p[...] = self.h.to_device(rho)
-        self.h.engine.communicate_ghosts(self._rho)
+        h = self.h
+        given = rho
+        rho = h.xp.asarray(rho, dtype=float)
+        self._rho.p[...] = h.to_device(rho)
+        h.engine.communicate_ghosts(self._rho)
         self.laplace.apply(self._rho, self._lap)  # (-Δ rho)
-        lap = self.h.to_host(self._lap.p)
+        lap = h.xp.asarray(self._lap.p, dtype=float)
 
-        grad_pen = self.h.comm.sum(float(np.sum(rho * lap))) * self.vol_pixel
-        dwell = self.h.comm.sum(
-            float(np.sum(rho**2 * (1.0 - rho) ** 2))
+        grad_pen = h.comm.sum(float((rho * lap).sum())) * self.vol_pixel
+        dwell = h.comm.sum(
+            float((rho**2 * (1.0 - rho) ** 2).sum())
         ) * self.vol_pixel
 
         # Raw Modica-Mortola bracket eta * ∫|∇rho|^2 + (1/eta) * ∫ W; the
@@ -186,7 +197,7 @@ class PhaseFieldRegularization:
             + dwell_drho * self.vol_pixel / self.eta
         )
         scale = self.scale
-        return scale * f, scale * g
+        return scale * f, _like(h, scale * g, given)
 
     def hessian_vector_product(self, rho, v):
         """Return ``H_reg v`` for a density direction ``v`` (exact).
@@ -196,19 +207,21 @@ class PhaseFieldRegularization:
         ``h^d W''(ρ)/η`` with ``W''(ρ) = 2 (1 − 6ρ + 6ρ²)`` (both times the
         normalization :attr:`scale`). Since ``W''(1/2) < 0``, the
         regularization Hessian is indefinite in the interfacial region."""
-        rho = np.asarray(rho)
-        v = np.asarray(v)
-        self._rho.p[...] = self.h.to_device(v)
-        self.h.engine.communicate_ghosts(self._rho)
+        h = self.h
+        given = v
+        rho = h.xp.asarray(rho, dtype=float)
+        v = h.xp.asarray(v, dtype=float)
+        self._rho.p[...] = h.to_device(v)
+        h.engine.communicate_ghosts(self._rho)
         self.laplace.apply(self._rho, self._lap)  # (-Delta v)
-        lap_v = self.h.to_host(self._lap.p)
+        lap_v = h.xp.asarray(self._lap.p, dtype=float)
 
         d2well = 2.0 * (1.0 - 6.0 * rho + 6.0 * rho**2)
         hv = (
             self.eta * 2.0 * lap_v * self.vol_pixel
             + d2well * v * self.vol_pixel / self.eta
         )
-        return self.scale * hv
+        return _like(h, self.scale * hv, given)
 
 
 def fe_laplacian_stencil(dim, grid_spacing, element):
@@ -357,15 +370,17 @@ class NodalPhaseFieldRegularization:
     def value_and_gradient(self, rho):
         """Return ``(f_reg, ∂f_reg/∂ρ)`` for a nodal density array (value
         MPI-reduced, gradient the local nodal slice)."""
-        rho = np.asarray(rho)
-        self._rho.p[...] = self.h.to_device(rho)
-        self.h.engine.communicate_ghosts(self._rho)
+        h = self.h
+        given = rho
+        rho = h.xp.asarray(rho, dtype=float)
+        self._rho.p[...] = h.to_device(rho)
+        h.engine.communicate_ghosts(self._rho)
         self.laplace.apply(self._rho, self._Lrho)  # L rho
-        Lrho = self.h.to_host(self._Lrho.p)
+        Lrho = h.xp.asarray(self._Lrho.p, dtype=float)
 
         # rhoᵀ L rho = ∫|∇rho|² (L already includes the physical volume
         # weighting); multiplied by eta below.
-        grad_pen = self.h.comm.sum(float(np.sum(rho * Lrho)))
+        grad_pen = h.comm.sum(float((rho * Lrho).sum()))
 
         if self._dwell is not None:
             # Fully consistent Galerkin: exact ∫ W(rho(x)) dx of the nodal
@@ -373,8 +388,8 @@ class NodalPhaseFieldRegularization:
             dwell, dwell_grad = self._dwell.value_and_gradient(rho)
         else:
             # Lumped nodal quadrature (pointwise).
-            dwell = self.h.comm.sum(
-                float(np.sum(rho**2 * (1.0 - rho) ** 2))
+            dwell = h.comm.sum(
+                float((rho**2 * (1.0 - rho) ** 2).sum())
             ) * self.vol_pixel
             dwell_grad = (
                 2.0 * rho * (1.0 - rho) * (1.0 - 2.0 * rho) * self.vol_pixel
@@ -385,7 +400,7 @@ class NodalPhaseFieldRegularization:
         f = self.eta * grad_pen + dwell / self.eta
         g = self.eta * 2.0 * Lrho + dwell_grad / self.eta
         scale = self.scale
-        return scale * f, scale * g
+        return scale * f, _like(h, scale * g, given)
 
     def hessian_vector_product(self, rho, v):
         """Return ``H_reg v`` for a nodal density direction ``v``.
@@ -398,16 +413,18 @@ class NodalPhaseFieldRegularization:
         trust-region method only requires a bounded model Hessian, and the
         lumped diagonal retains the indefiniteness in the interface
         (``W''(1/2) < 0``)."""
-        rho = np.asarray(rho)
-        v = np.asarray(v)
-        self._rho.p[...] = self.h.to_device(v)
-        self.h.engine.communicate_ghosts(self._rho)
+        h = self.h
+        given = v
+        rho = h.xp.asarray(rho, dtype=float)
+        v = h.xp.asarray(v, dtype=float)
+        self._rho.p[...] = h.to_device(v)
+        h.engine.communicate_ghosts(self._rho)
         self.laplace.apply(self._rho, self._Lrho)  # L v
-        Lv = self.h.to_host(self._Lrho.p)
+        Lv = h.xp.asarray(self._Lrho.p, dtype=float)
 
         d2well = 2.0 * (1.0 - 6.0 * rho + 6.0 * rho**2)
         hv = (
             self.eta * 2.0 * Lv
             + d2well * v * self.vol_pixel / self.eta
         )
-        return self.scale * hv
+        return _like(h, self.scale * hv, given)

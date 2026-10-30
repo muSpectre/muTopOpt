@@ -207,17 +207,25 @@ class ConsistentDoubleWell:
 
     def value_and_gradient(self, rho):
         """Return ``(∫ W(ρ_h) dx, ∂/∂ρ)`` for a nodal density array; the value
-        is MPI-reduced, the gradient is the local nodal slice.
+        is MPI-reduced, the gradient is the local nodal slice, an array of
+        the kind `rho` is (host, or in the fields' array module).
 
         The kernel gives each thread its own node, so it writes the nodal
         gradient directly -- no scatter and no ghost reduction here.
         """
         h = self.h
-        self._rho.p[...] = h.to_device(np.asarray(rho, dtype=h.dtype))
+        xp = h.xp
+        shape = rho.shape
+        self._rho.p[...] = h.to_device(rho)
         h.engine.communicate_ghosts(self._rho)
         self.op.compute(self._rho, self._moments, self._grads)
-        c = self.W_COEFFS
-        m = h.to_host(self._moments.p).reshape((self.NB_MOMENTS, -1))
-        g = h.to_host(self._grads.p).reshape((self.NB_MOMENTS, -1))
+        # Combined in the fields' array module, in double precision; only
+        # the NB_MOMENTS local moment sums reach the host for the reduction.
+        c = xp.asarray(self.W_COEFFS)
+        m = xp.asarray(self._moments.p, dtype=float).reshape(
+            (self.NB_MOMENTS, -1))
+        g = xp.asarray(self._grads.p, dtype=float).reshape(
+            (self.NB_MOMENTS, -1))
         f = h.comm.sum(float(c @ m.sum(axis=1)))
-        return f, (c @ g).reshape(np.shape(rho))
+        grad = (c @ g).reshape(shape)
+        return f, (grad if isinstance(rho, xp.ndarray) else h.to_host(grad))
