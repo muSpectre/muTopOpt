@@ -22,6 +22,14 @@ v1.5.0 (not yet released)
 - PERF: Plain device memory is used on every GPU, also for a single rank on a
   unified-memory accelerator, where MPI is ~40x slower on managed buffers
 - ENH: Managed memory is still available on request
+- PERF: The solves of the trust region's Hessian-vector products adapt their
+  tolerance to the subproblem they serve, between 1e-2 early and 1e-4 near
+  convergence, instead of a fixed 1e-3 that cost twice the CG iterations early on
+- PERF: Hessian solves without warm start skip the operator apply that checks a warm
+  start, and the CG fallback snapshot is only refreshed when the residual has halved
+- API: `optimizer.trust_region.hessian_tolerance` defaults to null (adaptive); a
+  number still fixes it
+- BUILD: Requires NuMPI 0.18.0 or newer
 
 v1.4.0 (28Oct26)
 ----------------

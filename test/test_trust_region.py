@@ -18,6 +18,9 @@ from muTopOpt import (
 )
 from muTopOpt.loadcases import isotropic_stiffness_tensor, target_load_cases
 from muTopOpt.optimize import (
+    HESSIAN_RTOL_MAX,
+    HESSIAN_RTOL_MIN,
+    hessian_rtol,
     initial_density,
     optimize_bounded_lbfgs,
     optimize_trust_region,
@@ -107,3 +110,41 @@ def test_tr_requires_hessian_flag(comm):
     problem, rho0 = _build(comm, cg_tol=1e-6, hessian=False)
     with pytest.raises(ValueError, match="hessian=True"):
         optimize_trust_region(problem, rho0, maxiter=2)
+
+
+def test_hessian_rtol_follows_the_steihaug_tolerance():
+    # A tenth of the subproblem tolerance, within [1e-4, 1e-2]
+    assert hessian_rtol(0.5) == HESSIAN_RTOL_MAX == 1e-2
+    assert hessian_rtol(None) == HESSIAN_RTOL_MAX
+    assert hessian_rtol(3e-2) == pytest.approx(3e-3)
+    assert hessian_rtol(1e-6) == HESSIAN_RTOL_MIN == 1e-4
+
+
+def test_tr_adapts_the_hessian_tolerance(comm):
+    """With the default (adaptive) Hessian tolerance the products are
+    requested at a tolerance derived from the Steihaug CG's -- 1e-2 for the
+    first subproblem -- and the run still lowers the objective."""
+    problem, rho0 = _build(comm, cg_tol=1e-6, hessian=True)
+    f0, _ = problem.objective_and_gradient(rho0)
+    rtols = []
+    hvp = problem.hessian_vector_product
+
+    def recording(v, rtol=None):
+        rtols.append(rtol)
+        return hvp(v, rtol=rtol)
+
+    problem.hessian_vector_product = recording
+    _, info = optimize_trust_region(
+        problem, rho0, comm=problem.h.comm, maxiter=10)
+    assert info["objective"] < f0
+    assert rtols and rtols[0] == HESSIAN_RTOL_MAX
+    assert all(HESSIAN_RTOL_MIN <= r <= HESSIAN_RTOL_MAX for r in rtols)
+
+    # A fixed tolerance is used as given
+    problem, rho0 = _build(comm, cg_tol=1e-6, hessian=True)
+    rtols.clear()
+    hvp = problem.hessian_vector_product
+    problem.hessian_vector_product = recording
+    optimize_trust_region(problem, rho0, comm=problem.h.comm, maxiter=3,
+                          hv_rtol=1e-3)
+    assert rtols and set(rtols) == {1e-3}

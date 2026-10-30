@@ -532,10 +532,37 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
     return np.asarray(res.x), info
 
 
+#: Bounds and factor of the adaptive Hessian-solve tolerance (hessian_rtol)
+HESSIAN_RTOL_MAX = 1e-2
+HESSIAN_RTOL_MIN = 1e-4
+HESSIAN_RTOL_FACTOR = 0.1
+
+
+def hessian_rtol(steihaug_tol):
+    """Relative tolerance of the solves in a Hessian-vector product requested
+    by a Steihaug CG that solves to the relative residual `steihaug_tol`.
+
+    A product with relative error ``e`` perturbs the Steihaug residual by
+    about ``e`` relative to it, so ``e`` an order of magnitude below the
+    Steihaug tolerance keeps the subproblem's own accuracy target meaningful
+    while the products stay no more accurate than it can use. The result is
+    clipped to [:data:`HESSIAN_RTOL_MIN`, :data:`HESSIAN_RTOL_MAX`]: the
+    first subproblems (Steihaug tolerance 0.5) get 1e-2, where a fixed 1e-3
+    cost twice the CG iterations, and the tolerance tightens only as the
+    outer iteration converges. ``None`` (no tolerance given) gives the
+    upper bound.
+    """
+    if steihaug_tol is None:
+        return HESSIAN_RTOL_MAX
+    return float(min(HESSIAN_RTOL_MAX,
+                     max(HESSIAN_RTOL_MIN,
+                         HESSIAN_RTOL_FACTOR * steihaug_tol)))
+
+
 def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
                           bounds=(0.0, 1.0), delta0=0.05, delta_max=0.5,
                           eta=0.1, eta_f=0.25, cg_tol_start=None,
-                          cg_tol_min=1e-10, hv_rtol=1e-3, callback=None,
+                          cg_tol_min=1e-10, hv_rtol=None, callback=None,
                           disp=False):
     """Minimize ``problem`` from ``rho0`` with NuMPI's MPI-distributed,
     bound-constrained **trust-region Newton-CG** (``tr_newton_bounded``); see
@@ -600,9 +627,12 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         :func:`muTopOpt.precision.cg_rtol_floor`).
     hv_rtol : float, optional
         Relative tolerance of the two extra solves in each Hessian-vector
-        product. May be loose (default 1e-3): the Hessian only shapes the
-        trust-region model, and the method's convergence theory requires
-        only a bounded model Hessian.
+        product. ``None`` (default) adapts it to the Steihaug CG that asks
+        for the product (see :func:`hessian_rtol`): loose while the
+        trust-region subproblems are solved coarsely, tighter as the outer
+        iteration converges. A number fixes it. Either way it may be loose:
+        the Hessian only shapes the trust-region model, and the method's
+        convergence theory requires only a bounded model Hessian.
     callback : callable, optional
         ``callback(it, rho, problem.last)`` after each accepted iterate.
     disp : bool, optional
@@ -659,18 +689,20 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
     # happen outside objective_and_gradient, so they are invisible to
     # ``problem.last['cg_iters']``; tally them here and attribute them to the
     # outer iterate whose step they computed.
-    hv_stats = {"cg": 0, "hessp": 0}
+    hv_stats = {"cg": 0, "hessp": 0, "rtol": None}
 
     def fun(x):
         return problem.objective_and_gradient(x)
 
-    def hessp(x, v):
+    def hessp(x, v, tol=None):
         # The Hessian is evaluated around the cached linearization point;
         # re-prime it if the last evaluation was a rejected trial iterate.
         problem.ensure_state(x)
-        hv = problem.hessian_vector_product(v, rtol=hv_rtol)
+        rtol = hessian_rtol(tol) if hv_rtol is None else hv_rtol
+        hv = problem.hessian_vector_product(v, rtol=rtol)
         hv_stats["cg"] += int(sum(problem.last_hv_cg_iters))
         hv_stats["hessp"] += 1
+        hv_stats["rtol"] = rtol
         return hv
 
     def fun_error():
@@ -696,6 +728,7 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         # iterate to this one, then reset the tally.
         problem.last["hv_cg_iters"] = hv_stats["cg"]
         problem.last["nb_hessp"] = hv_stats["hessp"]
+        problem.last["hv_rtol"] = hv_stats["rtol"]
         hv_stats["cg"] = 0
         hv_stats["hessp"] = 0
         history.append(problem.last.get("objective"))
@@ -712,6 +745,7 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         gtol=gtol * gscale, maxiter=maxiter,
         delta0=delta0, delta_max=delta_max, eta=eta,
         fun_error=fun_error, request_accuracy=request_accuracy, eta_f=eta_f,
+        hessp_tol=hv_rtol is None,
         comm=comm, callback=_cb, disp=disp,
     )
     info = {
