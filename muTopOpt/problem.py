@@ -512,14 +512,10 @@ class StressTargetProblem:
         for i, lc in enumerate(self.load_cases):
             u = self._u_cases[i]
             adj = self._adj_cases[i]
+            # Without hv_warm_start these are shared scratch holding the
+            # previous *case's* solution; solve_rhs then starts from zero.
             du = self._du_cases[i]
             dadj = self._dadj_cases[i]
-            if not self.hv_warm_start:
-                # Shared scratch: it holds the previous *case's* solution, not
-                # this one's, so start from zero rather than from an unrelated
-                # iterate.
-                du.set_zero()
-                dadj.set_zero()
             E = lc.macro_strain
             norm = float(np.sum(lc.target_stress**2))
             S = cache["S"][i]
@@ -527,8 +523,8 @@ class StressTargetProblem:
             # Forward sensitivity: K du = -(dK v) u - Bᵀ (dC v):Ē. With
             # hv_warm_start, warm-started from this case's previous product
             # (the rhs is O(1) in the unit direction, so the guess is
-            # well-scaled); otherwise du was zeroed above and solve_rhs's
-            # warm start reduces to a cold start.
+            # well-scaled); otherwise a cold start, which spares solve_rhs
+            # the operator apply that checks a warm start.
             with timer("hv forward solve"):
                 h.engine.communicate_ghosts(u)
                 h.op.apply(u, self._dlam_v, self._dmu_v, self._hv_rhs)
@@ -537,7 +533,8 @@ class StressTargetProblem:
                 self._hv_rhs.s[...] = -self._hv_rhs.s - self._hv_tmp.s
                 scale_fwd = pert_scale * max(float(np.abs(E).max()), 1e-300)
                 h.solve_rhs(self._hv_rhs, du, rtol=rtol, rhs_scale=scale_fwd,
-                            warm_start=True, label=f"case {i + 1} hv-fwd")
+                            warm_start=self.hv_warm_start,
+                            label=f"case {i + 1} hv-fwd")
             cg_iters.append(h.last_cg_iters)
 
             # d<sigma> = (1/V)∫ (dC v):(Ē + ∇u) + (1/V)∫ C:∇du.
@@ -562,7 +559,8 @@ class StressTargetProblem:
                     pert_scale * float(np.abs(S / V).max()),
                     h.mat_scale * float(np.abs(dS / V).max()), 1e-300)
                 h.solve_rhs(self._hv_rhs, dadj, rtol=rtol,
-                            rhs_scale=scale_adj, warm_start=True,
+                            rhs_scale=scale_adj,
+                            warm_start=self.hv_warm_start,
                             label=f"case {i + 1} hv-adj")
             cg_iters.append(h.last_cg_iters)
 

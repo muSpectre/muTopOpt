@@ -798,7 +798,10 @@ def main():
             # Solves that hit their finite-precision floor and returned a
             # best-effort iterate this outer step (0 = all solves converged).
             rtol_str += f"  cg-stalled={stalled}" if stalled else ""
-            hv_str = (f"  hv-cg={hv_cg} ({nb_hessp} Hv)"
+            hv_rtol = last.get("hv_rtol")
+            hv_str = (f"  hv-cg={hv_cg} ({nb_hessp} Hv"
+                      + (f", rtol={hv_rtol:.0e}" if hv_rtol is not None
+                         else "") + ")"
                       if nb_hessp else "")
             iter_label = "tr-iter" if optimizer == "tr" else "bfgs-iter"
             print(

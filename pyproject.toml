@@ -24,9 +24,10 @@ dependencies = [
     # plain device memory on an APU by itself.
     "muGrid>=1.6.0",
     "muTimer",
-    # The optimizers reduce over the muGrid communicator through NuMPI's
-    # communicator protocol, which releases after 0.15.2 provide.
-    "NuMPI>0.15.2",
+    # The trust region's Steihaug tolerance, which the adaptive Hessian-solve
+    # tolerance follows, is scale-invariant and passed to hessp from 0.18.0
+    # on (the communicator protocol came with 0.16.0).
+    "NuMPI>=0.18.0",
 ]
 
 [project.optional-dependencies]

@@ -218,10 +218,13 @@ ELASTICITY = Section(
                     "A step is accepted when actual/predicted reduction "
                     "exceeds this.", minimum=0),
                 "hessian_tolerance": Key(
-                    "number", 1e-3,
+                    "number", None,
                     "Relative CG tolerance of the two extra solves per "
                     "Hessian-vector product; may be loose, the Hessian only "
-                    "shapes the model.", **_POS),
+                    "shapes the model. null: a tenth of the tolerance of the "
+                    "trust-region subproblem that needs the product, within "
+                    "[1e-4, 1e-2], so loose early and tighter near "
+                    "convergence.", nullable=True, **_POS),
                 "hessian_warm_start": Key(
                     "bool", False,
                     "Warm-start each Hessian-vector solve from the same load "
