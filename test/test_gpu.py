@@ -104,3 +104,50 @@ def test_regularization_keeps_device_arrays_on_the_device(comm, gpu_problem):
     _, g_host = reg.value_and_gradient(rho)
     assert isinstance(g_host, np.ndarray)
     assert_allclose_on_all_ranks(comm, g_host, g_cpu, rtol=1e-10, atol=0)
+
+
+@pytest.mark.parametrize("gpu_problem", DESIGNS, indirect=True)
+def test_device_arrays_stay_on_the_device(comm, gpu_problem):
+    """Gradient and Hessian product of device input are device arrays (the
+    trust region's path); those of host input are host arrays."""
+    import cupy
+
+    rho, v = _inputs(gpu_problem)
+    f_dev, g_dev = gpu_problem.objective_and_gradient(cupy.asarray(rho))
+    assert isinstance(g_dev, cupy.ndarray)
+    hv_dev = gpu_problem.hessian_vector_product(cupy.asarray(v))
+    assert isinstance(hv_dev, cupy.ndarray)
+    f_host, g_host = gpu_problem.objective_and_gradient(rho)
+    hv_host = gpu_problem.hessian_vector_product(v)
+    assert f_dev == pytest.approx(f_host, rel=1e-12)
+    assert_allclose_on_all_ranks(comm, g_dev.get(), g_host, rtol=1e-12,
+                                 atol=0)
+    assert_allclose_on_all_ranks(comm, hv_dev.get(), hv_host, rtol=1e-10,
+                                 atol=1e-12 * np.abs(hv_host).max())
+
+
+@pytest.mark.parametrize("gpu_problem", DESIGNS, indirect=True)
+def test_trust_region_runs_on_the_device(comm, gpu_problem):
+    """The trust region iterates on device arrays -- the callback gets them
+    -- and follows the CPU run."""
+    import cupy
+
+    from muTopOpt.optimize import optimize_trust_region
+
+    rho0, _ = _inputs(gpu_problem)
+    kinds = []
+
+    def callback(it, rho, last):
+        kinds.append(isinstance(rho, cupy.ndarray))
+
+    rho_gpu, info_gpu = optimize_trust_region(
+        gpu_problem, rho0, comm=gpu_problem.h.comm, maxiter=5,
+        callback=callback)
+    cpu_problem = _make_problem(comm, "cpu", gpu_problem.design)
+    rho_cpu, info_cpu = optimize_trust_region(
+        cpu_problem, rho0, comm=cpu_problem.h.comm, maxiter=5)
+    assert kinds and all(kinds)
+    assert isinstance(rho_gpu, np.ndarray)
+    np.testing.assert_allclose(info_gpu["history"], info_cpu["history"],
+                               rtol=1e-6)
+    assert_allclose_on_all_ranks(comm, rho_gpu, rho_cpu, rtol=0, atol=1e-6)

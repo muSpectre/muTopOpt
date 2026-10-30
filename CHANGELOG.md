@@ -29,7 +29,6 @@ v1.5.0 (not yet released)
   start, and the CG fallback snapshot is only refreshed when the residual has halved
 - API: `optimizer.trust_region.hessian_tolerance` defaults to null (adaptive); a
   number still fixes it
-- BUILD: Requires NuMPI 0.18.0 or newer
 - PERF: The element-wise sensitivity work of the gradient and of the Hessian-vector
   products runs on the GPU, in double precision, instead of in NumPy on the host;
   only the gradient and the product are copied to the host
@@ -37,6 +36,9 @@ v1.5.0 (not yet released)
   compute on the GPU; their results come back as host or device arrays like their input
 - TST: GPU tests compare gradient, Hessian product and regularization with the CPU;
   they are skipped without CuPy and a GPU build of muGrid
+- PERF: The trust region iterates on the GPU: design, gradient and Hessian products
+  stay in device memory, and only single numbers come to the host
+- BUILD: Requires NuMPI 0.19.0 or newer
 
 v1.4.0 (28Oct26)
 ----------------

@@ -634,14 +634,15 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         the Hessian only shapes the trust-region model, and the method's
         convergence theory requires only a bounded model Hessian.
     callback : callable, optional
-        ``callback(it, rho, problem.last)`` after each accepted iterate.
+        ``callback(it, rho, problem.last)`` after each accepted iterate;
+        ``rho`` is in the fields' array module (a cupy array on a GPU).
     disp : bool, optional
         Let NuMPI print its per-iteration table (default False).
 
     Returns
     -------
     rho_opt : np.ndarray
-        Final density, same shape as ``rho0``.
+        Final density on the host, same shape as ``rho0``.
     info : dict
         ``success``, ``message``, ``nit`` (iterations including rejected
         steps), ``objective``, ``max_grad`` (in ``ĝ`` units), ``history``
@@ -740,7 +741,11 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
     # mesh-invariant ĝ units (see _gradient_scale).
     gscale = _gradient_scale(problem)
     res = tr_newton_bounded(
-        fun, np.asarray(rho0, dtype=float), hessp, jac=None,
+        # On the fields' device: the trust region runs in the array module
+        # of x0 (cupy on a GPU), so the design, gradient and Hessian
+        # products never leave the device; only scalars come to the host.
+        fun, problem.h.xp.asarray(np.asarray(rho0, dtype=float)), hessp,
+        jac=None,
         bounds_lo=bounds[0], bounds_hi=bounds[1],
         gtol=gtol * gscale, maxiter=maxiter,
         delta0=delta0, delta_max=delta_max, eta=eta,
@@ -760,7 +765,7 @@ def optimize_trust_region(problem, rho0, comm=None, maxiter=200, gtol=2.5,
         "rho_history": res.get("rho_history"),
         "final_cg_rtol": controller.current,
     }
-    return np.asarray(res.x), info
+    return problem.h.to_host(res.x), info
 
 
 def optimize_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=1e-9,
