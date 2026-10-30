@@ -134,14 +134,15 @@ class NodalElementMap:
         return [pg[sl] for sl in self._corner_slices()]
 
     # -- gather / scatter -----------------------------------------------------
-    def gather_mean(self, rho):
-        """Element averages ``ρ_e = Σ_c w_c ρ_{n(e,c)}`` as a host NumPy
-        array shaped like the element grid."""
+    def gather_mean(self, rho, on_device=False):
+        """Element averages ``ρ_e = Σ_c w_c ρ_{n(e,c)}`` shaped like the
+        element grid: a host NumPy array, or with `on_device` an array in
+        the fields' module (cupy on a device)."""
         views = self.corner_values(rho)
         acc = self.avg_weights[0] * views[0]
         for c in range(1, self.nb_nodes):
             acc = acc + self.avg_weights[c] * views[c]
-        return self.h.to_host(acc)
+        return acc if on_device else self.h.to_host(acc)
 
     def scatter(self, per_corner):
         """Adjoint of corner gathering: node ``i + offset(c)`` accumulates
@@ -156,9 +157,10 @@ class NodalElementMap:
 
     def scatter_mean(self, s_e):
         """Adjoint (transpose) of :meth:`gather_mean` for an element array
-        ``s_e``: ``g_n = Σ_{(e,c): n(e,c)=n} w_c s_e`` over the elements
-        adjacent to node ``n``. Returns a host NumPy nodal array."""
-        s = self.h.to_device(np.asarray(s_e, dtype=float))
+        ``s_e`` (host or in the fields' module): ``g_n = Σ_{(e,c): n(e,c)=n}
+        w_c s_e`` over the elements adjacent to node ``n``. Returns a host
+        NumPy nodal array."""
+        s = self.h.to_device(s_e)
         return self.scatter([w * s for w in self.avg_weights])
 
 
