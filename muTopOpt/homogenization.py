@@ -77,6 +77,12 @@ _CG_HAS_RESIDUAL = "residual" in _inspect.signature(
     conjugate_gradients).parameters
 
 
+#: Factor by which the squared CG residual must drop before the best iterate
+#: is snapshot again (0.25: the residual halved), so that a solve that has to
+#: fall back returns an iterate within a factor two of the best residual.
+_BACKUP_REDUCTION = 0.25
+
+
 class _CGStagnation(Exception):
     """Internal control flow of :meth:`Homogenization.solve_rhs`: raised from
     the CG iteration callback when the solve has stopped making progress (the
@@ -695,8 +701,9 @@ class Homogenization:
         This method does not raise on non-convergence. A solve that stagnates
         (no relative residual improvement of :attr:`cg_stagnation_rel` within
         :attr:`cg_stagnation_patience` iterations -- the finite-precision
-        residual floor), hits the iteration cap, or breaks down returns the
-        *best iterate* seen, with its true residual ``b − K x`` recomputed
+        residual floor), hits the iteration cap, or breaks down returns an
+        iterate within a factor two of the *best residual* seen (see
+        :data:`_BACKUP_REDUCTION`), with its true residual ``b − K x`` recomputed
         (and never worse than the zero solution). The callers tolerate a
         less-accurate solve: the consistent objective is second-order in the
         state-solve residual and reports the remaining error, and the
@@ -774,7 +781,8 @@ class Homogenization:
         # converges at ||r|| <= rtol*||b||.
         #
         # The callback doubles as the stagnation safeguard: it snapshots the
-        # best iterate seen so far and aborts the solve (via _CGStagnation)
+        # best iterate seen so far (whenever the residual has halved since the
+        # last snapshot) and aborts the solve (via _CGStagnation)
         # once the residual has not beaten the reference by at least
         # ``cg_stagnation_rel`` for ``cg_stagnation_patience`` consecutive
         # iterations. In finite precision -- float32 above all -- the *true*
@@ -793,7 +801,7 @@ class Homogenization:
         stall = (1.0 - self.cg_stagnation_rel) ** 2
         diverge = self.cg_divergence_factor ** 2
         guard = {"best": np.inf, "best_iter": 0, "ref": np.inf, "ref_iter": 0,
-                 "saved": False}
+                 "saved": False, "saved_rr": np.inf}
 
         def _count(iteration, state):
             counter["n"] += 1
@@ -806,11 +814,17 @@ class Homogenization:
             if rr < guard["best"]:
                 guard["best"] = rr
                 guard["best_iter"] = iteration
-                # Full-buffer copy (ghosts included): a contiguous copy,
-                # whereas `.s[...] = .s` goes through a strided,
-                # ghost-excluded view. It runs on most CG iterations.
-                muGrid.linalg.copy(x, self._x_best)
-                guard["saved"] = True
+                if rr < _BACKUP_REDUCTION * guard["saved_rr"]:
+                    # Snapshot only once the residual has halved since the
+                    # last one: a full-field copy on every improving
+                    # iteration cost ~2% of a solve, and the fallback only
+                    # needs an iterate close to the best. Full-buffer copy
+                    # (ghosts included): a contiguous copy, whereas
+                    # `.s[...] = .s` goes through a strided, ghost-excluded
+                    # view.
+                    muGrid.linalg.copy(x, self._x_best)
+                    guard["saved"] = True
+                    guard["saved_rr"] = rr
             elif cold_start and guard["best_iter"] == 0 and (
                     iteration >= self.cg_no_progress_patience
                     or rr > diverge * guard["best"]):
