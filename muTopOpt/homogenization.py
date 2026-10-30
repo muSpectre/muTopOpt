@@ -502,6 +502,12 @@ class Homogenization:
         density array on this rank."""
         return self._nb_pixels
 
+    @property
+    def xp(self):
+        """The array module of the fields: cupy on a device, numpy on the
+        host."""
+        return self._xp
+
     def to_host(self, a):
         """Return ``a`` (a field ``.p`` view or array) as a host NumPy array,
         copying off the device if necessary."""
@@ -523,20 +529,20 @@ class Homogenization:
     def set_density(self, rho):
         """Interpolate ``ρ -> (λ, μ)``, fill ghosts, and build (first call) or
         refresh the preconditioner. ``rho`` is the element-wise density of
-        shape :attr:`nb_pixels`.
+        shape :attr:`nb_pixels`, on the host or in the fields' array module
+        (:attr:`xp`); the interpolation runs in the latter.
 
         Raises ``ValueError`` on the first call if the ``preconditioner``
         given to the constructor is unknown."""
         with timer("set_density"):
-            lam, mu = self.material.lame(np.asarray(rho))
+            lam, mu = self.material.lame(self._xp.asarray(rho))
             self.lam.p[...] = self.to_device(lam)
             self.mu.p[...] = self.to_device(mu)
             self.engine.communicate_ghosts(self.lam)
             self.engine.communicate_ghosts(self.mu)
             # Stiffness scale (max |λ|, |2μ|), reduced across ranks, used to
             # detect a negligible (round-off-only) right-hand side.
-            local = max(float(np.abs(lam).max()),
-                        float(2.0 * np.abs(mu).max()))
+            local = max(float(abs(lam).max()), float(2.0 * abs(mu).max()))
             self._mat_scale = self.comm.max(local)
             with timer("preconditioner"):
                 self._update_preconditioner()

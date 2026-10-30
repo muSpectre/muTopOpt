@@ -30,6 +30,9 @@ v1.5.0 (not yet released)
 - API: `optimizer.trust_region.hessian_tolerance` defaults to null (adaptive); a
   number still fixes it
 - BUILD: Requires NuMPI 0.18.0 or newer
+- PERF: The element-wise sensitivity work of the gradient and of the Hessian-vector
+  products runs on the GPU, in double precision, instead of in NumPy on the host;
+  only the gradient and the product are copied to the host
 
 v1.4.0 (28Oct26)
 ----------------

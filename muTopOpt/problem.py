@@ -254,14 +254,19 @@ class StressTargetProblem:
     def _objective_and_gradient(self, rho):
         rho = np.asarray(rho, dtype=float)
         h = self.h
+        xp = h.xp
         V = h.domain_volume
+        # Element-wise work stays in the fields' array module (on the device
+        # for a GPU run), in double precision: only the design comes in and
+        # the gradient goes out through the host.
         if self.design == "nodal":
             # Element material from the exact element average of the nodal
             # interpolant; sensitivities are scattered back through the
             # transpose of this map after the load-case loop.
-            rho_e = self._nodal_map.gather_mean(rho)
+            rho_e = xp.asarray(self._nodal_map.gather_mean(rho, on_device=True),
+                               dtype=float)
         else:
-            rho_e = rho
+            rho_e = xp.asarray(rho)
         h.set_density(rho_e)
 
         dlam, dmu = h.material.dlame(rho_e)  # SIMP derivatives, per element
@@ -272,7 +277,7 @@ class StressTargetProblem:
                 if self.inner_tolerance is not None else None)
 
         f = 0.0
-        grad = np.zeros_like(rho_e)
+        grad = xp.zeros_like(rho_e)
         stresses = []
         corrections = []  # adjoint-weighted forward residuals (one per case)
         cg_iters = []  # CG iteration count of each (forward, adjoint) solve
@@ -333,23 +338,22 @@ class StressTargetProblem:
                     adj, list((S / V).ravel()),
                     self._g_shear, self._g_vol,
                 )
-                g_shear = h.to_host(self._g_shear.p)
-                g_vol = h.to_host(self._g_vol.p)
-                grad += 2.0 * dmu * g_shear + dlam * g_vol
+                g_shear = self._g_shear.p
+                g_vol = self._g_vol.p
+                grad += 2.0 * dmu * g_shear
+                grad += dlam * g_vol
 
             if self.hessian:
                 # Snapshot the per-case kernels and adjoint source for the
                 # Hessian-vector product (the kernel fields are reused by the
-                # next case, so copy to host).
-                hv_cache["g_shear"].append(np.array(g_shear, copy=True))
-                hv_cache["g_vol"].append(np.array(g_vol, copy=True))
+                # next case, so copy them), next to the fields.
+                hv_cache["g_shear"].append(xp.array(g_shear, copy=True))
+                hv_cache["g_vol"].append(xp.array(g_vol, copy=True))
                 hv_cache["S"].append(S)
 
         if self.hessian:
             hv_cache["rho"] = np.array(rho, copy=True)
-            hv_cache["rho_e"] = (np.array(rho_e, copy=True)
-                                 if self.design == "nodal" else
-                                 hv_cache["rho"])
+            hv_cache["rho_e"] = rho_e
             self._cache = hv_cache
 
         if self.design == "nodal":
@@ -357,6 +361,8 @@ class StressTargetProblem:
             # sensitivity is distributed onto the element's corner nodes with
             # the averaging weights (exact transpose of gather_mean).
             grad = self._nodal_map.scatter_mean(grad)
+        else:
+            grad = h.to_host(grad)
 
         if self.regularization is not None:
             # The regularization acts on the design variables themselves
@@ -469,10 +475,11 @@ class StressTargetProblem:
                 "no cached linearization point; call ensure_state(rho) or "
                 "objective_and_gradient(rho) first")
         h = self.h
+        xp = h.xp
         V = h.domain_volume
         d = self.dim
         cache = self._cache
-        rho_e = cache["rho_e"]
+        rho_e = cache["rho_e"]  # in the fields' array module
 
         v = np.asarray(v, dtype=float)
         # The reduced Hessian is a linear operator, so H v = ||v|| * H (v/||v||)
@@ -486,8 +493,10 @@ class StressTargetProblem:
             self.last_hv_cg_iters = []
             return np.zeros_like(v)
         vhat = v / vnorm
-        v_e = (self._nodal_map.gather_mean(vhat)
-               if self.design == "nodal" else vhat)
+        # As in the gradient, the element-wise work stays in the fields'
+        # array module, in double precision.
+        v_e = xp.asarray(self._nodal_map.gather_mean(vhat, on_device=True)
+                         if self.design == "nodal" else vhat, dtype=float)
 
         dlam, dmu = h.material.dlame(rho_e)
         d2lam, d2mu = h.material.d2lame(rho_e)
@@ -501,12 +510,11 @@ class StressTargetProblem:
         h.engine.communicate_ghosts(self._dmu_v)
         # Force scale of the perturbed material (for negligible-rhs detection
         # in the solves below), MPI-reduced.
-        local = (max(float(np.abs(dlam_v).max()),
-                     float(2.0 * np.abs(dmu_v).max()))
+        local = (max(float(abs(dlam_v).max()), float(2.0 * abs(dmu_v).max()))
                  if dlam_v.size else 0.0)
         pert_scale = h.comm.max(local)
 
-        hv_e = np.zeros_like(v_e)
+        hv_e = xp.zeros_like(v_e)
         cg_iters = []
         zero_E = [0.0] * (d * d)
         for i, lc in enumerate(self.load_cases):
@@ -574,20 +582,20 @@ class StressTargetProblem:
                 h.op.compute_sensitivity(
                     du, zero_E, adj, list((S / V).ravel()),
                     self._g_shear, self._g_vol)
-                hv_e += (2.0 * dmu * h.to_host(self._g_shear.p)
-                         + dlam * h.to_host(self._g_vol.p))
+                hv_e += 2.0 * dmu * self._g_shear.p
+                hv_e += dlam * self._g_vol.p
                 # (c) costate variation: dC (Ē+∇u):(dS/V + ∇dv).
                 h.engine.communicate_ghosts(dadj)
                 h.op.compute_sensitivity(
                     u, list(E.ravel()), dadj, list((dS / V).ravel()),
                     self._g_shear, self._g_vol)
-                hv_e += (2.0 * dmu * h.to_host(self._g_shear.p)
-                         + dlam * h.to_host(self._g_vol.p))
+                hv_e += 2.0 * dmu * self._g_shear.p
+                hv_e += dlam * self._g_vol.p
 
         if self.design == "nodal":
             hv = self._nodal_map.scatter_mean(hv_e)
         else:
-            hv = hv_e
+            hv = h.to_host(hv_e)
 
         if self.regularization is not None:
             # Also linear in the direction; evaluate on the unit direction to
