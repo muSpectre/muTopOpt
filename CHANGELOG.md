@@ -38,7 +38,7 @@ v1.5.0 (not yet released)
   they are skipped without CuPy and a GPU build of muGrid
 - PERF: The trust region iterates on the GPU: design, gradient and Hessian products
   stay in device memory, and only single numbers come to the host
-- BUILD: Requires NuMPI 0.19.0 or newer
+- BUILD: Requires NuMPI 0.18.1 or newer
 
 v1.4.0 (28Oct26)
 ----------------
