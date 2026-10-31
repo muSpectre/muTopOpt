@@ -252,13 +252,15 @@ class StressTargetProblem:
             return self._objective_and_gradient(rho)
 
     def _objective_and_gradient(self, rho):
-        rho = np.asarray(rho, dtype=float)
         h = self.h
         xp = h.xp
         V = h.domain_volume
-        # Element-wise work stays in the fields' array module (on the device
-        # for a GPU run), in double precision: only the design comes in and
-        # the gradient goes out through the host.
+        # All work runs in the fields' array module (on the device for a GPU
+        # run), in double precision. The design and the gradient are of the
+        # caller's kind: arrays of that module stay there (the trust region),
+        # host arrays (L-BFGS, the tests) cost one copy each way.
+        given = rho
+        rho = xp.asarray(rho, dtype=float)
         if self.design == "nodal":
             # Element material from the exact element average of the nodal
             # interpolant; sensitivities are scattered back through the
@@ -266,7 +268,7 @@ class StressTargetProblem:
             rho_e = xp.asarray(self._nodal_map.gather_mean(rho, on_device=True),
                                dtype=float)
         else:
-            rho_e = xp.asarray(rho)
+            rho_e = rho
         h.set_density(rho_e)
 
         dlam, dmu = h.material.dlame(rho_e)  # SIMP derivatives, per element
@@ -352,17 +354,16 @@ class StressTargetProblem:
                 hv_cache["S"].append(S)
 
         if self.hessian:
-            hv_cache["rho"] = np.array(rho, copy=True)
-            hv_cache["rho_e"] = rho_e
+            hv_cache["rho"] = xp.array(rho, copy=True)
+            hv_cache["rho_e"] = (rho_e if self.design == "nodal"
+                                 else hv_cache["rho"])
             self._cache = hv_cache
 
         if self.design == "nodal":
             # Chain rule through the element average: the per-element
             # sensitivity is distributed onto the element's corner nodes with
             # the averaging weights (exact transpose of gather_mean).
-            grad = self._nodal_map.scatter_mean(grad)
-        else:
-            grad = h.to_host(grad)
+            grad = self._nodal_map.scatter_mean(grad, on_device=True)
 
         if self.regularization is not None:
             # The regularization acts on the design variables themselves
@@ -382,11 +383,11 @@ class StressTargetProblem:
             # variable (element or nodal) the optimizer bounds in [lo, hi].
             lo, hi = self.inner_tolerance.bounds
             tol_box = 1e-12
-            r = np.abs(grad)
+            r = abs(grad)
             if lo is not None:
-                r[(rho <= lo + tol_box) & (grad >= 0.0)] = 0.0
+                r = xp.where((rho <= lo + tol_box) & (grad >= 0.0), 0.0, r)
             if hi is not None:
-                r[(rho >= hi - tol_box) & (grad <= 0.0)] = 0.0
+                r = xp.where((rho >= hi - tol_box) & (grad <= 0.0), 0.0, r)
             local = float(r.max()) if r.size else 0.0
             # Reported in mesh-invariant ĝ units (see _gnorm_scale) so the
             # controller history is human-readable and consistent with the
@@ -398,7 +399,7 @@ class StressTargetProblem:
         self.last = {"objective": f, "stresses": stresses,
                      "cg_iters": cg_iters, "corrections": corrections,
                      "cg_rtol": rtol}
-        return f, grad
+        return f, (grad if isinstance(given, xp.ndarray) else h.to_host(grad))
 
     def ensure_state(self, rho):
         """Make the cached linearization point match ``rho``, re-evaluating
@@ -415,11 +416,11 @@ class StressTargetProblem:
             raise RuntimeError(
                 "Hessian support is off; construct the problem with "
                 "hessian=True")
-        rho = np.asarray(rho, dtype=float)
+        rho = self.h.xp.asarray(rho, dtype=float)
         stale = 1.0
         if self._cache is not None:
             c = self._cache["rho"]
-            if c.shape == rho.shape and bool(np.array_equal(c, rho)):
+            if c.shape == rho.shape and bool((c == rho).all()):
                 stale = 0.0
         if self.h.comm.max(stale) > 0.0:
             self.objective_and_gradient(rho)
@@ -481,22 +482,25 @@ class StressTargetProblem:
         cache = self._cache
         rho_e = cache["rho_e"]  # in the fields' array module
 
-        v = np.asarray(v, dtype=float)
+        given = v
+        v = xp.asarray(v, dtype=float)
         # The reduced Hessian is a linear operator, so H v = ||v|| * H (v/||v||)
         # exactly. Solve for the *unit* direction and rescale: this keeps every
         # Hv-solve right-hand side at a comparable magnitude regardless of the
         # trust-region CG direction's scale, which (a) makes warm-starting from
         # the previous product well-scaled and (b) makes the fixed relative CG
         # tolerance mean the same accuracy every time.
-        vnorm = float(np.sqrt(h.comm.sum(float(np.sum(v * v)))))
+        vnorm = float(np.sqrt(h.comm.sum(float((v * v).sum()))))
         if vnorm == 0.0:
             self.last_hv_cg_iters = []
-            return np.zeros_like(v)
+            zero = xp.zeros_like(v)
+            return zero if isinstance(given, xp.ndarray) else h.to_host(zero)
         vhat = v / vnorm
         # As in the gradient, the element-wise work stays in the fields'
         # array module, in double precision.
-        v_e = xp.asarray(self._nodal_map.gather_mean(vhat, on_device=True)
-                         if self.design == "nodal" else vhat, dtype=float)
+        v_e = (xp.asarray(self._nodal_map.gather_mean(vhat, on_device=True),
+                          dtype=float)
+               if self.design == "nodal" else vhat)
 
         dlam, dmu = h.material.dlame(rho_e)
         d2lam, d2mu = h.material.d2lame(rho_e)
@@ -593,9 +597,9 @@ class StressTargetProblem:
                 hv_e += dlam * self._g_vol.p
 
         if self.design == "nodal":
-            hv = self._nodal_map.scatter_mean(hv_e)
+            hv = self._nodal_map.scatter_mean(hv_e, on_device=True)
         else:
-            hv = h.to_host(hv_e)
+            hv = hv_e
 
         if self.regularization is not None:
             # Also linear in the direction; evaluate on the unit direction to
@@ -606,4 +610,5 @@ class StressTargetProblem:
 
         self.last_hv_cg_iters = cg_iters
         # Undo the unit-direction normalization: H v = ||v|| * H (v/||v||).
-        return vnorm * hv
+        hv = vnorm * hv
+        return hv if isinstance(given, xp.ndarray) else h.to_host(hv)

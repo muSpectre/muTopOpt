@@ -761,7 +761,9 @@ def main():
         # callback (line search / trust-region solves, frame dump, ...).
         now = time.perf_counter()
         dt, t_iter[0] = now - t_iter[0], now
-        vf = comm.sum(float(np.sum(rho))) / n_global
+        # rho is in the fields' array module for the trust region (on the
+        # device for a GPU run) and on the host for L-BFGS
+        vf = comm.sum(float(rho.sum())) / n_global
         cg = last.get("cg_iters", [])
         cg_total = int(sum(cg))
         stalled = homog.cg_stagnation_count - stall_seen[0]

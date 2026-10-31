@@ -125,10 +125,11 @@ class NodalElementMap:
         return slices
 
     def corner_values(self, rho):
-        """Load a nodal density array, fill the ghost layer, and return the
+        """Load a nodal density array (host or in the fields' module), fill
+        the ghost layer, and return the
         ``2^dim`` per-corner arrays (each shaped like the element grid, in the
         fields' array module)."""
-        self._nodal.p[...] = self.h.to_device(np.asarray(rho, dtype=float))
+        self._nodal.p[...] = self.h.to_device(rho)
         self.h.engine.communicate_ghosts(self._nodal)
         pg = self._nodal.pg
         return [pg[sl] for sl in self._corner_slices()]
@@ -144,24 +145,30 @@ class NodalElementMap:
             acc = acc + self.avg_weights[c] * views[c]
         return acc if on_device else self.h.to_host(acc)
 
-    def scatter(self, per_corner):
+    def scatter(self, per_corner, on_device=False):
         """Adjoint of corner gathering: node ``i + offset(c)`` accumulates
         ``per_corner[c][i]``; ghost-node contributions are reduced back onto
-        their owning rank. Returns a host NumPy nodal array."""
+        their owning rank. Returns a host NumPy nodal array, or with
+        `on_device` a double-precision array in the fields' module."""
         pg = self._acc.pg
         pg[...] = 0.0
         for sl, contrib in zip(self._corner_slices(), per_corner):
             pg[sl] += contrib
         self.h.engine.reduce_ghosts(self._acc)
+        if on_device:
+            # A copy: the accumulator is reused by the next scatter
+            return self.h.xp.array(self._acc.p, dtype=float, copy=True)
         return self.h.to_host(self._acc.p).copy()
 
-    def scatter_mean(self, s_e):
+    def scatter_mean(self, s_e, on_device=False):
         """Adjoint (transpose) of :meth:`gather_mean` for an element array
         ``s_e`` (host or in the fields' module): ``g_n = Σ_{(e,c): n(e,c)=n}
         w_c s_e`` over the elements adjacent to node ``n``. Returns a host
-        NumPy nodal array."""
+        NumPy nodal array, or with `on_device` an array in the fields'
+        module."""
         s = self.h.to_device(s_e)
-        return self.scatter([w * s for w in self.avg_weights])
+        return self.scatter([w * s for w in self.avg_weights],
+                            on_device=on_device)
 
 
 class ConsistentDoubleWell:

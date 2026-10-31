@@ -24,10 +24,10 @@ dependencies = [
     # plain device memory on an APU by itself.
     "muGrid>=1.6.0",
     "muTimer",
-    # The trust region's Steihaug tolerance, which the adaptive Hessian-solve
-    # tolerance follows, is scale-invariant and passed to hessp from 0.18.0
-    # on (the communicator protocol came with 0.16.0).
-    "NuMPI>=0.18.0",
+    # The trust region runs on device (cupy) arrays from 0.18.1 on; its
+    # Steihaug tolerance, which the adaptive Hessian-solve tolerance follows,
+    # is scale-invariant and passed to hessp from 0.18.0 on.
+    "NuMPI>=0.18.1",
 ]
 
 [project.optional-dependencies]
