@@ -301,6 +301,12 @@ class HomogenizationConductivity:
         density array on this rank."""
         return self._nb_pixels
 
+    @property
+    def xp(self):
+        """The array module of the fields: cupy on a device, numpy on the
+        host."""
+        return self._xp
+
     def to_host(self, a):
         return a.get() if hasattr(a, "get") else np.asarray(a)
 
