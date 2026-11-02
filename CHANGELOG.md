@@ -16,8 +16,8 @@ Style for this changelog (keep to it so entries stay uniform):
 Change log for muTopOpt
 =======================
 
-v1.5.0 (not yet released)
--------------------------
+v1.5.0 (02Nov26)
+----------------
 
 - PERF: Plain device memory is used on every GPU, also for a single rank on a
   unified-memory accelerator, where MPI is ~40x slower on managed buffers
