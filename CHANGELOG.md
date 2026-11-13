@@ -16,6 +16,12 @@ Style for this changelog (keep to it so entries stay uniform):
 Change log for muTopOpt
 =======================
 
+v1.5.1 (not yet released)
+-------------------------
+
+- PERF: With more than one rank the elasticity solves overlap the halo exchange with
+  the stencil on the planes that do not need it, where muGrid supports it
+
 v1.5.0 (05Nov26)
 ----------------
 
