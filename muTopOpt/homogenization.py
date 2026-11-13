@@ -48,6 +48,7 @@ layout.
 """
 
 import os
+from contextlib import nullcontext
 
 import warnings
 
@@ -434,6 +435,16 @@ class Homogenization:
         self._rhs = self.fc.real_field("to_rhs", (self.dim,), dtype=self.dtype)
         self._Ku = self.fc.real_field("to_Ku", (self.dim,), dtype=self.dtype)
 
+        # Planes per rank along the distributed axis when _hessp overlaps the
+        # halo exchange with the stencil, None when it does not (see there).
+        self._overlap_nz = None
+        if (self.OVERLAP_HALO_EXCHANGE
+                and getattr(self.engine, "overlaps_ghost_communication", False)
+                and hasattr(self.op, "apply_planes")):
+            nz = int(self.engine.nb_subdomain_grid_pts[-1])
+            if nz >= 3:
+                self._overlap_nz = nz
+
         # Array module of the (possibly device-resident) fields: cupy on a GPU
         # device, numpy on host. `on_device` gates the host<->device copies at
         # the optimizer boundary.
@@ -619,18 +630,47 @@ class Homogenization:
             # from the updated material.
             self._prec.refresh()
 
+    #: Overlap the halo exchange of the distributed axis with the stencil on
+    #: the planes that do not need it (see _hessp). Off only for comparison;
+    #: it falls back to the blocking exchange by itself wherever it cannot
+    #: overlap (one rank, a muGrid without the split exchange, slabs of
+    #: fewer than three planes).
+    OVERLAP_HALO_EXCHANGE = True
+
     # -- solves -------------------------------------------------------------
+    def _timed(self, name):
+        return self.timer(name) if self.timer is not None else nullcontext()
+
     def _hessp(self, u, Au):
-        if self.timer is None:
-            self.engine.communicate_ghosts(u)
-            self.op.apply(u, self.lam, self.mu, Au)
+        """``Au = K u``, with the halo exchange hidden behind the stencil.
+
+        The engine is a slab: only its last axis crosses ranks, and the
+        stencil on a node reads the planes either side of it. So every plane
+        but the first and the last reads no ghost of that axis, and is
+        computed while those ghosts are still in flight; the two boundary
+        planes follow once they have arrived. On a GPU the interior stencil
+        is one asynchronous launch, so the MPI transfer and the kernel run
+        at the same time.
+
+        "ghosts" times the exchange (its start and its completion), "stencil"
+        the operator, so the breakdown keeps its meaning.
+        """
+        nz = self._overlap_nz
+        if nz is None:
+            with self._timed("ghosts"):
+                self.engine.communicate_ghosts(u)
+            with self._timed("stencil"):
+                self.op.apply(u, self.lam, self.mu, Au)
             return
-        # Split the halo exchange (inter-rank communication) from the stencil
-        # (pure local bandwidth) for a solve-time breakdown.
-        with self.timer("ghosts"):
-            self.engine.communicate_ghosts(u)
-        with self.timer("stencil"):
-            self.op.apply(u, self.lam, self.mu, Au)
+        with self._timed("ghosts"):
+            self.engine.begin_communicate_ghosts(u)
+        with self._timed("stencil"):
+            self.op.apply_planes(u, self.lam, self.mu, Au, 1, nz - 1)
+        with self._timed("ghosts"):
+            self.engine.end_communicate_ghosts(u)
+        with self._timed("stencil"):
+            self.op.apply_planes(u, self.lam, self.mu, Au, 0, 1)
+            self.op.apply_planes(u, self.lam, self.mu, Au, nz - 1, nz)
 
     def _clamp_rtol(self, rtol):
         """Raise ``rtol`` to what this precision can actually reach, warning
