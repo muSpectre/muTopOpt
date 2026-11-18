@@ -63,6 +63,11 @@ from muGrid.Preconditioners import (
 )
 from muGrid.Solvers import ConvergenceError, conjugate_gradients
 
+try:  # the energy-error stopping test needs a recent muGrid
+    from muGrid.Solvers import conjugate_gradients_energy
+except ImportError:
+    conjugate_gradients_energy = None
+
 from .material import SimpMaterial
 from .precision import cg_rtol_floor
 from .timing import timer
@@ -268,6 +273,10 @@ class Homogenization:
         cg_tol=None,
         cg_maxiter=2000,
         cg_verbose=False,
+        cg_stop="residual",
+        cg_delay=0,
+        multigrid_precision="double",
+        multigrid_degree=2,
         device=None,
         dtype=np.float64,
         managed_memory=None,
@@ -301,9 +310,15 @@ class Homogenization:
             operator inverted by FFT along the rank-local axes and by a
             tridiagonal solve along the distributed one, which needs no
             all-to-all communication. ``"hybrid-jacobi"``: ``"hybrid"``
-            combined with the Jacobi diagonal. ``None``: unpreconditioned CG.
-            Any other value raises ``ValueError`` in the first
-            :meth:`set_density`.
+            combined with the Jacobi diagonal. ``"multigrid"``: a geometric
+            multigrid V-cycle for the heterogeneous operator itself
+            (:class:`muGrid.Multigrid.MultigridPreconditioner`), rebuilt for
+            every design. Its iteration count does not grow with the grid or
+            the phase contrast, where the FFT-based preconditioners' does; it
+            needs ``dtype=float64``, a void phase with non-zero stiffness
+            and a grid that can be halved at least once (every axis even and
+            at least 8 wide). ``None``: unpreconditioned CG. Any other value
+            raises ``ValueError`` in the first :meth:`set_density`.
         cg_tol : float, optional
             Default relative CG tolerance ``‖r‖ ≤ cg_tol ‖b‖``. ``None``
             (default) gives ``max(1e-8, cg_rtol_floor(dtype))``, i.e. 1e-8 in
@@ -317,6 +332,28 @@ class Homogenization:
         cg_verbose : bool, optional
             Print the residual of every CG iteration on rank 0 (default
             False).
+        cg_stop : {"residual", "energy"}, optional
+            What ``cg_tol`` bounds. ``"residual"`` (default): the relative
+            residual ``‖b − K x‖ ≤ cg_tol ‖b‖``. ``"energy"``: an estimate of
+            the energy-norm error relative to the energy of the solution,
+            ``‖x − x_k‖_K ≤ cg_tol ‖x‖_K``
+            (:func:`muGrid.Solvers.conjugate_gradients_energy`). The energy
+            error is what CG minimises and what enters a homogenised
+            stiffness; the same accuracy of the objective is reached in
+            fewer iterations than with a residual test, whose distance from
+            the energy error depends on the conditioning.
+        cg_delay : int, optional
+            Minimal number of CG steps in an energy-error estimate (default
+            0: the adaptive rule alone). Only with ``cg_stop="energy"``.
+        multigrid_precision : {"double", "single"}, optional
+            Precision of the multigrid cycle (default ``"double"``).
+            ``"single"`` runs the cycle in float32 between the float64 CG
+            vectors, which halves its memory and its memory traffic; the
+            iteration counts stay the same. Only with
+            ``preconditioner="multigrid"``.
+        multigrid_degree : int, optional
+            Chebyshev steps per smoothing of the multigrid (default 2: a
+            V(2, 2) cycle).
         device : str or muGrid.Device, optional
             ``None``/``"cpu"`` (default), ``"gpu"``/``"cuda"``/``"rocm"``
             (one GPU per rank, ``local_rank % n_gpus``), or an explicit
@@ -458,6 +495,17 @@ class Homogenization:
         self.cg_tol = (max(1e-8, self._rtol_floor) if cg_tol is None
                        else self._clamp_rtol(cg_tol))
         self.cg_maxiter = cg_maxiter
+        if cg_stop not in ("residual", "energy"):
+            raise ValueError(
+                f"cg_stop must be 'residual' or 'energy', got {cg_stop!r}")
+        if cg_stop == "energy" and conjugate_gradients_energy is None:
+            raise ValueError(
+                "cg_stop='energy' needs a muGrid with "
+                "muGrid.Solvers.conjugate_gradients_energy")
+        self.cg_stop = cg_stop
+        self.cg_delay = int(cg_delay)
+        self.multigrid_precision = multigrid_precision
+        self.multigrid_degree = int(multigrid_degree)
         # Stagnation safeguard of the CG solves (see solve_rhs): a solve whose
         # residual has not improved by at least `cg_stagnation_rel` (relative)
         # within the last `cg_stagnation_patience` iterations has hit its
@@ -610,6 +658,9 @@ class Homogenization:
 
                     prec.refresh = refresh
                     self._prec = prec
+            elif self.preconditioner_kind == "multigrid":
+                self._prec = self._make_multigrid()
+                self._prec.setup()
             else:
                 raise ValueError(
                     f"unknown preconditioner '{self.preconditioner_kind}'"
@@ -618,6 +669,94 @@ class Homogenization:
             # Reuse the (reference) Green part; refresh only the Jacobi diagonal
             # from the updated material.
             self._prec.refresh()
+        elif self.preconditioner_kind == "multigrid":
+            # The coarse operators are Galerkin products of the current
+            # stiffness: all of them change with the design.
+            self._refresh_multigrid_material()
+            self._prec.setup()
+
+    def _make_multigrid(self):
+        """Build the multigrid preconditioner for the current material.
+
+        The stiffness is a sum of fixed element matrices with non-negative
+        factors per element, ``K = Σ_e [λ_e K_λ + μ_e K_μ]``. Telling the
+        multigrid so (``ScaledLocalMatrices``) gives its smoother a
+        guaranteed eigenvalue bound that does not depend on the design, so
+        no estimate has to be recomputed, or trusted, when the design
+        changes.
+        """
+        from muGrid.Multigrid import (
+            MultigridPreconditioner,
+            ScaledLocalMatrices,
+        )
+
+        if self.dtype != np.dtype(np.float64):
+            raise ValueError(
+                "preconditioner='multigrid' needs dtype=float64 fields; use "
+                "multigrid_precision='single' for a single-precision cycle")
+        m = self.material
+        if min(m.lam_void + 2.0 * m.mu_void, m.mu_void) <= 0.0:
+            raise ValueError(
+                "preconditioner='multigrid' needs a void phase with non-zero "
+                "stiffness (void_ratio > 0): its smoother divides by the "
+                "diagonal of the stiffness")
+
+        proportional = np.isclose(m.lam_void * m.mu_solid,
+                                  m.lam_solid * m.mu_void, rtol=1e-12)
+        self._mg_scales = self._lam32 = self._mu32 = None
+        if proportional:
+            # C(ρ) = s(ρ) C_solid: one family, with μ itself as the factor
+            # (λ = μ λ_solid / μ_solid). No further field is needed.
+            local = ScaledLocalMatrices.isotropic_stiffness(
+                self.op, m.lam_solid / m.mu_solid, 1.0, self.mu)
+        else:
+            # λ and μ vary independently: two families with the factors
+            # (λ, μ) per element, kept in one field with two components.
+            self._mg_scales = self.fc.real_field("to_mg_scales", (2,))
+            k_lambda = ScaledLocalMatrices.isotropic_stiffness(
+                self.op, 1.0, 0.0, self.lam).matrices[0]
+            k_mu = ScaledLocalMatrices.isotropic_stiffness(
+                self.op, 0.0, 1.0, self.mu).matrices[0]
+            local = ScaledLocalMatrices(np.array([k_lambda, k_mu]),
+                                        self._mg_scales)
+
+        def diagonal(field):
+            self.op.assemble_diagonal(self.lam, self.mu, field)
+
+        operator_single = None
+        if self.multigrid_precision == "single":
+            # The fine level of a single-precision cycle applies the
+            # stiffness to float32 vectors, with float32 material fields.
+            self._lam32 = self.fc.real_field("to_lambda32", dtype=np.float32)
+            self._mu32 = self.fc.real_field("to_mu32", dtype=np.float32)
+
+            def operator_single(u, Au):
+                self.engine.communicate_ghosts(u)
+                self.op.apply(u, self._lam32, self._mu32, Au)
+
+        self._refresh_multigrid_material()
+        return MultigridPreconditioner(
+            self._hessp_untimed, self.engine, self.dim, local_matrices=local,
+            diagonal=diagonal, degree=self.multigrid_degree,
+            precision=self.multigrid_precision,
+            operator_single=operator_single, communicator=self.comm,
+            timer=self.timer)
+
+    def _refresh_multigrid_material(self):
+        """Copy the material into the fields only the multigrid reads."""
+        if self._mg_scales is not None:
+            self._mg_scales.s[0] = self.lam.s
+            self._mg_scales.s[1] = self.mu.s
+            self.engine.communicate_ghosts(self._mg_scales)
+        if self._lam32 is not None:
+            self._lam32.sg[...] = self.lam.sg
+            self._mu32.sg[...] = self.mu.sg
+
+    def _hessp_untimed(self, u, Au):
+        """``Au = K u``, without the timer regions of :meth:`_hessp` (the
+        multigrid times its own stages)."""
+        self.engine.communicate_ghosts(u)
+        self.op.apply(u, self.lam, self.mu, Au)
 
     # -- solves -------------------------------------------------------------
     def _hessp(self, u, Au):
@@ -804,6 +943,9 @@ class Homogenization:
         # here, so the float32 floor cannot be routed around. In double
         # precision the floor is 0.0 and this is a no-op.
         rtol_eff = self._clamp_rtol(self.cg_tol if rtol is None else rtol)
+        if self.cg_stop == "energy":
+            return self._solve_energy(b, x, rtol_eff, maxiter, residual,
+                                      verbose, tag)
         stall = (1.0 - self.cg_stagnation_rel) ** 2
         diverge = self.cg_divergence_factor ** 2
         guard = {"best": np.inf, "best_iter": 0, "ref": np.inf, "ref_iter": 0,
@@ -903,12 +1045,56 @@ class Homogenization:
         self.last_cg_iters = counter["n"]
         return x
 
+    def _solve_energy(self, b, x, rtol, maxiter, residual, verbose, tag):
+        """CG stopped on the estimated energy-norm error (``cg_stop=
+        "energy"``); the tail of :meth:`solve_rhs`, which has already dealt
+        with a negligible right-hand side and a bad warm start.
+
+        ``x`` holds the start vector (zero, or the accepted warm start). A
+        solve that reaches the iteration cap keeps the iterate reached and
+        is counted in :attr:`cg_stagnation_count`, as in the residual path.
+        """
+        state_seen = {}
+
+        def _watch(iteration, state):
+            # The callback is also called once before the first iteration.
+            self.last_cg_iters = iteration
+            state_seen["r"] = state["r"]
+            if verbose and iteration > 0:
+                estimate = state["energy_error_sq"]
+                shown = ("no estimate yet" if estimate is None else
+                         f"error/energy="
+                         f"{np.sqrt(estimate / state['energy_sq']):.2e}")
+                print(f"    cg-iter {iteration:4d}  {tag}{shown}  "
+                      f"(rtol={rtol:.1e})", flush=True)
+
+        self.last_cg_iters = 0
+        try:
+            conjugate_gradients_energy(
+                self.comm, self.fc, b, x, hessp=self._hessp, prec=self._prec,
+                rtol=rtol, d_min=self.cg_delay, timer=self.timer,
+                maxiter=self.cg_maxiter if maxiter is None else maxiter,
+                callback=_watch)
+        except ConvergenceError as err:
+            if "r" not in state_seen:
+                raise  # broke down before the first iteration
+            self.cg_stagnation_count += 1
+            if verbose:
+                print(f"    cg {tag}{err}; kept the iterate reached",
+                      flush=True)
+        if residual is not None:
+            # CG's own residual of the returned iterate: one copy instead of
+            # one more operator product.
+            linalg.copy(state_seen["r"], residual)
+        return x
+
     def solve_macro(self, E_macro, x, rtol=None, maxiter=None, residual=None,
-                    label=None):
+                    label=None, warm_start=False):
         """Solve the periodic cell problem ``K u = −Bᵀ C:Ē`` for the
         fluctuation displacement ``u`` (written to ``x`` and returned) under
         the ``dim × dim`` macro strain ``E_macro``. The remaining arguments
-        are those of :meth:`solve_rhs`; the negligible-rhs scale is
+        are those of :meth:`solve_rhs` (with ``warm_start`` the content of
+        ``x`` is the start vector); the negligible-rhs scale is
         ``mat_scale · max|Ē|``."""
         E_arr = np.asarray(E_macro, dtype=float)
         E = list(E_arr.ravel())
@@ -918,7 +1104,7 @@ class Homogenization:
             float(np.abs(E_arr).max()), 1e-300)
         return self.solve_rhs(
             self._rhs, x, rtol=rtol, maxiter=maxiter, rhs_scale=scale,
-            residual=residual, label=label)
+            residual=residual, label=label, warm_start=warm_start)
 
     @property
     def mat_scale(self):
