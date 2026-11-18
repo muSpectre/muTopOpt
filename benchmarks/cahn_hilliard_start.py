@@ -92,7 +92,7 @@ def cahn_hilliard(n, seed=11, eta_h=2.0, eps_eta=np.sqrt(2.0),
         c_hat = xp.fft.rfftn(c)
         c_hat -= dt * neg_laplace * xp.fft.rfftn(c * c * c - c)
         c_hat /= denominator
-        c = xp.fft.irfftn(c_hat, s=(n, n, n))
+        c = xp.fft.irfftn(c_hat, s=(n, n, n), axes=(0, 1, 2))
         if log is not None and (step % max(steps // 10, 1) == 0
                                 or step == steps):
             log(f"step {step}/{steps}: c in [{float(c.min()):+.3f}, "
@@ -118,11 +118,16 @@ def write_start(path, rho, description):
 
 
 def plot_mid_slice(path, rho, title):
-    """The mid slice ``z = 1/2`` and a zoom on its first quarter."""
-    import matplotlib
+    """The mid slice ``z = 1/2`` and a zoom on its first quarter. Skipped
+    without matplotlib (e.g. a cluster venv for the solves only)."""
+    try:
+        import matplotlib
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(f"no matplotlib: {path} not written", flush=True)
+        return
 
     n = rho.shape[0]
     mid = rho[:, :, n // 2]

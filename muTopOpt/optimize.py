@@ -587,13 +587,55 @@ def helmholtz_preconditioner(homogenization, length, c=4.0):
         dtype=np.float64)
 
 
+def first_step_scaled(precond, comm, first_step):
+    """The preconditioner ``σ M``, with the factor ``σ`` fixed at its first
+    application so that the largest entry of that first result is
+    ``first_step``. (``σ`` scales the whole smoother; it is not the factor
+    ``helmholtz_c`` inside the smoother, which stays as it is.)
+
+    In :func:`optimize_helmholtz_lbfgs` the first application is to the
+    projected gradient of the start, so the first step of the L-BFGS
+    (``α = 1``, no curvature pairs yet) changes no density by more than
+    ``first_step``. Every later quasi-Newton direction is independent of
+    ``σ``: the scale ``γ = sᵀy / yᵀ P (σ M) P y`` of the initial inverse
+    Hessian divides it out again. Only steps with an empty memory change
+    (the first one, and steepest-descent steps after the pairs are dropped).
+
+    Parameters
+    ----------
+    precond : callable
+        ``precond(v, Mv)`` writes ``M v`` into the field ``Mv``.
+    comm : muGrid.Communicator
+        To take the largest entry over all ranks.
+    first_step : float
+        Largest change of the first step, > 0.
+
+    Returns
+    -------
+    callable
+        ``scaled(v, out)``, the same interface; ``scaled.sigma`` is the list
+        ``[σ]`` once ``σ`` is fixed (empty before).
+    """
+    def scaled(v, out):
+        precond(v, out)
+        values = out.p
+        if not scaled.sigma:
+            largest = float(comm.max(float(abs(values).max())))
+            scaled.sigma.append(first_step / largest if largest > 0 else 1.0)
+        values *= scaled.sigma[0]
+
+    scaled.sigma = []
+    return scaled
+
+
 def optimize_helmholtz_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=0.0,
                              xtol=0.0, bounds=(0.0, 1.0), maxcor=20,
                              callback=None, length=None, helmholtz_c=4.0,
                              precond="helmholtz", cg_tol_start=None,
                              cg_tol_min=None, cg_forcing_c=1.0,
                              cg_forcing_exp=1.0, cg_stall_rel=1e-2,
-                             cg_stall_shrink=0.3, pair_store="device"):
+                             cg_stall_shrink=0.3, pair_store="device",
+                             first_step=0.0):
     """Minimize ``problem`` from ``rho0`` with muGrid's box-constrained
     L-BFGS on fields, preconditioned by a Helmholtz smoother.
 
@@ -636,6 +678,19 @@ def optimize_helmholtz_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=0.0,
         them (``2 · maxcor · 8`` bytes per node, 320 at ``maxcor = 20``);
         the iterates are the same, at about ``4 · maxcor`` field copies
         between host and device per iteration.
+    first_step : float, optional
+        > 0: multiply the smoother by a factor ``σ``, fixed once
+        (:func:`first_step_scaled`), so that the first step changes no
+        density by more than ``first_step`` (0.05 in the large 3D runs).
+        0 (default): unscaled. Unscaled, the first step is ``α = 1`` along
+        ``−P M P r``, which on a converging design is far too small (the
+        ``σ`` that corrects it was 6.3e3 at 64³ and 4.0e4 at 128³); its
+        curvature pair is then CG noise, and the following directions
+        overshoot by orders of magnitude, so that the line search halves 7
+        or more times through designs whose solves need 60-300 CG
+        iterations, or stalls (the muFFTTO study's ``LBFGS_FIRST_STEP``,
+        found after restarts at 128³ and 512³). For restarts and grid
+        continuation; from a fresh start (``σ`` ~ 10) it gave no gain.
 
     Returns
     -------
@@ -643,7 +698,8 @@ def optimize_helmholtz_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=0.0,
         Final density, same shape as ``rho0``.
     info : dict
         As for :func:`optimize_bounded_lbfgs`, plus ``nfev`` (number of
-        evaluations of the objective).
+        evaluations of the objective) and, with ``first_step``,
+        ``first_step_sigma`` (the factor ``σ``).
     """
     from muGrid.Optimize import l_bfgs_bounded
 
@@ -663,6 +719,11 @@ def optimize_helmholtz_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=0.0,
         smoother = None
     else:
         raise ValueError(f"unknown preconditioner {precond!r}")
+    if first_step > 0:
+        if smoother is None:
+            raise ValueError("first_step scales the Helmholtz preconditioner;"
+                             " precond=None has none")
+        smoother = first_step_scaled(smoother, h.comm, first_step)
 
     # The optimizer's vectors are always double precision, whatever the
     # precision of the solver's fields.
@@ -705,6 +766,8 @@ def optimize_helmholtz_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=0.0,
         "cg_rtol_history": (inner_tol.history if inner_tol is not None
                             else None),
     }
+    if first_step > 0 and smoother.sigma:
+        info["first_step_sigma"] = smoother.sigma[0]
     rho_opt = np.asarray(h.to_host(design.p)).reshape(np.shape(rho0))
     return rho_opt, info
 

@@ -15,6 +15,7 @@ from muTopOpt import (
 )
 from muTopOpt.loadcases import isotropic_stiffness_tensor, target_load_cases
 from muTopOpt.optimize import (
+    first_step_scaled,
     helmholtz_preconditioner,
     initial_density,
     optimize_bounded_lbfgs,
@@ -59,6 +60,46 @@ def test_smoother_inverts_the_helmholtz_stencil():
     # a smoother: the mean is kept, the variation is damped
     assert z.mean() == pytest.approx(values.mean())
     assert z.std() < 0.5 * values.std()
+
+
+@serial_only
+def test_first_step_scaled_fixes_the_scale_at_the_first_call():
+    """σ M: the first result has the largest entry first_step, and every
+    later one is the same σ times M v."""
+    h = make_problem().h
+    smoother = helmholtz_preconditioner(h, 0.07)
+    scaled = first_step_scaled(smoother, h.comm, 0.05)
+    v, out, reference = (h.scalar_field(name)
+                         for name in ("v", "out", "reference"))
+    rng = np.random.default_rng(1)
+    v.p[...] = rng.standard_normal(v.p.shape)
+    scaled(v, out)
+    assert np.abs(out.p).max() == pytest.approx(0.05, rel=1e-12)
+    (sigma,) = scaled.sigma
+    v.p[...] = 10.0 * rng.standard_normal(v.p.shape)
+    scaled(v, out)
+    smoother(v, reference)
+    np.testing.assert_allclose(out.p, sigma * reference.p, rtol=1e-12)
+    assert scaled.sigma == [sigma]
+
+
+@serial_only
+def test_first_step_bounds_the_first_change():
+    """With first_step the first accepted step changes no density by more
+    than first_step, the run still descends, and σ is reported."""
+    rho0 = initial_density((16, 16), kind="uniform", volume_fraction=0.5)
+    problem = make_problem()
+    f0, _ = problem.objective_and_gradient(rho0)
+    iterates = []
+    _, info = optimize_helmholtz_lbfgs(
+        problem, rho0, maxiter=8, first_step=0.05,
+        callback=lambda it, x, last: iterates.append(np.array(x)))
+    assert np.abs(iterates[0] - rho0).max() <= 0.05 + 1e-12
+    assert info["objective"] < f0
+    assert info["first_step_sigma"] > 0
+    with pytest.raises(ValueError, match="first_step"):
+        optimize_helmholtz_lbfgs(make_problem(), rho0, precond=None,
+                                 first_step=0.05)
 
 
 @serial_only

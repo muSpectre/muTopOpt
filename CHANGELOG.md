@@ -31,6 +31,8 @@ v1.6.0 (not yet released)
   and an isotropic auxetic target
 - ENH: L-BFGS on fields with a Helmholtz smoother as initial inverse Hessian: no vector
   leaves the GPU, and the curvature pairs can be kept in host memory
+- ENH: The first L-BFGS step can be bounded, which avoids overshooting steps and stalls
+  when an optimisation restarts from a converged design (off by default)
 - ENH: The nodal phase-field gradient term can use one quadrature point per voxel, which
   reproduces the objective of the muFFTTO large-grid studies exactly
 - ENH: Grid continuation: a design moves to a finer grid by trilinear interpolation, which

@@ -33,6 +33,9 @@ buys:
   smoother, or NuMPI's L-BFGS on host arrays)
 * ``--lbfgs-pairs device | host`` (where the L-BFGS on fields keeps its
   curvature pairs)
+* ``--lbfgs-first-step X`` (the Helmholtz H_0 scaled so that the first
+  step changes the design by at most X; without it the first step from a
+  converging design is far too small and the next ones overshoot)
 
 Grid continuation. Several grids run one after the other, each starting
 from the final design of the previous one, interpolated trilinearly
@@ -252,8 +255,10 @@ def _run_grid(n, start, args, comm):
               f"({args.multigrid_coarsening}), CG stop "
               f"{args.cg_stop} at {args.cg_tol:g}, warm starts "
               f"{args.warm_start}, optimizer {args.optimizer} (pairs on "
-              f"{args.lbfgs_pairs}), {args.objective} objective, gradient term "
-              f"{args.pf_quadrature}, start {start.shape[0]}^3", flush=True)
+              f"{args.lbfgs_pairs}, first step "
+              f"{args.lbfgs_first_step or 'unscaled'}), {args.objective} "
+              f"objective, gradient term {args.pf_quadrature}, start "
+              f"{start.shape[0]}^3", flush=True)
     # snapshots: the start now, then every save_every-th accepted iterate
 
     def save(filename, rho, iteration, objective):
@@ -276,9 +281,13 @@ def _run_grid(n, start, args, comm):
     options = dict(maxiter=args.maxiter, gtol=0.0, xtol=1e-3, maxcor=20,
                    callback=save_snapshot if args.save_every > 0 else None)
     if args.optimizer == "helmholtz":
-        rho, info = optimize_helmholtz_lbfgs(problem, rho0,
-                                             pair_store=args.lbfgs_pairs,
-                                             **options)
+        rho, info = optimize_helmholtz_lbfgs(
+            problem, rho0, pair_store=args.lbfgs_pairs,
+            first_step=args.lbfgs_first_step, **options)
+        if rank0 and "first_step_sigma" in info:
+            print(f"first step: sigma = {info['first_step_sigma']:.3e} "
+                  "(H_0 = sigma x Helmholtz)",
+                  flush=True)
     else:
         rho, info = optimize_bounded_lbfgs(problem, rho0, comm=comm,
                                            **options)
@@ -364,6 +373,13 @@ def main():
     parser.add_argument("--lbfgs-pairs", default="device",
                         choices=("device", "host"),
                         help="where the L-BFGS on fields keeps its pairs")
+    parser.add_argument("--lbfgs-first-step", type=float, default=0.0,
+                        metavar="X",
+                        help="multiply the Helmholtz H_0 once by a factor "
+                             "sigma so that the first "
+                             "L-BFGS step changes the design by at most X "
+                             "(the study's LBFGS_FIRST_STEP; 0.05 in its "
+                             "production runs); 0: unscaled")
     parser.add_argument("--objective", default="energy",
                         choices=("energy", "stress"))
     parser.add_argument("--target-nu", type=float, default=-0.5)
@@ -380,6 +396,9 @@ def main():
                              "(<output>_N<n>_it<iteration>.nc, with a PNG of "
                              "the mid slices); 0: only the final design")
     args = parser.parse_args()
+    if args.lbfgs_first_step > 0 and args.optimizer != "helmholtz":
+        parser.error("--lbfgs-first-step scales the Helmholtz H_0 of "
+                     "--optimizer helmholtz")
     if args.save_every > 0 and args.output is None:
         parser.error("--save-every needs --output (the file name prefix)")
     if len(args.nb_grid_pts) > 1 and args.output is None:
