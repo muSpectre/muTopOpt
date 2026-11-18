@@ -50,6 +50,16 @@ Drivers
     accepted if ``r ≥ eta``, and the radius is updated as ``Δ ← Δ/4`` if
     ``r < 1/4`` and ``Δ ← min(2Δ, Δ_max)`` if ``r > 3/4`` and the step
     reached the boundary (unchanged otherwise).
+:func:`optimize_helmholtz_lbfgs`
+    muGrid's L-BFGS on fields (``muGrid.Optimize.l_bfgs_bounded``), the
+    algorithm of the NuMPI driver above with the initial inverse Hessian
+    ``γ P M P``: ``M = (I − c ℓ² Δ_h)⁻¹`` the Helmholtz smoother of
+    :func:`helmholtz_preconditioner`, ``P`` the projector onto the free
+    densities. The smoother turns a voxel-wise gradient step into one that
+    moves interfaces, which cut the number of evaluations by a factor 2 to 3
+    in the 3D studies. Design, gradient and L-BFGS memory are fields next to
+    the solver's (on the GPU in a GPU run); the curvature pairs can be kept
+    in host memory instead (``pair_store="host"``) when the device is full.
 :func:`optimize_lbfgs`
     SciPy's serial L-BFGS-B, for single-process runs without NuMPI.
 

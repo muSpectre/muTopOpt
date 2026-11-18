@@ -17,6 +17,15 @@ bulk/shear modulus or Poisson's ratio.
 Isotropic targets use the convention ``σ = 2G dev(ε) + K tr(ε) I``, i.e.
 ``G = μ`` and ``K = λ + 2μ/d``: the ordinary bulk modulus in 3D and the
 plane-strain area modulus in 2D.
+
+Energy objective. :func:`energy_load_cases` matches stiffness energies
+instead of stresses: terms ``(W − W*)² / W*²`` with the energies
+``W = E_k : C̄ : Ē^Γ`` of a load-case strain ``Ē^Γ`` and a "left" strain
+``E_k``, one per entry of the stiffness that an isotropic target
+constrains (in 3D 9 terms from 6 load cases: three normal stiffnesses,
+three couplings of normal strains, three shears). :func:`auxetic_target` is the
+isotropic target of the large-grid studies: a given Poisson ratio (default
+−0.5) and a shear modulus as a fraction of that of the solid.
 """
 
 import numpy as np

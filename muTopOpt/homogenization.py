@@ -40,6 +40,22 @@ stiffness of a homogeneous reference medium -- the global means of ``λ`` and
 Jacobi diagonal of ``K``. The reference part is built once; the diagonal is
 refreshed from the current design on every :meth:`set_density`.
 
+For large, high-contrast 3D cells ``preconditioner="multigrid"`` uses
+muGrid's heterogeneous geometric multigrid instead: Galerkin coarse levels of
+the current ``K``, a Chebyshev smoother with a guaranteed eigenvalue bound,
+the cycle in single or double precision (``multigrid_precision``). It is
+rebuilt on every :meth:`set_density`, and its iteration count hardly grows
+with the grid or the contrast (13 CG iterations per load case at 128³,
+against 128 with J-FFT).
+
+Stopping test. ``cg_stop="residual"`` (default) stops on
+``‖b − K x‖ ≤ cg_tol ‖b‖``. ``cg_stop="energy"`` stops on an estimate of the
+energy-norm error relative to the energy of the solution
+(:func:`muGrid.Solvers.conjugate_gradients_energy`), the quantity that enters
+the homogenized stiffness; it needs no residual and one global reduction per
+iteration less. A start vector in ``x`` (``warm_start=True``, see
+:mod:`muTopOpt.warmstart`) sets the energy scale of the test.
+
 Everything is dimension-agnostic (``d`` = 2 or 3): the only per-dimension
 detail is which ``IsotropicStiffnessOperator{2,3}D`` to instantiate. Fields live
 on the engine's real-space collection so the solver, the preconditioner FFTs and
