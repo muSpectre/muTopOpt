@@ -40,16 +40,23 @@ def solve(nb_grid_pts, material=None, strain=(0, 0), **options):
     return h.homogenized_stress(u, E), h.last_cg_iters, h, u, E
 
 
+COARSENINGS = ["galerkin", "rediscretised"]
+
+
+@pytest.mark.parametrize("coarsening", COARSENINGS)
 @pytest.mark.parametrize("nb_grid_pts", [(32, 32), (16, 16, 16)])
 @pytest.mark.parametrize("precision", ["double", "single"])
-def test_multigrid_gives_the_stress_of_green_jacobi(nb_grid_pts, precision):
+def test_multigrid_gives_the_stress_of_green_jacobi(nb_grid_pts, precision,
+                                                    coarsening):
     """Same homogenised stress as a tight Green-Jacobi solve, in fewer
-    iterations, for a contrast of 1000."""
+    iterations, for a contrast of 1000, with Galerkin and with re-discretised
+    coarse levels."""
     reference, iterations_reference, *_ = solve(
         nb_grid_pts, preconditioner="green-jacobi", cg_tol=1e-10)
     stress, iterations, *_ = solve(
         nb_grid_pts, preconditioner="multigrid", cg_tol=1e-6,
-        cg_stop="energy", multigrid_precision=precision)
+        cg_stop="energy", multigrid_precision=precision,
+        multigrid_coarsening=coarsening)
     # an energy error of 1e-6 is an error of 1e-12 in the energy; the stress
     # is linear in the solution, so its error is of first order
     np.testing.assert_allclose(stress, reference,
@@ -74,15 +81,18 @@ def test_multigrid_with_either_stopping_test(stop):
                                atol=1e-5 * np.abs(reference).max())
 
 
-def test_material_with_independent_lame_parameters():
+@pytest.mark.parametrize("coarsening", COARSENINGS)
+def test_material_with_independent_lame_parameters(coarsening):
     """A void phase that is not a multiple of the solid: the multigrid then
-    uses one family of element matrices for λ and one for μ."""
+    uses one family of element matrices for λ and one for μ (on the coarse
+    levels too, when they are re-discretised)."""
     material = SimpMaterial(1.0, 0.3, penalty=3, void_ratio=1e-3)
     material.lam_void *= 5.0        # another Poisson ratio in the void
     reference, *_ = solve((32, 32), material,
                           preconditioner="green-jacobi", cg_tol=1e-10)
     stress, _, h, *_ = solve((32, 32), material, preconditioner="multigrid",
-                             cg_tol=1e-7, cg_stop="energy")
+                             cg_tol=1e-7, cg_stop="energy",
+                             multigrid_coarsening=coarsening)
     assert h._mg_scales is not None
     np.testing.assert_allclose(stress, reference,
                                atol=1e-5 * np.abs(reference).max())
@@ -137,11 +147,13 @@ def test_warm_start_needs_fewer_iterations():
     assert h.last_cg_iters >= cold - 1              # cold again: as before
 
 
-def test_multigrid_setup_follows_the_design():
+@pytest.mark.parametrize("coarsening", COARSENINGS)
+def test_multigrid_setup_follows_the_design(coarsening):
     """A second design gets its own coarse operators: solving it with the
     refreshed multigrid takes as few iterations as a fresh solver does."""
     nb_grid_pts = (32, 32)
-    options = dict(preconditioner="multigrid", cg_tol=1e-6, cg_stop="energy")
+    options = dict(preconditioner="multigrid", cg_tol=1e-6, cg_stop="energy",
+                   multigrid_coarsening=coarsening)
     material = SimpMaterial(1.0, 0.3, void_ratio=1e-3)
     E = unit_strain(2, 0, 0)
     second = density(nb_grid_pts, sharpness=1.0)[::-1].copy()
@@ -173,6 +185,14 @@ def test_unsupported_combinations_raise():
     h = Homogenization((16, 16), SimpMaterial(1.0, 0.3, void_ratio=0.0),
                        preconditioner="multigrid")
     with pytest.raises(ValueError, match="void"):
+        h.set_density(density((16, 16)))
+    with pytest.raises(ValueError, match="multigrid_coarsening"):
+        Homogenization((16, 16), material, preconditioner="multigrid",
+                       multigrid_coarsening="algebraic")
+    # re-discretised levels exist for Q1 only
+    h = Homogenization((16, 16), material, preconditioner="multigrid",
+                       element="p1", multigrid_coarsening="rediscretised")
+    with pytest.raises(ValueError, match="q1"):
         h.set_density(density((16, 16)))
 
 

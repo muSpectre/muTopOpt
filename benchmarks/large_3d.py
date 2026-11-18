@@ -25,7 +25,8 @@ Problem (the reference setup of the muFFTTO study ``to3d_large.py``):
 Every option that makes the solve fast can be switched, to measure what it
 buys:
 
-* ``--preconditioner multigrid | green-jacobi``
+* ``--preconditioner multigrid | green-jacobi``, and
+  ``--multigrid-coarsening galerkin | rediscretised``
 * ``--cg-stop energy | residual``
 * ``--warm-start device | device32 | host | host32 | none``
 * ``--optimizer helmholtz | numpi`` (L-BFGS on fields with the Helmholtz
@@ -199,7 +200,8 @@ def _run_grid(n, start, args, comm):
     homogenization = Homogenization(
         (n, n, n), material, comm=comm, device=args.device,
         preconditioner=args.preconditioner, cg_tol=args.cg_tol,
-        cg_stop=args.cg_stop, multigrid_precision=args.multigrid_precision)
+        cg_stop=args.cg_stop, multigrid_precision=args.multigrid_precision,
+        multigrid_coarsening=args.multigrid_coarsening)
     regularization = NodalPhaseFieldRegularization(
         homogenization, eta=2.0 / n, weight=args.pf_weight, dwell="lumped",
         gradient_quadrature=args.pf_quadrature.replace("-", "_"))
@@ -240,7 +242,8 @@ def _run_grid(n, start, args, comm):
         homogenization.nb_pixels), 0.0, 1.0)
     if rank0:
         print(f"3D TO {n}^3 on {comm.size} rank(s), device {args.device}, "
-              f"preconditioner {args.preconditioner}, CG stop "
+              f"preconditioner {args.preconditioner} "
+              f"({args.multigrid_coarsening}), CG stop "
               f"{args.cg_stop} at {args.cg_tol:g}, warm starts "
               f"{args.warm_start}, optimizer {args.optimizer} (pairs on "
               f"{args.lbfgs_pairs}), {args.objective} objective, gradient term "
@@ -288,6 +291,8 @@ def main():
                              "needed for several grids")
     parser.add_argument("--preconditioner", default="multigrid")
     parser.add_argument("--multigrid-precision", default="single")
+    parser.add_argument("--multigrid-coarsening", default="galerkin",
+                        choices=("galerkin", "rediscretised"))
     parser.add_argument("--cg-stop", default="energy")
     parser.add_argument("--cg-tol", type=float, default=1e-6)
     parser.add_argument("--warm-start", default="device")

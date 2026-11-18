@@ -21,6 +21,8 @@ v1.6.0 (not yet released)
 
 - ENH: Multigrid preconditioner for large high-contrast cells, rebuilt for every design:
   13 CG iterations per load case at 128³ on a GPU instead of 128 with Green-Jacobi
+- ENH: The multigrid's coarse levels can be re-discretised instead of Galerkin: a setup without
+  probing and less memory (13 % at 256³), at 6–10 % more CG iterations in the 3D runs
 - ENH: CG can stop on an estimate of the energy-norm error, the error that enters the
   homogenized stiffness, instead of the residual
 - ENH: Warm starts of the forward and adjoint solves between evaluations, kept on the

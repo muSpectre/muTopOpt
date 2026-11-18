@@ -125,6 +125,10 @@ rho, info = optimize_helmholtz_lbfgs(problem, rho0, maxiter=500, gtol=0.0,
                                      xtol=1e-3, pair_store="host")
 ```
 
+`multigrid_coarsening="rediscretised"` re-discretises the coarse levels instead
+(no probing at a design update, 13 % less GPU memory at 256³, 6–10 % more CG
+iterations); Galerkin is the default.
+
 The device memory of this setting is about 900 bytes per voxel with the warm
 starts and the L-BFGS pairs in host memory (`warm_start="host"`,
 `pair_store="host"`): a 512³ cell fits on one 141 GB GPU. The multigrid, the

@@ -41,9 +41,11 @@ Jacobi diagonal of ``K``. The reference part is built once; the diagonal is
 refreshed from the current design on every :meth:`set_density`.
 
 For large, high-contrast 3D cells ``preconditioner="multigrid"`` uses
-muGrid's heterogeneous geometric multigrid instead: Galerkin coarse levels of
-the current ``K``, a Chebyshev smoother with a guaranteed eigenvalue bound,
-the cycle in single or double precision (``multigrid_precision``). It is
+muGrid's heterogeneous geometric multigrid instead: coarse levels of the
+current ``K`` (Galerkin products, or the operator re-discretised on the
+coarse grids: ``multigrid_coarsening``), a Chebyshev smoother with a
+guaranteed eigenvalue bound, the cycle in single or double precision
+(``multigrid_precision``). It is
 rebuilt on every :meth:`set_density`, and its iteration count hardly grows
 with the grid or the contrast (13 CG iterations per load case at 128³,
 against 128 with J-FFT).
@@ -299,6 +301,7 @@ class Homogenization:
         cg_delay=0,
         multigrid_precision="double",
         multigrid_degree=2,
+        multigrid_coarsening="galerkin",
         device=None,
         dtype=np.float64,
         managed_memory=None,
@@ -376,6 +379,16 @@ class Homogenization:
         multigrid_degree : int, optional
             Chebyshev steps per smoothing of the multigrid (default 2: a
             V(2, 2) cycle).
+        multigrid_coarsening : {"galerkin", "rediscretised"}, optional
+            How the multigrid's coarse operators are made (default
+            ``"galerkin"``). ``"galerkin"``: ``R A P``, probed from the fine
+            operator at every :meth:`set_density` and stored as stencils.
+            ``"rediscretised"``: the fused operator on every coarse grid with
+            ``λ, μ`` averaged over the child voxels
+            (:class:`muGrid.MultigridCoarsening.IsotropicRediscretisation`,
+            as muFFTTO's multigrid): a setup without probing, about 16 times
+            faster, and no stored stencils, at a few more CG iterations on
+            some materials. Q1 elements only.
         device : str or muGrid.Device, optional
             ``None``/``"cpu"`` (default), ``"gpu"``/``"cuda"``/``"rocm"``
             (one GPU per rank, ``local_rank % n_gpus``), or an explicit
@@ -530,6 +543,11 @@ class Homogenization:
         self.cg_delay = int(cg_delay)
         self.multigrid_precision = multigrid_precision
         self.multigrid_degree = int(multigrid_degree)
+        if multigrid_coarsening not in ("galerkin", "rediscretised"):
+            raise ValueError(
+                "multigrid_coarsening must be 'galerkin' or 'rediscretised', "
+                f"got {multigrid_coarsening!r}")
+        self.multigrid_coarsening = multigrid_coarsening
         # Stagnation safeguard of the CG solves (see solve_rhs): a solve whose
         # residual has not improved by at least `cg_stagnation_rel` (relative)
         # within the last `cg_stagnation_patience` iterations has hit its
@@ -790,13 +808,27 @@ class Homogenization:
 
             operator_single = apply_single
 
+        # passed only when not the default: a muGrid without coarsening
+        # rules then still builds the Galerkin multigrid
+        coarsening = {}
+        if self.multigrid_coarsening == "rediscretised":
+            # The fused operator on every coarse grid, λ and μ averaged over
+            # the child voxels at every setup; one family when the material
+            # is a scaled C_solid (λ/μ fixed), which gives the tight bound.
+            from muGrid.MultigridCoarsening import IsotropicRediscretisation
+
+            coarsening = {"coarsening": IsotropicRediscretisation(
+                self.element, self.grid_spacing, (self.lam, self.mu),
+                lambda_over_mu=(m.lam_solid / m.mu_solid if proportional
+                                else None))}
+
         self._refresh_multigrid_material()
         return MultigridPreconditioner(
             self._hessp_untimed, self.engine, self.dim, local_matrices=local,
             diagonal=diagonal, degree=self.multigrid_degree,
             precision=self.multigrid_precision,
             operator_single=operator_single, communicator=self.comm,
-            timer=self.timer)
+            timer=self.timer, **coarsening)
 
     def _refresh_multigrid_material(self):
         """Copy the material into the fields only the multigrid reads."""
