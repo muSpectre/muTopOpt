@@ -730,9 +730,11 @@ class Homogenization:
             self._lam32 = self.fc.real_field("to_lambda32", dtype=np.float32)
             self._mu32 = self.fc.real_field("to_mu32", dtype=np.float32)
 
-            def operator_single(u, Au):
+            def apply_single(u, Au):
                 self.engine.communicate_ghosts(u)
                 self.op.apply(u, self._lam32, self._mu32, Au)
+
+            operator_single = apply_single
 
         self._refresh_multigrid_material()
         return MultigridPreconditioner(
@@ -895,7 +897,12 @@ class Homogenization:
                       flush=True)
             return x
         cold_start = True
-        if warm_start:
+        if warm_start and self.cg_stop == "energy":
+            # The energy-stopped CG forms K x_0 itself and copes with any
+            # start vector; a poor one only costs iterations. No guard, and
+            # so no extra operator product.
+            pass
+        elif warm_start:
             # Guard the warm start: an initial guess left over from a previous
             # solve (a different Steihaug direction, or -- worse -- a previous
             # outer iterate whose material was less ill-conditioned) can be far
