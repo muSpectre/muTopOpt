@@ -14,7 +14,9 @@ Problem (the reference setup of the muFFTTO study ``to3d_large.py``):
 * material ``C(ρ) = [k + ρ_e² (1 − k)] C_solid`` with ``k = 1e-3`` and
   ``ρ_e`` the element average of the density;
 * energy objective for an isotropic target with Poisson ratio −0.5 and
-  shear modulus 0.3 · 0.15 E_solid (9 energies, 6 load cases);
+  shear modulus 0.3 · 0.15 E_solid (9 energies, 6 load cases), or with
+  ``--objective stress`` the stresses of the 6 load cases matched to the
+  target's;
 * phase-field regularization with weight 0.2, interface width ``η = 2h``
   and the lumped double well; the gradient term with one quadrature point
   per voxel (``--pf-quadrature one-point``) is the study's, the default
@@ -69,7 +71,11 @@ from muTopOpt import (
     SimpMaterial,
     StressTargetProblem,
 )
-from muTopOpt.loadcases import auxetic_target, energy_load_cases
+from muTopOpt.loadcases import (
+    auxetic_target,
+    energy_load_cases,
+    target_load_cases,
+)
 from muTopOpt.optimize import optimize_bounded_lbfgs, optimize_helmholtz_lbfgs
 from muTopOpt.restart import linear_resample, read_final_density, write_density
 
@@ -78,8 +84,9 @@ def read_start(path):
     """The start design on its own grid, as a global array: from a muTopOpt
     file (:func:`muTopOpt.restart.write_density` or ``simulate.py``, which
     carry the attribute ``nb_grid_pts``), from a muFFTTO file (variable
-    ``phase_field_solution``), or without a file a smooth random field
-    (8³ values, interpolated later)."""
+    ``phase_field_solution`` of a final design or a Cahn-Hilliard start,
+    ``phase_field_iterate`` of a checkpoint; last frame), or without a file
+    a smooth random field (8³ values, interpolated later)."""
     if path is None:
         return np.random.default_rng(11).uniform(0.0, 1.0, (8, 8, 8))
     fio = muGrid.FileIONetCDF(path, muGrid.FileIONetCDF.OpenMode.Read,
@@ -93,7 +100,10 @@ def read_start(path):
     import netCDF4
 
     with netCDF4.Dataset(path) as data:
-        return np.asarray(data["phase_field_solution"][-1, 0], dtype=float)
+        name = next(name for name in ("phase_field_solution",
+                                      "phase_field_iterate")
+                    if name in data.variables)
+        return np.asarray(data[name][-1, 0], dtype=float)
 
 
 def release_device_memory():
@@ -193,8 +203,10 @@ def _run_grid(n, start, args, comm):
     regularization = NodalPhaseFieldRegularization(
         homogenization, eta=2.0 / n, weight=args.pf_weight, dwell="lumped",
         gradient_quadrature=args.pf_quadrature.replace("-", "_"))
-    cases = energy_load_cases(3, auxetic_target(
-        3, E_solid, nu=args.target_nu, scale=args.target_scale))
+    target = auxetic_target(3, E_solid, nu=args.target_nu,
+                            scale=args.target_scale)
+    cases = (energy_load_cases(3, target) if args.objective == "energy"
+             else target_load_cases(3, target))
     problem = StressTargetProblem(
         homogenization, cases, regularization=regularization, design="nodal",
         warm_start=None if args.warm_start == "none" else args.warm_start)
@@ -231,7 +243,7 @@ def _run_grid(n, start, args, comm):
               f"preconditioner {args.preconditioner}, CG stop "
               f"{args.cg_stop} at {args.cg_tol:g}, warm starts "
               f"{args.warm_start}, optimizer {args.optimizer} (pairs on "
-              f"{args.lbfgs_pairs}), gradient term "
+              f"{args.lbfgs_pairs}), {args.objective} objective, gradient term "
               f"{args.pf_quadrature}, start {start.shape[0]}^3", flush=True)
     options = dict(maxiter=args.maxiter, gtol=0.0, xtol=1e-3, maxcor=20)
     if args.optimizer == "helmholtz":
@@ -283,6 +295,8 @@ def main():
     parser.add_argument("--lbfgs-pairs", default="device",
                         choices=("device", "host"),
                         help="where the L-BFGS on fields keeps its pairs")
+    parser.add_argument("--objective", default="energy",
+                        choices=("energy", "stress"))
     parser.add_argument("--target-nu", type=float, default=-0.5)
     parser.add_argument("--target-scale", type=float, default=0.3)
     parser.add_argument("--pf-weight", type=float, default=0.2)
