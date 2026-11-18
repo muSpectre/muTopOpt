@@ -532,6 +532,164 @@ def optimize_bounded_lbfgs(problem, rho0, comm=None, maxiter=200, gtol=2.5,
     return np.asarray(res.x), info
 
 
+def helmholtz_preconditioner(homogenization, length, c=4.0):
+    """The smoother ``M = (I − c ℓ² Δ_h)⁻¹`` on scalar fields, applied by
+    FFT; ``Δ_h`` is the ``2d + 1``-point Laplacian of the grid.
+
+    ``M`` damps a field's variations on scales below ``√c ℓ`` and leaves
+    longer ones alone. As the initial inverse Hessian of L-BFGS
+    (:func:`optimize_helmholtz_lbfgs`) it turns the raw gradient step, which
+    changes the design voxel by voxel, into one that moves interfaces as a
+    whole.
+
+    Parameters
+    ----------
+    homogenization : Homogenization
+        Its FFT engine defines the grid and the decomposition.
+    length : float
+        The length ``ℓ``, e.g. the interface width of the phase field.
+    c : float, optional
+        Factor on ``ℓ²`` (default 4).
+
+    Returns
+    -------
+    muGrid.Preconditioners.FourierPreconditioner
+        Callable ``M(v, Mv)`` on scalar fields of the homogenization's
+        collection.
+    """
+    from muGrid.Preconditioners import FourierPreconditioner
+
+    spacing = homogenization.grid_spacing
+
+    def inverse_symbol(engine):
+        # symbol of −Δ_h: Σ_d (4 / h_d²) sin²(π q_d), q the frequency in
+        # units of the grid
+        frequencies = np.asarray(homogenization.to_host(engine.fftfreq))
+        minus_laplace = sum(
+            4.0 / h**2 * np.sin(np.pi * frequencies[d]) ** 2
+            for d, h in enumerate(spacing))
+        return 1.0 / (1.0 + c * length**2 * minus_laplace)
+
+    # The optimizer's vectors are double precision whatever the precision
+    # of the solver's fields.
+    return FourierPreconditioner(
+        homogenization.engine, inverse_symbol, name="helmholtz-smoother",
+        dtype=np.float64)
+
+
+def optimize_helmholtz_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=0.0,
+                             xtol=0.0, bounds=(0.0, 1.0), maxcor=20,
+                             callback=None, length=None, helmholtz_c=4.0,
+                             precond="helmholtz", cg_tol_start=None,
+                             cg_tol_min=None, cg_forcing_c=1.0,
+                             cg_forcing_exp=1.0, cg_stall_rel=1e-2,
+                             cg_stall_shrink=0.3):
+    """Minimize ``problem`` from ``rho0`` with muGrid's box-constrained
+    L-BFGS on fields, preconditioned by a Helmholtz smoother.
+
+    The differences from :func:`optimize_bounded_lbfgs`:
+
+    * **Preconditioner.** The initial inverse Hessian of the L-BFGS
+      recursion is ``γ P M P`` with the smoother ``M`` of
+      :func:`helmholtz_preconditioner` and ``P`` the projector onto the free
+      densities, in place of ``γ I``. In the 3D studies this cut the number
+      of evaluations by a factor 2 to 3 at the same or better designs.
+    * **Where the vectors live.** The design, the gradient and the L-BFGS
+      memory are muGrid fields in the homogenization's collection: on the
+      GPU in a GPU run, distributed under MPI, allocated once. Nothing but
+      scalars is copied to the host per iteration. At 512³ per rank the
+      vector work of an iteration then takes a fraction of a second instead
+      of several seconds.
+
+    Parameters
+    ----------
+    problem, rho0, maxiter, gtol, ftol, xtol, bounds, callback
+        As for :func:`optimize_bounded_lbfgs`. The communicator is the
+        homogenization's.
+    maxcor : int, optional
+        Number of stored L-BFGS curvature pairs (default 20). Each pair is
+        two scalar fields.
+    length : float, optional
+        Length ``ℓ`` of the smoother. Default: the interface width ``eta``
+        of the problem's regularization, or the grid spacing without one.
+    helmholtz_c : float, optional
+        Factor ``c`` of the smoother (default 4).
+    precond : {"helmholtz", None}, optional
+        ``None`` runs the same optimizer without the smoother.
+    cg_tol_start, cg_tol_min, cg_forcing_c, cg_forcing_exp, cg_stall_rel,
+    cg_stall_shrink
+        The adaptive inner tolerance, as for :func:`optimize_bounded_lbfgs`.
+
+    Returns
+    -------
+    rho_opt : np.ndarray
+        Final density, same shape as ``rho0``.
+    info : dict
+        As for :func:`optimize_bounded_lbfgs`, plus ``nfev`` (number of
+        evaluations of the objective).
+    """
+    from muGrid.Optimize import l_bfgs_bounded
+
+    h = problem.h
+    history = []
+    inner_tol = _make_inner_tolerance(
+        problem, cg_tol_start, cg_tol_min, cg_forcing_c, cg_forcing_exp,
+        cg_stall_rel, cg_stall_shrink, bounds)
+
+    if precond == "helmholtz":
+        if length is None:
+            regularization = getattr(problem, "regularization", None)
+            length = (regularization.eta if regularization is not None
+                      else h.grid_spacing[0])
+        smoother = helmholtz_preconditioner(h, length, helmholtz_c)
+    elif precond is None:
+        smoother = None
+    else:
+        raise ValueError(f"unknown preconditioner {precond!r}")
+
+    # The optimizer's vectors are always double precision, whatever the
+    # precision of the solver's fields.
+    design = h.fc.real_field("to_lbfgs_design", dtype=np.float64)
+    design.p[...] = h.to_device(np.asarray(rho0, dtype=float))
+
+    def fun(point, gradient):
+        # the problem works on, and returns, arrays of the fields' module
+        f, g = problem.objective_and_gradient(
+            point.p.reshape(h.nb_pixels))
+        gradient.p[...] = g.reshape(gradient.p.shape)
+        return f
+
+    def _cb(iteration, state):
+        # A new outer iterate has been accepted: retune the inner tolerance
+        # before the next line search (see optimize_bounded_lbfgs).
+        if inner_tol is not None:
+            inner_tol.advance()
+        history.append(problem.last.get("objective"))
+        if callback is not None:
+            return callback(len(history),
+                            state["x"].p.reshape(h.nb_pixels), problem.last)
+        return False
+
+    gscale = _gradient_scale(problem)
+    result = l_bfgs_bounded(
+        h.comm, h.fc, fun, design, lower=bounds[0], upper=bounds[1],
+        precond=smoother, maxcor=maxcor, gtol=gtol * gscale, ftol=ftol,
+        xtol=xtol, maxiter=maxiter, callback=_cb)
+    info = {
+        "success": bool(result.success),
+        "message": result.message,
+        "nit": int(result.nit),
+        "nfev": int(result.nfev),
+        "objective": float(result.fun),
+        "max_grad": float(result.max_grad) / gscale,
+        "history": history,
+        "cg_rtol_history": (inner_tol.history if inner_tol is not None
+                            else None),
+    }
+    rho_opt = np.asarray(h.to_host(design.p)).reshape(np.shape(rho0))
+    return rho_opt, info
+
+
 #: Bounds and factor of the adaptive Hessian-solve tolerance (hessian_rtol)
 HESSIAN_RTOL_MAX = 1e-2
 HESSIAN_RTOL_MIN = 1e-4
