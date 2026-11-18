@@ -45,8 +45,14 @@ which ``--start`` of a later run reads (a chain over several jobs)::
         --start CH3D_start_bi_s11.nc --maxiter 200
 
 ``--start`` takes such a muTopOpt file or a muFFTTO file (variable
-``phase_field_solution``, e.g. the Cahn-Hilliard starts of the study), on
-any grid.
+``phase_field_solution``, e.g. the Cahn-Hilliard starts of the study or of
+``cahn_hilliard_start.py``), on any grid.
+
+Snapshots. ``--save-every k`` also writes the design of every k-th
+iteration, and the start, to ``<output>_N<n>_it<iteration>.nc`` (same
+format as the final design, so any snapshot is a ``--start``). Every saved
+design, the final one included, gets a PNG of its three mid slices next to
+it, to see the geometry evolve.
 
 One line is printed per evaluation, with the objective and the CG
 iterations of the forward and adjoint solves, and a summary per grid. With
@@ -248,7 +254,27 @@ def _run_grid(n, start, args, comm):
               f"{args.warm_start}, optimizer {args.optimizer} (pairs on "
               f"{args.lbfgs_pairs}), {args.objective} objective, gradient term "
               f"{args.pf_quadrature}, start {start.shape[0]}^3", flush=True)
-    options = dict(maxiter=args.maxiter, gtol=0.0, xtol=1e-3, maxcor=20)
+    # snapshots: the start now, then every save_every-th accepted iterate
+
+    def save(filename, rho, iteration, objective):
+        attributes = {"iteration": [iteration]}
+        title = f"{n}³, iteration {iteration}"
+        if objective is not None:
+            attributes["objective"] = [float(objective)]
+            title += f", f = {float(objective):.6e}"
+        write_density(filename, homogenization, rho, attributes)
+        plot_mid_slices(filename, comm, title)
+
+    def save_snapshot(iteration, rho, last):
+        if iteration % args.save_every == 0:
+            save(snapshot_name(args.output, n, iteration), rho, iteration,
+                 last.get("objective"))
+        return False  # never stop the optimiser
+
+    if args.save_every > 0:
+        save(snapshot_name(args.output, n, 0), rho0, 0, None)
+    options = dict(maxiter=args.maxiter, gtol=0.0, xtol=1e-3, maxcor=20,
+                   callback=save_snapshot if args.save_every > 0 else None)
     if args.optimizer == "helmholtz":
         rho, info = optimize_helmholtz_lbfgs(problem, rho0,
                                              pair_store=args.lbfgs_pairs,
@@ -263,6 +289,10 @@ def _run_grid(n, start, args, comm):
             "nb_iterations": [int(info["nit"])],
             "optimizer_message": str(info["message"]),
             "command_line": shlex.join(sys.argv)})
+        if args.save_every > 0:
+            plot_mid_slices(output_name(args.output, n), comm,
+                            f"{n}³, final after {info['nit']} iterations, "
+                            f"f = {info['objective']:.6e}")
 
     summary = (f"{n}^3: {info['message']} after {info['nit']} iterations, "
                f"objective {info['objective']:.12e}, wall "
@@ -274,6 +304,40 @@ def _run_grid(n, start, args, comm):
 
 def output_name(prefix, n):
     return f"{prefix}_N{n}.nc"
+
+
+def snapshot_name(prefix, n, iteration):
+    return f"{prefix}_N{n}_it{iteration:04d}.nc"
+
+
+def plot_mid_slices(filename, comm, title):
+    """PNG (``filename`` with ``.png``) of the mid slices ``x, y, z = 1/2``
+    of the design in the NetCDF file ``filename``; rank 0 reads the file
+    back, so it works for any decomposition. Skipped without matplotlib."""
+    if comm.rank != 0:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    rho = read_final_density(filename)[0]
+    n = rho.shape[0]
+    slices = ((rho[n // 2, :, :], "x = 1/2"), (rho[:, n // 2, :], "y = 1/2"),
+              (rho[:, :, n // 2], "z = 1/2"))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5.6))
+    for ax, (image, label) in zip(axes, slices):
+        ax.imshow(image.T, origin="lower", cmap="gray_r", vmin=0, vmax=1,
+                  interpolation="nearest")
+        ax.set_title(label)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(filename.rsplit(".", 1)[0] + ".png", dpi=max(n // 8, 100))
+    plt.close(fig)
 
 
 def main():
@@ -311,7 +375,13 @@ def main():
     parser.add_argument("--pf-quadrature", default="full",
                         choices=("full", "one-point"),
                         help="quadrature of the phase-field gradient term")
+    parser.add_argument("--save-every", type=int, default=0, metavar="K",
+                        help="also write the start and every K-th iterate "
+                             "(<output>_N<n>_it<iteration>.nc, with a PNG of "
+                             "the mid slices); 0: only the final design")
     args = parser.parse_args()
+    if args.save_every > 0 and args.output is None:
+        parser.error("--save-every needs --output (the file name prefix)")
     if len(args.nb_grid_pts) > 1 and args.output is None:
         parser.error("several grids need --output: each grid hands its "
                      "design to the next through its output file")

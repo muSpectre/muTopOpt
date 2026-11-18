@@ -38,7 +38,7 @@ v1.6.0 (not yet released)
 - PERF: About 100 bytes per voxel less device memory in an evaluation; with warm starts
   and pairs in host memory a 3D run needs about 900 bytes per voxel on the GPU
 - ENH: Benchmark of the 3D auxetic problem of the large-grid studies, with an option for
-  every piece, grid continuation and a device-memory report
+  every piece, grid continuation, a device-memory report, random Cahn–Hilliard starts and snapshots
 
 v1.5.0 (05Nov26)
 ----------------
