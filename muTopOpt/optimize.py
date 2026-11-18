@@ -583,7 +583,7 @@ def optimize_helmholtz_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=0.0,
                              precond="helmholtz", cg_tol_start=None,
                              cg_tol_min=None, cg_forcing_c=1.0,
                              cg_forcing_exp=1.0, cg_stall_rel=1e-2,
-                             cg_stall_shrink=0.3):
+                             cg_stall_shrink=0.3, pair_store="device"):
     """Minimize ``problem`` from ``rho0`` with muGrid's box-constrained
     L-BFGS on fields, preconditioned by a Helmholtz smoother.
 
@@ -619,6 +619,13 @@ def optimize_helmholtz_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=0.0,
     cg_tol_start, cg_tol_min, cg_forcing_c, cg_forcing_exp, cg_stall_rel,
     cg_stall_shrink
         The adaptive inner tolerance, as for :func:`optimize_bounded_lbfgs`.
+    pair_store : {"device", "host"}, optional
+        Where the L-BFGS keeps its ``maxcor`` curvature pairs (two scalar
+        fields each). "device" (default): next to the design. "host": in
+        page-locked host memory, for a GPU run whose device cannot hold
+        them (``2 · maxcor · 8`` bytes per node, 320 at ``maxcor = 20``);
+        the iterates are the same, at about ``4 · maxcor`` field copies
+        between host and device per iteration.
 
     Returns
     -------
@@ -671,10 +678,12 @@ def optimize_helmholtz_lbfgs(problem, rho0, maxiter=200, gtol=2.5, ftol=0.0,
         return False
 
     gscale = _gradient_scale(problem)
+    # pair_store only when asked for: a muGrid without it runs the default
+    store = {} if pair_store == "device" else {"pair_store": pair_store}
     result = l_bfgs_bounded(
         h.comm, h.fc, fun, design, lower=bounds[0], upper=bounds[1],
         precond=smoother, maxcor=maxcor, gtol=gtol * gscale, ftol=ftol,
-        xtol=xtol, maxiter=maxiter, callback=_cb)
+        xtol=xtol, maxiter=maxiter, callback=_cb, **store)
     info = {
         "success": bool(result.success),
         "message": result.message,

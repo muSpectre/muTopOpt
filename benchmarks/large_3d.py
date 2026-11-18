@@ -28,6 +28,8 @@ buys:
 * ``--warm-start device | device32 | host | host32 | none``
 * ``--optimizer helmholtz | numpi`` (L-BFGS on fields with the Helmholtz
   smoother, or NuMPI's L-BFGS on host arrays)
+* ``--lbfgs-pairs device | host`` (where the L-BFGS on fields keeps its
+  curvature pairs)
 
 Grid continuation. Several grids run one after the other, each starting
 from the final design of the previous one, interpolated trilinearly
@@ -228,11 +230,14 @@ def _run_grid(n, start, args, comm):
         print(f"3D TO {n}^3 on {comm.size} rank(s), device {args.device}, "
               f"preconditioner {args.preconditioner}, CG stop "
               f"{args.cg_stop} at {args.cg_tol:g}, warm starts "
-              f"{args.warm_start}, optimizer {args.optimizer}, gradient term "
+              f"{args.warm_start}, optimizer {args.optimizer} (pairs on "
+              f"{args.lbfgs_pairs}), gradient term "
               f"{args.pf_quadrature}, start {start.shape[0]}^3", flush=True)
     options = dict(maxiter=args.maxiter, gtol=0.0, xtol=1e-3, maxcor=20)
     if args.optimizer == "helmholtz":
-        rho, info = optimize_helmholtz_lbfgs(problem, rho0, **options)
+        rho, info = optimize_helmholtz_lbfgs(problem, rho0,
+                                             pair_store=args.lbfgs_pairs,
+                                             **options)
     else:
         rho, info = optimize_bounded_lbfgs(problem, rho0, comm=comm,
                                            **options)
@@ -275,6 +280,9 @@ def main():
     parser.add_argument("--cg-tol", type=float, default=1e-6)
     parser.add_argument("--warm-start", default="device")
     parser.add_argument("--optimizer", default="helmholtz")
+    parser.add_argument("--lbfgs-pairs", default="device",
+                        choices=("device", "host"),
+                        help="where the L-BFGS on fields keeps its pairs")
     parser.add_argument("--target-nu", type=float, default=-0.5)
     parser.add_argument("--target-scale", type=float, default=0.3)
     parser.add_argument("--pf-weight", type=float, default=0.2)

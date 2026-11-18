@@ -139,3 +139,29 @@ def test_gpu_matches_cpu():
     _, gpu = optimize_helmholtz_lbfgs(make_problem(device="gpu"), rho0,
                                       maxiter=6)
     np.testing.assert_allclose(gpu["history"], cpu["history"], rtol=1e-6)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("maxcor", [2, 20])
+def test_host_pairs_give_the_same_run(maxcor):
+    """The L-BFGS pairs in host memory: the same objectives and design bit
+    for bit as with the pairs on the device (maxcor 2 drops pairs every
+    step). Needs a muGrid whose L-BFGS has pair_store."""
+    pytest.importorskip("cupy")
+    if not muGrid.has_gpu:
+        pytest.skip("muGrid without GPU support")
+    import inspect
+
+    from muGrid.Optimize import l_bfgs_bounded
+
+    if "pair_store" not in inspect.signature(l_bfgs_bounded).parameters:
+        pytest.skip("muGrid's L-BFGS has no pair_store")
+    rho0 = initial_density((16, 16), kind="uniform", volume_fraction=0.5)
+    runs = [optimize_helmholtz_lbfgs(make_problem(device="gpu"), rho0,
+                                     maxiter=8, maxcor=maxcor,
+                                     pair_store=store)
+            for store in ("device", "host")]
+    (rho_device, device), (rho_host, host) = runs
+    assert host["history"] == device["history"]
+    assert host["nfev"] == device["nfev"]
+    np.testing.assert_array_equal(rho_host, rho_device)
