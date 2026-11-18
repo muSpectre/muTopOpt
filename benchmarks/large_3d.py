@@ -29,10 +29,27 @@ buys:
 * ``--optimizer helmholtz | numpi`` (L-BFGS on fields with the Helmholtz
   smoother, or NuMPI's L-BFGS on host arrays)
 
+Grid continuation. Several grids run one after the other, each starting
+from the final design of the previous one, interpolated trilinearly
+(:func:`muTopOpt.restart.linear_resample`); the interface width stays two
+voxels on every grid. Each grid writes its final design to
+``<output>_N<n>.nc``, which is also how the next grid receives it, and
+which ``--start`` of a later run reads (a chain over several jobs)::
+
+    python benchmarks/large_3d.py --nb-grid-pts 32 64 128 --output chain \\
+        --start CH3D_start_bi_s11.nc --maxiter 200
+
+``--start`` takes such a muTopOpt file or a muFFTTO file (variable
+``phase_field_solution``, e.g. the Cahn-Hilliard starts of the study), on
+any grid.
+
 One line is printed per evaluation, with the objective and the CG
-iterations of the forward and adjoint solves, and a summary at the end.
+iterations of the forward and adjoint solves, and a summary per grid.
 """
 import argparse
+import gc
+import shlex
+import sys
 import time
 
 import numpy as np
@@ -47,63 +64,49 @@ from muTopOpt import (
 )
 from muTopOpt.loadcases import auxetic_target, energy_load_cases
 from muTopOpt.optimize import optimize_bounded_lbfgs, optimize_helmholtz_lbfgs
+from muTopOpt.restart import linear_resample, read_final_density, write_density
 
 
-def periodic_interpolation(values, homogenization):
-    """Trilinear interpolation of a periodic nodal field given on a cubic
-    grid onto this process's nodes, axis by axis."""
-    coarse = values.shape[0]
-    locations = homogenization.engine.subdomain_locations
-    for axis, (location, size, n) in enumerate(zip(
-            locations, homogenization.nb_pixels,
-            homogenization.nb_grid_pts)):
-        position = (int(location) + np.arange(int(size))) * (coarse / n)
-        base = np.floor(position).astype(int)
-        fraction = (position - base).reshape(
-            [-1 if a == axis else 1 for a in range(3)])
-        values = (np.take(values, base % coarse, axis=axis) * (1 - fraction)
-                  + np.take(values, (base + 1) % coarse, axis=axis) * fraction)
-    return np.clip(values, 0.0, 1.0)
-
-
-def start_design(path, homogenization):
-    """The start: a saved nodal design (NetCDF, variable
-    ``phase_field_solution``), or without a file a smooth random field."""
+def read_start(path):
+    """The start design on its own grid, as a global array: from a muTopOpt
+    file (:func:`muTopOpt.restart.write_density` or ``simulate.py``, which
+    carry the attribute ``nb_grid_pts``), from a muFFTTO file (variable
+    ``phase_field_solution``), or without a file a smooth random field
+    (8³ values, interpolated later)."""
     if path is None:
-        rng = np.random.default_rng(11)
-        coarse = rng.uniform(0.0, 1.0, (8, 8, 8))
-    else:
-        import netCDF4
+        return np.random.default_rng(11).uniform(0.0, 1.0, (8, 8, 8))
+    fio = muGrid.FileIONetCDF(path, muGrid.FileIONetCDF.OpenMode.Read,
+                              muGrid.Communicator())
+    try:
+        written_by_mutopopt = "nb_grid_pts" in fio.read_global_attribute_names()
+    finally:
+        fio.close()
+    if written_by_mutopopt:
+        return read_final_density(path)[0]
+    import netCDF4
 
-        with netCDF4.Dataset(path) as data:
-            coarse = np.asarray(data["phase_field_solution"][-1, 0])
-    return periodic_interpolation(coarse, homogenization)
+    with netCDF4.Dataset(path) as data:
+        return np.asarray(data["phase_field_solution"][-1, 0], dtype=float)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--nb-grid-pts", type=int, default=32)
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--maxiter", type=int, default=30)
-    parser.add_argument("--start", default=None,
-                        help="NetCDF file of a nodal start design")
-    parser.add_argument("--preconditioner", default="multigrid")
-    parser.add_argument("--multigrid-precision", default="single")
-    parser.add_argument("--cg-stop", default="energy")
-    parser.add_argument("--cg-tol", type=float, default=1e-6)
-    parser.add_argument("--warm-start", default="device")
-    parser.add_argument("--optimizer", default="helmholtz")
-    parser.add_argument("--target-nu", type=float, default=-0.5)
-    parser.add_argument("--target-scale", type=float, default=0.3)
-    parser.add_argument("--pf-weight", type=float, default=0.2)
-    parser.add_argument("--pf-quadrature", default="full",
-                        choices=("full", "one-point"),
-                        help="quadrature of the phase-field gradient term")
-    args = parser.parse_args()
+def release_device_memory():
+    """Return the memory of a finished grid to the device: the fields go
+    with their collection once nothing refers to it any more, and cupy keeps
+    freed blocks in its pools until asked."""
+    gc.collect()
+    try:
+        import cupy
+    except ImportError:
+        return
+    cupy.get_default_memory_pool().free_all_blocks()
+    cupy.get_default_pinned_memory_pool().free_all_blocks()
 
-    comm = muGrid.Communicator.world()
+
+def run_grid(n, start, args, comm):
+    """Optimise on the ``n³`` grid from the design ``start`` (global array on
+    any grid). Returns the summary line of this grid; with ``--output`` the
+    final design is written to ``<output>_N<n>.nc``."""
     rank0 = comm.rank == 0
-    n = args.nb_grid_pts
     started = time.time()
 
     # Solid with bulk modulus 1 and shear modulus 0.5
@@ -129,9 +132,9 @@ def main():
     totals = {"evaluations": 0, "forward": 0, "adjoint": 0, "seconds": 0.0}
 
     def timed_evaluate(rho):
-        start = time.time()
+        start_evaluation = time.time()
         f, g = evaluate(rho)
-        seconds = time.time() - start
+        seconds = time.time() - start_evaluation
         iterations = problem.last["cg_iters"]
         totals["evaluations"] += 1
         totals["forward"] += sum(iterations[0::2])
@@ -146,13 +149,17 @@ def main():
 
     problem.objective_and_gradient = timed_evaluate
 
-    rho0 = start_design(args.start, homogenization)
+    # the start on this rank's nodes; clipped, since a start from another
+    # code (e.g. a Cahn-Hilliard field) may leave [0, 1] slightly
+    rho0 = np.clip(linear_resample(
+        start, (n, n, n), homogenization.engine.subdomain_locations,
+        homogenization.nb_pixels), 0.0, 1.0)
     if rank0:
         print(f"3D TO {n}^3 on {comm.size} rank(s), device {args.device}, "
               f"preconditioner {args.preconditioner}, CG stop "
               f"{args.cg_stop} at {args.cg_tol:g}, warm starts "
               f"{args.warm_start}, optimizer {args.optimizer}, gradient term "
-              f"{args.pf_quadrature}", flush=True)
+              f"{args.pf_quadrature}, start {start.shape[0]}^3", flush=True)
     options = dict(maxiter=args.maxiter, gtol=0.0, xtol=1e-3, maxcor=20)
     if args.optimizer == "helmholtz":
         rho, info = optimize_helmholtz_lbfgs(problem, rho0, **options)
@@ -160,12 +167,73 @@ def main():
         rho, info = optimize_bounded_lbfgs(problem, rho0, comm=comm,
                                            **options)
 
+    if args.output is not None:
+        write_density(output_name(args.output, n), homogenization, rho, {
+            "objective": [float(info["objective"])],
+            "nb_iterations": [int(info["nit"])],
+            "optimizer_message": str(info["message"]),
+            "command_line": shlex.join(sys.argv)})
+
+    summary = (f"{n}^3: {info['message']} after {info['nit']} iterations, "
+               f"objective {info['objective']:.12e}, wall "
+               f"{time.time() - started:.1f} s, evaluations "
+               f"{totals['evaluations']} in {totals['seconds']:.1f} s, CG "
+               f"forward {totals['forward']}, adjoint {totals['adjoint']}")
     if rank0:
-        print(f"{info['message']} after {info['nit']} iterations, objective "
-              f"{info['objective']:.12e}")
-        print(f"TOTAL wall {time.time() - started:.1f} s, evaluations "
-              f"{totals['evaluations']} in {totals['seconds']:.1f} s, CG "
-              f"forward {totals['forward']}, adjoint {totals['adjoint']}")
+        print(summary, flush=True)
+    return summary
+
+
+def output_name(prefix, n):
+    return f"{prefix}_N{n}.nc"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--nb-grid-pts", type=int, nargs="+", default=[32],
+                        help="grid, or several grids run coarse to fine")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--maxiter", type=int, default=30,
+                        help="L-BFGS iterations per grid")
+    parser.add_argument("--start", default=None,
+                        help="NetCDF file of a nodal start design (muTopOpt "
+                             "or muFFTTO), on any grid")
+    parser.add_argument("--output", default=None,
+                        help="prefix of the final designs <output>_N<n>.nc; "
+                             "needed for several grids")
+    parser.add_argument("--preconditioner", default="multigrid")
+    parser.add_argument("--multigrid-precision", default="single")
+    parser.add_argument("--cg-stop", default="energy")
+    parser.add_argument("--cg-tol", type=float, default=1e-6)
+    parser.add_argument("--warm-start", default="device")
+    parser.add_argument("--optimizer", default="helmholtz")
+    parser.add_argument("--target-nu", type=float, default=-0.5)
+    parser.add_argument("--target-scale", type=float, default=0.3)
+    parser.add_argument("--pf-weight", type=float, default=0.2)
+    parser.add_argument("--pf-quadrature", default="full",
+                        choices=("full", "one-point"),
+                        help="quadrature of the phase-field gradient term")
+    args = parser.parse_args()
+    if len(args.nb_grid_pts) > 1 and args.output is None:
+        parser.error("several grids need --output: each grid hands its "
+                     "design to the next through its output file")
+
+    comm = muGrid.Communicator.world()
+    started = time.time()
+    start = read_start(args.start)
+    summaries = []
+    for stage, n in enumerate(args.nb_grid_pts):
+        if stage > 0:
+            # the previous grid's final design, as the next job would read it
+            start = read_final_density(
+                output_name(args.output, args.nb_grid_pts[stage - 1]))[0]
+        summaries.append(run_grid(n, start, args, comm))
+        release_device_memory()
+
+    if comm.rank == 0:
+        if len(summaries) > 1:
+            print("CHAIN\n  " + "\n  ".join(summaries))
+        print(f"TOTAL wall {time.time() - started:.1f} s")
 
 
 if __name__ == "__main__":
