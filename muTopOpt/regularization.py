@@ -437,20 +437,39 @@ class NodalPhaseFieldRegularization:
             # interpolant, with its exact nodal gradient.
             dwell, dwell_grad = self._dwell.value_and_gradient(rho)
         else:
-            # Lumped nodal quadrature (pointwise).
-            dwell = h.comm.sum(
-                float((rho**2 * (1.0 - rho) ** 2).sum())
-            ) * self.vol_pixel
-            dwell_grad = (
-                2.0 * rho * (1.0 - rho) * (1.0 - 2.0 * rho) * self.vol_pixel
-            )
+            # Lumped nodal quadrature (pointwise),
+            #   W = ρ² (1 − ρ)²,  W' = 2ρ (1 − ρ)(1 − 2ρ),
+            # evaluated in place with two scratch arrays (the operations and
+            # their order are those of the plain expressions).
+            xp = h.xp
+            w = rho ** 2
+            factor = 1.0 - rho
+            factor **= 2
+            w *= factor
+            dwell = h.comm.sum(float(w.sum())) * self.vol_pixel
+            dwell_grad = w                       # reused: W is summed
+            xp.multiply(rho, 2.0, out=dwell_grad)
+            xp.subtract(1.0, rho, out=factor)
+            dwell_grad *= factor
+            xp.multiply(rho, 2.0, out=factor)
+            xp.subtract(1.0, factor, out=factor)
+            dwell_grad *= factor
+            dwell_grad *= self.vol_pixel
+            del factor
 
         # Raw Modica-Mortola bracket eta * ∫|∇rho|^2 + (1/eta) * ∫ W; the
         # normalization weight / (c_W V^((D-1)/D)) is applied by `scale`.
         f = self.eta * grad_pen + dwell / self.eta
-        g = self.eta * 2.0 * Lrho + dwell_grad / self.eta
+        g = self.eta * 2.0 * Lrho
+        if self._dwell is None:
+            dwell_grad /= self.eta               # our own array: in place
+            g += dwell_grad
+        else:
+            g += dwell_grad / self.eta
+        del dwell_grad
         scale = self.scale
-        return scale * f, _like(h, scale * g, given)
+        g *= scale
+        return scale * f, _like(h, g, given)
 
     def hessian_vector_product(self, rho, v):
         """Return ``H_reg v`` for a nodal density direction ``v``.

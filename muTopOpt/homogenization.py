@@ -95,6 +95,12 @@ class _CGStagnation(Exception):
     best iterate returned instead of burning the full iteration budget."""
 
 
+def _largest_magnitude(a):
+    """``max |a|`` of a host or device array as a float, from its maximum and
+    minimum: unlike ``abs(a).max()`` it needs no full-size temporary."""
+    return max(float(a.max()), -float(a.min()))
+
+
 def _local_rank(comm):
     """Node-local rank of this process, used to pick a per-rank GPU.
 
@@ -469,7 +475,9 @@ class Homogenization:
         self.lam = self.fc.real_field("to_lambda", dtype=self.dtype)
         self.mu = self.fc.real_field("to_mu", dtype=self.dtype)
         self._rhs = self.fc.real_field("to_rhs", (self.dim,), dtype=self.dtype)
-        self._Ku = self.fc.real_field("to_Ku", (self.dim,), dtype=self.dtype)
+        # K u and the best CG iterate: scratch of the residual-stopped CG
+        # only, created on first use (see _Ku and _x_best)
+        self._scratch = {}
 
         # Array module of the (possibly device-resident) fields: cupy on a GPU
         # device, numpy on host. `on_device` gates the host<->device copies at
@@ -534,8 +542,6 @@ class Homogenization:
         self.cg_divergence_factor = 1e3
         # Number of solves cut short by the safeguard (diagnostic).
         self.cg_stagnation_count = 0
-        self._x_best = self.fc.real_field(
-            "to_cg_best", (self.dim,), dtype=self.dtype)
         # When True, print a live per-CG-iteration residual on rank 0 during
         # every solve, so convergence can be watched as it happens (opt-in;
         # verbose over a full optimization). See ``solve_rhs``.
@@ -567,6 +573,28 @@ class Homogenization:
         ``.p``/``.s`` view."""
         return self._xp.asarray(a, dtype=self.dtype)
 
+    def _scratch_vector(self, name):
+        """The vector field ``name`` of the collection, created on the first
+        call and kept. The residual-stopped CG needs two of them (``_Ku``,
+        ``_x_best``); the energy-stopped one needs neither, so a run with
+        ``cg_stop="energy"`` never allocates them (48 bytes per voxel in 3D,
+        double precision)."""
+        field = self._scratch.get(name)
+        if field is None:
+            field = self._scratch[name] = self.fc.real_field(
+                name, (self.dim,), dtype=self.dtype)
+        return field
+
+    @property
+    def _Ku(self):
+        """Scratch for ``K u`` (warm-start guard, true residuals)."""
+        return self._scratch_vector("to_Ku")
+
+    @property
+    def _x_best(self):
+        """The best iterate of a residual-stopped CG solve, its fallback."""
+        return self._scratch_vector("to_cg_best")
+
     def scalar_field(self, name):
         return self.fc.real_field(name, dtype=self.dtype)
 
@@ -583,14 +611,24 @@ class Homogenization:
         Raises ``ValueError`` on the first call if the ``preconditioner``
         given to the constructor is unknown."""
         with timer("set_density"):
-            lam, mu = self.material.lame(self._xp.asarray(rho))
-            self.lam.p[...] = self.to_device(lam)
-            self.mu.p[...] = self.to_device(mu)
+            rho = self._xp.asarray(rho)
+            if np.dtype(self.dtype) == np.float64:
+                # straight into the fields: no temporary besides ρ^p
+                self.material.lame(rho, out=(self.lam.p, self.mu.p))
+            else:
+                # Single-precision fields: interpolate in double and round
+                # once, so that λ and μ are the nearest float32 values.
+                lam, mu = self.material.lame(rho)
+                self.lam.p[...] = self.to_device(lam)
+                self.mu.p[...] = self.to_device(mu)
+                del lam, mu
             self.engine.communicate_ghosts(self.lam)
             self.engine.communicate_ghosts(self.mu)
             # Stiffness scale (max |λ|, |2μ|), reduced across ranks, used to
-            # detect a negligible (round-off-only) right-hand side.
-            local = max(float(abs(lam).max()), float(2.0 * abs(mu).max()))
+            # detect a negligible (round-off-only) right-hand side. The
+            # largest magnitude from max and min: no |·| temporary.
+            local = max(_largest_magnitude(self.lam.p),
+                        2.0 * _largest_magnitude(self.mu.p))
             self._mat_scale = self.comm.max(local)
             with timer("preconditioner"):
                 self._update_preconditioner()

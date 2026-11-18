@@ -44,12 +44,17 @@ which ``--start`` of a later run reads (a chain over several jobs)::
 any grid.
 
 One line is printed per evaluation, with the objective and the CG
-iterations of the forward and adjoint solves, and a summary per grid.
+iterations of the forward and adjoint solves, and a summary per grid. With
+``--memory`` the summary also gives the peak device memory of the process
+(largest over the ranks) and its bytes per voxel of the rank's subdomain.
 """
 import argparse
 import gc
+import os
 import shlex
+import subprocess
 import sys
+import threading
 import time
 
 import numpy as np
@@ -102,10 +107,75 @@ def release_device_memory():
     cupy.get_default_pinned_memory_pool().free_all_blocks()
 
 
+class DeviceMemoryPeak:
+    """Peak device memory of this process, sampled with ``nvidia-smi`` every
+    ``interval`` seconds in a background thread while the context is open.
+
+    ``nvidia-smi`` reports what the driver gave the process: muGrid's
+    fields, cupy's memory pools and the CUDA context (about 100–200 MiB);
+    other processes on the same GPU do not count. A peak shorter than the
+    interval can be missed. Without ``nvidia-smi`` the peak stays 0."""
+
+    def __init__(self, interval=0.2):
+        self.interval = interval
+        self.peak_mib = 0
+        self._running = False
+        self._thread = None
+
+    def sample(self):
+        """This process's device memory now, in MiB (0 if unknown)."""
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-compute-apps=pid,used_memory",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return 0
+        for line in out.splitlines():
+            pid, mib = (int(value) for value in line.split(","))
+            if pid == os.getpid():
+                return mib
+        return 0
+
+    def _run(self):
+        while self._running:
+            self.peak_mib = max(self.peak_mib, self.sample())
+            time.sleep(self.interval)
+
+    def __enter__(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._running = False
+        self._thread.join()
+        self.peak_mib = max(self.peak_mib, self.sample())
+
+
 def run_grid(n, start, args, comm):
     """Optimise on the ``n³`` grid from the design ``start`` (global array on
     any grid). Returns the summary line of this grid; with ``--output`` the
     final design is written to ``<output>_N<n>.nc``."""
+    if args.memory:
+        with DeviceMemoryPeak() as memory:
+            summary, voxels = _run_grid(n, start, args, comm)
+        # bytes per voxel of each rank's own subdomain; the largest rank
+        per_voxel = comm.max(memory.peak_mib * 2**20 / voxels)
+        summary += (f", peak device memory {comm.max(memory.peak_mib)} MiB "
+                    f"per rank, {per_voxel:.0f} B/voxel (incl. the CUDA "
+                    f"context)")
+    else:
+        summary, _ = _run_grid(n, start, args, comm)
+    if comm.rank == 0:
+        print(summary, flush=True)
+    return summary
+
+
+def _run_grid(n, start, args, comm):
+    """The work of :func:`run_grid`; returns the summary line and the
+    number of voxels of this rank."""
     rank0 = comm.rank == 0
     started = time.time()
 
@@ -179,9 +249,7 @@ def run_grid(n, start, args, comm):
                f"{time.time() - started:.1f} s, evaluations "
                f"{totals['evaluations']} in {totals['seconds']:.1f} s, CG "
                f"forward {totals['forward']}, adjoint {totals['adjoint']}")
-    if rank0:
-        print(summary, flush=True)
-    return summary
+    return summary, int(np.prod(homogenization.nb_pixels))
 
 
 def output_name(prefix, n):
@@ -210,6 +278,9 @@ def main():
     parser.add_argument("--target-nu", type=float, default=-0.5)
     parser.add_argument("--target-scale", type=float, default=0.3)
     parser.add_argument("--pf-weight", type=float, default=0.2)
+    parser.add_argument("--memory", action="store_true",
+                        help="report the peak device memory per grid "
+                             "(nvidia-smi)")
     parser.add_argument("--pf-quadrature", default="full",
                         choices=("full", "one-point"),
                         help="quadrature of the phase-field gradient term")

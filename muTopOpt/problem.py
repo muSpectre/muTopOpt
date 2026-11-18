@@ -343,7 +343,10 @@ class StressTargetProblem:
             rho_e = rho
         h.set_density(rho_e)
 
-        dlam, dmu = h.material.dlame(rho_e)  # SIMP derivatives, per element
+        # SIMP derivatives per element, the shear one times two as the
+        # sensitivity uses it: 2 dμ/dρ (scaled in place, no temporary)
+        dlam, two_dmu = h.material.dlame(rho_e)
+        two_dmu *= 2.0
 
         # Adaptive inner tolerance: the current (frozen-per-outer-iterate)
         # forcing-term value, or None to use the fixed Homogenization.cg_tol.
@@ -417,7 +420,7 @@ class StressTargetProblem:
                 )
                 g_shear = self._g_shear.p
                 g_vol = self._g_vol.p
-                grad += 2.0 * dmu * g_shear
+                grad += two_dmu * g_shear
                 grad += dlam * g_vol
 
             if self.hessian:
@@ -434,10 +437,14 @@ class StressTargetProblem:
                                  else hv_cache["rho"])
             self._cache = hv_cache
 
+        # The element arrays are not needed any more; dropping them now lets
+        # the nodal scatter and the regularization reuse their memory.
+        del dlam, two_dmu
         if self.design == "nodal":
             # Chain rule through the element average: the per-element
             # sensitivity is distributed onto the element's corner nodes with
             # the averaging weights (exact transpose of gather_mean).
+            del rho_e
             grad = self._nodal_map.scatter_mean(grad, on_device=True)
 
         if self.regularization is not None:
