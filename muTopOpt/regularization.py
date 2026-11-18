@@ -49,7 +49,10 @@ Discretizations of the gradient term:
   constant ``3^d`` stencil (computed once from the element geometry by
   :func:`fe_laplacian_stencil`) applied matrix-free by
   :class:`muGrid.GenericLinearOperator`, so no ``d × nb_quad`` gradient field
-  is resident and anisotropic spacing is handled.
+  is resident and anisotropic spacing is handled. In 3D with trilinear
+  hexahedra, ``gradient_quadrature="one_point"`` evaluates the gradient at
+  the voxel centres only (the Laplacian of ``FEMElement.q1_reduced``), as the
+  large-grid studies of muFFTTO do.
 
 The double-well term is a lumped (pointwise) quadrature for the element-wise
 density; for the nodal density it is either the exact integral of the
@@ -289,6 +292,35 @@ def fe_laplacian_stencil(dim, grid_spacing, element):
     return [-1] * dim, np.ascontiguousarray(stencil)
 
 
+#: Quadratures of the gradient term of :class:`NodalPhaseFieldRegularization`
+GRADIENT_QUADRATURES = ("full", "one_point")
+
+
+def _gradient_term_element(homogenization, quadrature):
+    """The element whose FE-Laplacian gives the gradient term ``∫ |∇ρ_h|²``
+    of the nodal regularization with the given ``quadrature`` (one of
+    :data:`GRADIENT_QUADRATURES`)."""
+    if quadrature == "full":
+        # the mechanics element: exact for P1 and for Q1 (2^d Gauss points)
+        return homogenization.element
+    if quadrature == "one_point":
+        # Only the trilinear hexahedron has a one-point variant in muGrid.
+        one_point = getattr(muGrid.FEMElement, "q1_reduced", None)
+        if one_point is None:
+            raise ValueError(
+                "gradient_quadrature='one_point' needs a muGrid with "
+                "FEMElement.q1_reduced")
+        if (homogenization.dim != 3
+                or homogenization.element != muGrid.FEMElement.q1):
+            raise ValueError(
+                "gradient_quadrature='one_point' is implemented for 3D "
+                "trilinear hexahedra (element 'q1') only")
+        return one_point
+    raise ValueError(
+        f"unknown gradient quadrature {quadrature!r}; choose from "
+        f"{GRADIENT_QUADRATURES}")
+
+
 class NodalPhaseFieldRegularization:
     r"""Nodal-FE phase-field regularization.
 
@@ -312,6 +344,17 @@ class NodalPhaseFieldRegularization:
     :class:`muTopOpt.nodal.ConsistentDoubleWell`); ``dwell='lumped'`` selects
     the pointwise (lumped nodal) quadrature ``h^d Σ_n W(ρ_n)`` instead.
 
+    The gradient term can instead use one quadrature point per voxel
+    (``gradient_quadrature="one_point"``, 3D trilinear hexahedra only):
+    ``∫ |∇ρ_h|² ≈ h³ Σ_e |∇ρ_h(x_e)|²`` with ``x_e`` the voxel centre, the
+    Laplacian of ``muGrid.FEMElement.q1_reduced``. This is what the muFFTTO
+    large-grid studies evaluate (``to3d_large.py`` with ``OPERATOR=fused``
+    builds its design operators on the element ``trilinear_hexahedron_1Q``),
+    so it reproduces their objective. The one-point rule does not see the
+    hourglass modes of the density (for example ``(−1)^(i+j+k)`` on the
+    nodes has zero gradient at every voxel centre), so these are penalized
+    by the double well only; ``"full"`` is the default for that reason.
+
     Parameters
     ----------
     homogenization : Homogenization
@@ -323,15 +366,20 @@ class NodalPhaseFieldRegularization:
         Penalty ``w`` per unit relative interfacial area (default 1).
     dwell : {"consistent", "lumped"}, optional
         Quadrature of the double-well term (default ``"consistent"``).
+    gradient_quadrature : {"full", "one_point"}, optional
+        Quadrature of the gradient term (default ``"full"``: that of the
+        mechanics element, exact for the interpolant).
 
     Raises
     ------
     ValueError
-        If ``dwell`` is neither ``"consistent"`` nor ``"lumped"``.
+        If ``dwell`` is neither ``"consistent"`` nor ``"lumped"``, or
+        ``gradient_quadrature`` is unknown or ``"one_point"`` with an
+        element other than 3D ``q1``.
     """
 
     def __init__(self, homogenization, eta=None, weight=1.0,
-                 dwell="consistent"):
+                 dwell="consistent", gradient_quadrature="full"):
         self.h = homogenization
         # eta IS the interface width (Modica-Mortola normalization); it
         # defaults to one grid spacing.
@@ -344,9 +392,11 @@ class NodalPhaseFieldRegularization:
         if dwell not in ("consistent", "lumped"):
             raise ValueError(f"unknown double-well quadrature '{dwell}'")
         self.dwell_kind = dwell
+        self.gradient_quadrature = gradient_quadrature
 
         offset, stencil = fe_laplacian_stencil(
-            self.h.dim, self.h.grid_spacing, self.h.element
+            self.h.dim, self.h.grid_spacing,
+            _gradient_term_element(self.h, gradient_quadrature)
         )
         # Fused (matrix-free) scalar FE-Laplacian: L = Bᵀ W B as a convolution.
         self.laplace = muGrid.GenericLinearOperator(offset, stencil)
@@ -387,20 +437,39 @@ class NodalPhaseFieldRegularization:
             # interpolant, with its exact nodal gradient.
             dwell, dwell_grad = self._dwell.value_and_gradient(rho)
         else:
-            # Lumped nodal quadrature (pointwise).
-            dwell = h.comm.sum(
-                float((rho**2 * (1.0 - rho) ** 2).sum())
-            ) * self.vol_pixel
-            dwell_grad = (
-                2.0 * rho * (1.0 - rho) * (1.0 - 2.0 * rho) * self.vol_pixel
-            )
+            # Lumped nodal quadrature (pointwise),
+            #   W = ρ² (1 − ρ)²,  W' = 2ρ (1 − ρ)(1 − 2ρ),
+            # evaluated in place with two scratch arrays (the operations and
+            # their order are those of the plain expressions).
+            xp = h.xp
+            w = rho ** 2
+            factor = 1.0 - rho
+            factor **= 2
+            w *= factor
+            dwell = h.comm.sum(float(w.sum())) * self.vol_pixel
+            dwell_grad = w                       # reused: W is summed
+            xp.multiply(rho, 2.0, out=dwell_grad)
+            xp.subtract(1.0, rho, out=factor)
+            dwell_grad *= factor
+            xp.multiply(rho, 2.0, out=factor)
+            xp.subtract(1.0, factor, out=factor)
+            dwell_grad *= factor
+            dwell_grad *= self.vol_pixel
+            del factor
 
         # Raw Modica-Mortola bracket eta * ∫|∇rho|^2 + (1/eta) * ∫ W; the
         # normalization weight / (c_W V^((D-1)/D)) is applied by `scale`.
         f = self.eta * grad_pen + dwell / self.eta
-        g = self.eta * 2.0 * Lrho + dwell_grad / self.eta
+        g = self.eta * 2.0 * Lrho
+        if self._dwell is None:
+            dwell_grad /= self.eta               # our own array: in place
+            g += dwell_grad
+        else:
+            g += dwell_grad / self.eta
+        del dwell_grad
         scale = self.scale
-        return scale * f, _like(h, scale * g, given)
+        g *= scale
+        return scale * f, _like(h, g, given)
 
     def hessian_vector_product(self, rho, v):
         """Return ``H_reg v`` for a nodal density direction ``v``.

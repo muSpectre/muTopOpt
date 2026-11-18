@@ -18,7 +18,21 @@ the cell problem ``K(ρ) u^Γ = b^Γ = −Bᵀ C(ρ):Ē^Γ`` (see
 :mod:`muTopOpt.regularization`. In 2D, 3 independent load cases constrain
 the effective stiffness, in 3D 6 (:mod:`muTopOpt.loadcases`).
 
-Adjoint gradient. With ``S^Γ = ∂f/∂σ̄^Γ = 2 a_Γ (σ̄^Γ − σ*^Γ)/‖σ*^Γ‖²`` the
+Energy objective. A load case with ``energy_terms`` (see
+:class:`LoadCase` and :func:`muTopOpt.loadcases.energy_load_cases`) matches
+energies instead of stresses,
+
+    f^Γ = a_Γ Σ_k c_k (E_k : σ̄^Γ − W*_k)² / W*_k²,   W*_k = E_k : C* : Ē^Γ,
+
+with "left" strains ``E_k``. Each entry ``C̄_ijkl`` of the effective
+stiffness then enters with the weight of its own target, so small entries
+(the off-diagonal ones that make a material auxetic) count as much as large
+ones; the stress objective weighs every entry of a column by the norm of the
+whole column. Everything below holds for both: only ``f^Γ`` and its
+derivative ``S^Γ = ∂f^Γ/∂σ̄^Γ`` differ.
+
+Adjoint gradient. With ``S^Γ = ∂f/∂σ̄^Γ`` (for the stress objective
+``2 a_Γ (σ̄^Γ − σ*^Γ)/‖σ*^Γ‖²``) the
 Lagrangian
 
     L(ρ, u, v) = f + Σ_Γ v^Γᵀ (K u^Γ − b^Γ)
@@ -70,16 +84,53 @@ from .timing import timer
 
 @dataclass
 class LoadCase:
-    """A prescribed macro strain and the stress it should produce."""
+    """A prescribed macro strain and what the homogenized stress it produces
+    is compared with.
+
+    Without ``energy_terms`` the stress itself is matched (the stress
+    objective of the module docstring). With ``energy_terms``, a list of
+    ``(E_k, W*_k, c_k)``, the energies ``W_k = E_k : σ̄`` of the stress with
+    the "left" strains ``E_k`` are matched to their targets ``W*_k``
+    instead (the energy objective), with the weights ``c_k``.
+    """
     macro_strain: np.ndarray  # (dim, dim)
     target_stress: np.ndarray  # (dim, dim)
     weight: float = 1.0
+    energy_terms: list = None  # [(left strain, target energy, weight), ...]
+
+    def misfit(self, stress):
+        """This case's part ``f^Γ`` of the objective for the homogenized
+        stress ``σ̄`` and its derivative ``S^Γ = ∂f^Γ/∂σ̄``."""
+        if self.energy_terms is None:
+            norm = float(np.sum(self.target_stress**2))
+            difference = stress - self.target_stress
+            return (self.weight * float(np.sum(difference**2)) / norm,
+                    2.0 * self.weight * difference / norm)
+        value = 0.0
+        derivative = np.zeros_like(stress)
+        for left, target, c in self.energy_terms:
+            relative = (float(np.sum(left * stress)) - target) / target
+            value += c * relative**2
+            derivative += 2.0 * c * relative / target * left
+        return self.weight * value, self.weight * derivative
+
+    def misfit_derivative_increment(self, stress_increment):
+        """Change ``δS^Γ`` of the derivative for a change ``δσ̄`` of the
+        stress (the misfit is quadratic in the stress, so this is linear)."""
+        if self.energy_terms is None:
+            norm = float(np.sum(self.target_stress**2))
+            return 2.0 * self.weight * stress_increment / norm
+        increment = np.zeros_like(stress_increment)
+        for left, target, c in self.energy_terms:
+            increment += (2.0 * c * float(np.sum(left * stress_increment))
+                          / target**2 * left)
+        return self.weight * increment
 
 
 class StressTargetProblem:
     def __init__(self, homogenization, load_cases, regularization=None,
                  design="element", consistent_objective=True, hessian=False,
-                 hv_warm_start=False):
+                 hv_warm_start=False, warm_start=None):
         """Stress-matching objective over a set of load cases (see the module
         docstring for the mathematics).
 
@@ -134,10 +185,21 @@ class StressTargetProblem:
             shared by all cases and every solve starts from zero (see the
             comment in the constructor for the measured trade-off).
 
+        warm_start : {None, "device", "device32", "host", "host32"}, optional
+            Start the forward and the adjoint solve of every load case from
+            their solutions of the previous evaluation, kept in the named
+            store (:class:`muTopOpt.warmstart.WarmStarts`). Between two
+            evaluations of an optimisation the design changes little, so
+            this cuts the CG iterations several times. It costs two vector
+            fields per load case: in the solver's precision or in single
+            precision, on the device or in host memory. Default None: every
+            solve starts from zero and nothing is kept.
+
         Raises
         ------
         ValueError
-            If ``design`` is neither ``"element"`` nor ``"nodal"``.
+            If ``design`` is neither ``"element"`` nor ``"nodal"``, or
+            ``warm_start`` names no store.
         """
         self.h = homogenization
         self.dim = homogenization.dim
@@ -152,6 +214,12 @@ class StressTargetProblem:
             self._nodal_map = NodalElementMap(homogenization)
         self.consistent_objective = bool(consistent_objective)
         self.hessian = bool(hessian)
+        if warm_start is None:
+            self.warm_starts = None
+        else:
+            from .warmstart import WarmStarts
+
+            self.warm_starts = WarmStarts(homogenization, warm_start)
 
         # Optional adaptive inner-solve tolerance controller
         # (:class:`muTopOpt.optimize.AdaptiveInnerTolerance`). When set, every
@@ -233,7 +301,11 @@ class StressTargetProblem:
         d = self.dim
         E = np.asarray(lc.macro_strain, dtype=float).reshape(d, d)
         S = np.asarray(lc.target_stress, dtype=float).reshape(d, d)
-        return LoadCase(E, S, float(lc.weight))
+        terms = getattr(lc, "energy_terms", None)
+        if terms is not None:
+            terms = [(np.asarray(left, dtype=float).reshape(d, d),
+                      float(target), float(c)) for left, target, c in terms]
+        return LoadCase(E, S, float(lc.weight), terms)
 
     def objective_and_gradient(self, rho):
         """Return ``(f, df/dρ)`` for a density array of shape
@@ -271,7 +343,10 @@ class StressTargetProblem:
             rho_e = rho
         h.set_density(rho_e)
 
-        dlam, dmu = h.material.dlame(rho_e)  # SIMP derivatives, per element
+        # SIMP derivatives per element, the shear one times two as the
+        # sensitivity uses it: 2 dμ/dρ (scaled in place, no temporary)
+        dlam, two_dmu = h.material.dlame(rho_e)
+        two_dmu *= 2.0
 
         # Adaptive inner tolerance: the current (frozen-per-outer-iterate)
         # forcing-term value, or None to use the fixed Homogenization.cg_tol.
@@ -286,31 +361,34 @@ class StressTargetProblem:
         hv_cache = ({"g_shear": [], "g_vol": [], "S": []}
                     if self.hessian else None)
         for i, lc in enumerate(self.load_cases):
-            norm = float(np.sum(lc.target_stress**2))
             # Forward equilibrium. With Hessian support the solution must
             # survive the loop (one field per case).
+            u = self._u_cases[i] if self.hessian else self._u
             with timer("forward solve"):
-                u = h.solve_macro(
-                    lc.macro_strain,
-                    self._u_cases[i] if self.hessian else self._u, rtol=rtol,
+                h.solve_macro(
+                    lc.macro_strain, u, rtol=rtol,
                     residual=self._res_u if self.consistent_objective else None,
-                    label=f"case {i + 1} fwd")
+                    label=f"case {i + 1} fwd",
+                    warm_start=self._load_warm_start(("forward", i), u))
+            self._store_warm_start(("forward", i), u)
             cg_iters.append(h.last_cg_iters)
             sigma = h.homogenized_stress(u, lc.macro_strain)
             stresses.append(sigma)
-            diff = sigma - lc.target_stress
-            f += lc.weight * float(np.sum(diff**2)) / norm
+            # This case's misfit and S = df/d<sigma> (stress or energy
+            # objective, see LoadCase).
+            f_case, S = lc.misfit(sigma)
+            f += f_case
 
-            # Adjoint: S = df/d<sigma>; rhs = -(1/V) Bᵀ C : S; solve K adj = rhs.
-            S = 2.0 * lc.weight * diff / norm
+            # Adjoint: rhs = -(1/V) Bᵀ C : S; solve K adj = rhs.
             h.macro_rhs_tensor(S, self._adj_rhs, scale=-1.0 / V)
             adj_scale = h.mat_scale * max(float(np.abs(S / V).max()), 1e-300)
+            adj = self._adj_cases[i] if self.hessian else self._adj
             with timer("adjoint solve"):
-                adj = h.solve_rhs(self._adj_rhs,
-                                  self._adj_cases[i] if self.hessian
-                                  else self._adj, rtol=rtol,
-                                  rhs_scale=adj_scale,
-                                  label=f"case {i + 1} adj")
+                h.solve_rhs(self._adj_rhs, adj, rtol=rtol,
+                            rhs_scale=adj_scale, label=f"case {i + 1} adj",
+                            warm_start=self._load_warm_start(
+                                ("adjoint", i), adj))
+            self._store_warm_start(("adjoint", i), adj)
             cg_iters.append(h.last_cg_iters)
 
             if self.consistent_objective:
@@ -342,7 +420,7 @@ class StressTargetProblem:
                 )
                 g_shear = self._g_shear.p
                 g_vol = self._g_vol.p
-                grad += 2.0 * dmu * g_shear
+                grad += two_dmu * g_shear
                 grad += dlam * g_vol
 
             if self.hessian:
@@ -359,10 +437,14 @@ class StressTargetProblem:
                                  else hv_cache["rho"])
             self._cache = hv_cache
 
+        # The element arrays are not needed any more; dropping them now lets
+        # the nodal scatter and the regularization reuse their memory.
+        del dlam, two_dmu
         if self.design == "nodal":
             # Chain rule through the element average: the per-element
             # sensitivity is distributed onto the element's corner nodes with
             # the averaging weights (exact transpose of gather_mean).
+            del rho_e
             grad = self._nodal_map.scatter_mean(grad, on_device=True)
 
         if self.regularization is not None:
@@ -400,6 +482,19 @@ class StressTargetProblem:
                      "cg_iters": cg_iters, "corrections": corrections,
                      "cg_rtol": rtol}
         return f, (grad if isinstance(given, xp.ndarray) else h.to_host(grad))
+
+    def _load_warm_start(self, key, field):
+        """Put the kept start vector of ``key`` into ``field``; False if
+        warm starts are off or nothing is kept yet."""
+        if self.warm_starts is None:
+            return False
+        with timer("warm start"):
+            return self.warm_starts.load(key, field)
+
+    def _store_warm_start(self, key, field):
+        if self.warm_starts is not None:
+            with timer("warm start"):
+                self.warm_starts.store(key, field)
 
     def ensure_state(self, rho):
         """Make the cached linearization point match ``rho``, re-evaluating
@@ -529,7 +624,6 @@ class StressTargetProblem:
             du = self._du_cases[i]
             dadj = self._dadj_cases[i]
             E = lc.macro_strain
-            norm = float(np.sum(lc.target_stress**2))
             S = cache["S"][i]
 
             # Forward sensitivity: K du = -(dK v) u - Bᵀ (dC v):Ē. With
@@ -554,7 +648,7 @@ class StressTargetProblem:
                 h.homogenized_stress(u, E, lam=self._dlam_v, mu=self._dmu_v)
                 + h.homogenized_stress(du, np.zeros((d, d)))
             )
-            dS = 2.0 * lc.weight * dsigma / norm
+            dS = lc.misfit_derivative_increment(dsigma)
 
             # Second adjoint:
             # K dl = -(dK v) l - (1/V) Bᵀ [(dC v):S + C:dS].

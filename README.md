@@ -19,13 +19,15 @@ The mathematics is documented in the module docstrings:
 | Topic | Module |
 |---|---|
 | SIMP interpolation $C(\rho) = C_\text{void} + \rho^p (C_\text{solid} - C_\text{void})$ | `muTopOpt/material.py` |
-| Cell problem $K u = -B^T C : \bar E$, homogenized stress, CG safeguards, GPU memory | `muTopOpt/homogenization.py` |
-| Macro-strain load cases, isotropic targets | `muTopOpt/loadcases.py` |
+| Cell problem $K u = -B^T C : \bar E$, homogenized stress, CG safeguards, multigrid, energy-error stopping test, GPU memory | `muTopOpt/homogenization.py` |
+| Macro-strain load cases, isotropic and auxetic targets, stress and energy objectives | `muTopOpt/loadcases.py` |
 | Objective, adjoint gradient, adjoint-corrected Lagrangian, Hessian-vector products | `muTopOpt/problem.py` |
-| Modica–Mortola regularization | `muTopOpt/regularization.py` |
+| Warm starts of the forward and adjoint solves between evaluations | `muTopOpt/warmstart.py` |
+| Modica–Mortola regularization, one-point gradient term | `muTopOpt/regularization.py` |
 | Nodal design field, exact double-well integration | `muTopOpt/nodal.py` |
 | Voigt / Hashin–Shtrikman feasibility bounds | `muTopOpt/bounds.py` |
-| Optimizers and inner-tolerance control | `muTopOpt/optimize.py` |
+| Optimizers (incl. L-BFGS on fields with a Helmholtz smoother) and inner-tolerance control | `muTopOpt/optimize.py` |
+| Restarts, resampling between grids, grid continuation | `muTopOpt/restart.py` |
 
 References:
 * J-FFT preconditioner: https://doi.org/10.1016/j.cma.2026.119269
@@ -90,6 +92,48 @@ problem  = StressTargetProblem(homog, cases, regularization=reg)
 rho0     = initial_density(homog.nb_pixels, kind="random", seed=0)
 rho, info = optimize_lbfgs(problem, rho0, maxiter=200)
 ```
+
+### Large 3D cells
+
+For grids of 128³ and more, the fast settings are: muGrid's multigrid
+preconditioner with CG stopped on the energy error, warm starts between
+evaluations, the energy objective, and L-BFGS on fields with the Helmholtz
+smoother; designs move coarse to fine. `benchmarks/large_3d.py` runs the 3D
+auxetic problem of the large-grid studies this way (with an option for every
+piece, a memory report and grid continuation):
+
+```python
+from muTopOpt import (Homogenization, NodalPhaseFieldRegularization,
+                      SimpMaterial, StressTargetProblem)
+from muTopOpt.loadcases import auxetic_target, energy_load_cases
+from muTopOpt.optimize import initial_density, optimize_helmholtz_lbfgs
+
+n, E_solid = 128, 1.0
+material = SimpMaterial(E_solid, nu=0.3, penalty=2.0, void_ratio=1e-3)
+homog = Homogenization((n, n, n), material, device="gpu",
+                       preconditioner="multigrid", multigrid_precision="single",
+                       cg_stop="energy", cg_tol=1e-6)
+reg = NodalPhaseFieldRegularization(homog, eta=2.0 / n, weight=0.2, dwell="lumped")
+cases = energy_load_cases(3, auxetic_target(3, E_solid, nu=-0.5, scale=0.3))
+problem = StressTargetProblem(homog, cases, regularization=reg, design="nodal",
+                              warm_start="host")
+rho0 = initial_density((n, n, n), kind="filtered_random", length=0.1,
+                       grid_spacing=homog.grid_spacing,
+                       subdomain_locations=homog.engine.subdomain_locations,
+                       nb_subdomain_grid_pts=homog.nb_pixels)
+rho, info = optimize_helmholtz_lbfgs(problem, rho0, maxiter=500, gtol=0.0,
+                                     xtol=1e-3, pair_store="host")
+```
+
+`multigrid_coarsening="rediscretised"` re-discretises the coarse levels instead
+(no probing at a design update, 13 % less GPU memory at 256³, 6–10 % more CG
+iterations); Galerkin is the default.
+
+The device memory of this setting is about 900 bytes per voxel with the warm
+starts and the L-BFGS pairs in host memory (`warm_start="host"`,
+`pair_store="host"`): a 512³ cell fits on one 141 GB GPU. The multigrid, the
+energy-error test and the L-BFGS on fields need a muGrid newer than 1.6.2 (not
+yet released).
 
 ### Command line
 

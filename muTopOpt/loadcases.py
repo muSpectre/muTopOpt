@@ -17,6 +17,15 @@ bulk/shear modulus or Poisson's ratio.
 Isotropic targets use the convention ``σ = 2G dev(ε) + K tr(ε) I``, i.e.
 ``G = μ`` and ``K = λ + 2μ/d``: the ordinary bulk modulus in 3D and the
 plane-strain area modulus in 2D.
+
+Energy objective. :func:`energy_load_cases` matches stiffness energies
+instead of stresses: terms ``(W − W*)² / W*²`` with the energies
+``W = E_k : C̄ : Ē^Γ`` of a load-case strain ``Ē^Γ`` and a "left" strain
+``E_k``, one per entry of the stiffness that an isotropic target
+constrains (in 3D 9 terms from 6 load cases: three normal stiffnesses,
+three couplings of normal strains, three shears). :func:`auxetic_target` is the
+isotropic target of the large-grid studies: a given Poisson ratio (default
+−0.5) and a shear modulus as a fraction of that of the solid.
 """
 
 import numpy as np
@@ -115,3 +124,76 @@ def target_load_cases(dim, target_sigma, magnitude=1.0, weights=None):
         LoadCase(E, target_sigma(E), w)
         for E, w in zip(strains, weights)
     ]
+
+
+def energy_load_cases(dim, target_sigma, magnitude=1.0, weight=1.0):
+    """Load cases of the *energy* objective: every independent entry of the
+    effective stiffness is matched relative to its own target.
+
+    The effective stiffness has ``n(n+1)/2`` independent entries for
+    ``n = dim(dim+1)/2`` strain directions; an isotropic target constrains
+    9 of them in 3D (4 in 2D): the three normal stiffnesses, the three
+    couplings between normal strains and the three shears. They are the
+    energies ``W = E_k : C̄ : Ē^Γ`` of a load-case strain ``Ē^Γ`` with a
+    "left" strain ``E_k``:
+
+    * normal case ``i``: left strains of the normal directions ``j ≥ i``
+      (``C̄_iijj``, each coupling once);
+    * shear case: its own strain (``C̄_ijij``).
+
+    Parameters
+    ----------
+    dim : int
+        Spatial dimension (2 or 3).
+    target_sigma : callable
+        ``target_sigma(E) -> σ`` of the target stiffness.
+    magnitude : float, optional
+        Magnitude of the unit strains (default 1).
+    weight : float, optional
+        Weight ``a_Γ`` of every case (default 1).
+
+    Returns
+    -------
+    list of LoadCase
+        One per unit strain, in the order of :func:`unit_strains`, each
+        with its ``energy_terms``.
+    """
+    strains = unit_strains(dim, magnitude)
+    cases = []
+    for index, strain in enumerate(strains):
+        target = target_sigma(strain)
+        lefts = range(index, dim) if index < dim else [index]
+        terms = [(strains[k], float(np.sum(strains[k] * target)), 1.0)
+                 for k in lefts]
+        cases.append(LoadCase(strain, target, weight, terms))
+    return cases
+
+
+def auxetic_target(dim, E_solid, nu=-0.5, scale=1.0, shear_fraction=0.15):
+    """Isotropic target with a negative Poisson ratio, as a callable
+    ``sigma(E)``.
+
+    The target is fixed by its Poisson ratio ``nu`` and its shear modulus
+    ``G* = scale · shear_fraction · E_solid``. The shear modulus sets how
+    stiff the metamaterial is asked to be relative to the solid it is made
+    of: a porous cell cannot reach the solid's own stiffness, and a target
+    that is too stiff leaves no room for the voids an auxetic mechanism
+    needs. ``scale`` rescales the whole target stiffness at a fixed Poisson
+    ratio.
+
+    Parameters
+    ----------
+    dim : int
+        Spatial dimension (2 or 3).
+    E_solid : float
+        Young's modulus of the solid phase.
+    nu : float, optional
+        Target Poisson ratio (default -0.5).
+    scale : float, optional
+        Factor on the target stiffness (default 1).
+    shear_fraction : float, optional
+        Target shear modulus at ``scale = 1`` as a fraction of ``E_solid``
+        (default 0.15).
+    """
+    shear = scale * shear_fraction * E_solid
+    return isotropic_stiffness_from_E_nu(dim, 2.0 * shear * (1.0 + nu), nu)

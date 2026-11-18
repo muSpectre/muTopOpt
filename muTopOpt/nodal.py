@@ -140,16 +140,19 @@ class NodalElementMap:
         element grid: a host NumPy array, or with `on_device` an array in
         the fields' module (cupy on a device)."""
         views = self.corner_values(rho)
+        # accumulated in place: one temporary (the weighted corner) at a time
         acc = self.avg_weights[0] * views[0]
         for c in range(1, self.nb_nodes):
-            acc = acc + self.avg_weights[c] * views[c]
+            acc += self.avg_weights[c] * views[c]
         return acc if on_device else self.h.to_host(acc)
 
     def scatter(self, per_corner, on_device=False):
         """Adjoint of corner gathering: node ``i + offset(c)`` accumulates
         ``per_corner[c][i]``; ghost-node contributions are reduced back onto
         their owning rank. Returns a host NumPy nodal array, or with
-        `on_device` a double-precision array in the fields' module."""
+        `on_device` a double-precision array in the fields' module.
+        ``per_corner`` may be a generator: each corner's array is then used
+        and dropped before the next one is formed."""
         pg = self._acc.pg
         pg[...] = 0.0
         for sl, contrib in zip(self._corner_slices(), per_corner):
@@ -167,7 +170,9 @@ class NodalElementMap:
         NumPy nodal array, or with `on_device` an array in the fields'
         module."""
         s = self.h.to_device(s_e)
-        return self.scatter([w * s for w in self.avg_weights],
+        # a generator, not a list: one weighted copy of s alive at a time
+        # instead of 2^d of them
+        return self.scatter((w * s for w in self.avg_weights),
                             on_device=on_device)
 
 

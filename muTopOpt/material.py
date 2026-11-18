@@ -91,20 +91,41 @@ class SimpMaterial:
         self.lam_void = self.lam_solid * void_ratio
         self.mu_void = self.mu_solid * void_ratio
 
-    def lame(self, rho):
-        """Return ``(λ(ρ), μ(ρ))`` as arrays with the shape of ``rho``."""
-        f = np.power(rho, self.penalty)
-        lam = self.lam_void + f * (self.lam_solid - self.lam_void)
-        mu = self.mu_void + f * (self.mu_solid - self.mu_void)
-        return lam, mu
+    def lame(self, rho, out=None):
+        """Return ``(λ(ρ), μ(ρ))`` as arrays with the shape of ``rho``.
 
-    def dlame(self, rho):
+        With ``out=(lam, mu)`` the values are written into these arrays
+        (e.g. the views of the material fields) and they are returned; then
+        ``ρ^p`` is the only temporary."""
+        f = np.power(rho, self.penalty)
+        return self._interpolate(
+            f, (self.lam_void, self.lam_solid - self.lam_void),
+            (self.mu_void, self.mu_solid - self.mu_void), out)
+
+    def dlame(self, rho, out=None):
         """Return the density derivatives ``(dλ/dρ, dμ/dρ)``, i.e.
-        ``p ρ^(p−1) (λ_solid − λ_void)`` and likewise for ``μ``."""
+        ``p ρ^(p−1) (λ_solid − λ_void)`` and likewise for ``μ``. ``out`` as
+        for :meth:`lame`."""
         df = self.penalty * np.power(rho, self.penalty - 1.0)
-        dlam = df * (self.lam_solid - self.lam_void)
-        dmu = df * (self.mu_solid - self.mu_void)
-        return dlam, dmu
+        return self._interpolate(
+            df, (0.0, self.lam_solid - self.lam_void),
+            (0.0, self.mu_solid - self.mu_void), out)
+
+    @staticmethod
+    def _interpolate(f, lam_coefficients, mu_coefficients, out):
+        """``(a_λ + b_λ f, a_μ + b_μ f)`` for the coefficients ``(a, b)``,
+        into ``out`` if given (in place, no further temporary)."""
+        results = []
+        for (a, b), target in zip((lam_coefficients, mu_coefficients),
+                                  out if out is not None else (None, None)):
+            if target is None:
+                results.append(a + f * b if a != 0.0 else f * b)
+            else:
+                np.multiply(f, b, out=target)
+                if a != 0.0:
+                    target += a
+                results.append(target)
+        return tuple(results)
 
     def d2lame(self, rho):
         """Return the second density derivatives ``(d²λ/dρ², d²μ/dρ²)``,

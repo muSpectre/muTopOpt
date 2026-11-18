@@ -17,7 +17,13 @@ trigonometric (band-limited) interpolation -- zero-padding or truncating its
 discrete Fourier spectrum -- so a converged coarse design can seed a finer
 run (or vice versa). Sample ``j`` sits at ``x_j = j h`` on both grids, so the
 interpolant does not shift interfaces, and it preserves the mean (the
-volume fraction) exactly. :func:`restart_density` combines the two.
+volume fraction) exactly. :func:`linear_resample` instead evaluates the
+d-linear interpolant of a nodal design at the new nodes, which represents a
+nodal Q1 design exactly and never overshoots; this is the grid continuation
+of the large 3D runs (coarse to fine, each grid starting from the converged
+design of the previous one). :func:`restart_density` combines reading and
+resampling, and :func:`write_density` writes a design in the format they
+read.
 
 :func:`restart_control` derives, from a run's control, the control of the run
 that continues it from its output file; the driver writes it as the restart
@@ -254,22 +260,149 @@ def read_final_density(filename):
     return rho, metadata
 
 
-def restart_density(filename, nb_grid_pts):
+def linear_resample(a, nb_grid_pts, subdomain_locations=None,
+                    nb_subdomain_grid_pts=None):
+    """Resample a periodic nodal field to a new grid by d-linear
+    interpolation.
+
+    Node ``j`` sits at ``x_j = j h`` on both grids. Each node of the target
+    grid takes the value of the d-linear (bilinear, trilinear) interpolant
+    of the source nodes at its position: for a nodal design on quadrilaterals
+    or hexahedra (Q1) this is the design itself, so refining by an integer
+    factor represents the coarse design exactly. Every value is a convex
+    combination of source values, so the result stays within the range of
+    the input and needs no clipping. Coarsening samples the interpolant (it
+    does not average). This is the resampling of the grid continuation of
+    the muFFTTO large-grid studies (``interpolate_design`` of
+    ``to3d_large.py``), with the same arithmetic.
+
+    Parameters
+    ----------
+    a : array_like
+        Real field on the periodic source grid (global).
+    nb_grid_pts : sequence of int
+        Target grid shape (same dimensionality as ``a``).
+    subdomain_locations, nb_subdomain_grid_pts : sequence of int, optional
+        Compute only this part of the target grid, e.g. the rank's
+        subdomain under MPI (``homogenization.engine.subdomain_locations``
+        and ``homogenization.nb_pixels``). Default: the whole grid. The
+        interpolation runs axis by axis, so the intermediate arrays grow to
+        the requested part only.
+
+    Returns
+    -------
+    np.ndarray
+        The resampled field (float64), of shape ``nb_subdomain_grid_pts``.
+
+    Raises
+    ------
+    ValueError
+        If ``nb_grid_pts`` has a different number of axes than ``a``.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    dim = a.ndim
+    if len(nb_grid_pts) != dim:
+        raise ValueError(
+            f"target shape {tuple(nb_grid_pts)} does not match the "
+            f"{dim}-dimensional input field")
+    if subdomain_locations is None:
+        subdomain_locations = (0,) * dim
+    if nb_subdomain_grid_pts is None:
+        nb_subdomain_grid_pts = nb_grid_pts
+    for axis, (n_new, location, size) in enumerate(
+            zip(nb_grid_pts, subdomain_locations, nb_subdomain_grid_pts)):
+        n_old = a.shape[axis]
+        # positions of the target nodes in units of the source spacing
+        position = (int(location) + np.arange(int(size))) * (n_old / int(n_new))
+        base = np.floor(position).astype(int)
+        fraction = (position - base).reshape(
+            [-1 if b == axis else 1 for b in range(dim)])
+        a = (np.take(a, base % n_old, axis=axis) * (1.0 - fraction)
+             + np.take(a, (base + 1) % n_old, axis=axis) * fraction)
+    return a
+
+
+#: How :func:`restart_density` moves a design between grids
+RESAMPLING_METHODS = ("fourier", "linear")
+
+
+def restart_density(filename, nb_grid_pts, method="fourier"):
     """Initial density from a previous run: the last frame of ``filename``,
-    Fourier-resampled to ``nb_grid_pts`` if the grids differ and clipped back
-    to the admissible range ``[0, 1]`` (resampling a sharp design rings and
-    can overshoot the bounds).
+    resampled to ``nb_grid_pts`` if the grids differ and clipped to the
+    admissible range ``[0, 1]``.
+
+    ``method`` is ``"fourier"`` (default, :func:`fourier_resample`: band
+    limited, keeps the mean; resampling a sharp design rings and can
+    overshoot the bounds, hence the clipping) or ``"linear"``
+    (:func:`linear_resample`: the interpolant of a nodal Q1 design, no
+    overshoot).
 
     Returns ``(rho, metadata)`` with ``rho`` the global density on the target
     grid (float64) and ``metadata`` as in :func:`read_final_density`, plus
     ``resampled`` (bool).
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is not one of :data:`RESAMPLING_METHODS`.
     """
+    if method not in RESAMPLING_METHODS:
+        raise ValueError(
+            f"unknown resampling method {method!r}; choose from "
+            f"{RESAMPLING_METHODS}")
     rho, metadata = read_final_density(filename)
     nb_grid_pts = tuple(int(n) for n in nb_grid_pts)
     metadata["resampled"] = nb_grid_pts != metadata["nb_grid_pts"]
     if metadata["resampled"]:
-        rho = fourier_resample(rho, nb_grid_pts)
+        resample = fourier_resample if method == "fourier" else linear_resample
+        rho = resample(rho, nb_grid_pts)
     return np.clip(rho, 0.0, 1.0), metadata
+
+
+def write_density(filename, homogenization, rho, attributes=None):
+    """Write a design as a one-frame NetCDF file that
+    :func:`read_final_density` and :func:`restart_density` read back, on any
+    grid and any number of ranks. Collective under MPI.
+
+    The file holds the variable ``density`` and the global attributes
+    ``nb_grid_pts``, ``precision`` and ``domain_lengths`` that the reader
+    needs, as in the output of ``simulate.py``. The design passes through
+    the scalar field ``density`` of the homogenization's collection, which is
+    created on the first call and stays registered.
+
+    Parameters
+    ----------
+    filename : str
+        Output file; an existing file is overwritten.
+    homogenization : Homogenization
+        Provides the grid, the communicator and the field collection.
+    rho : array_like
+        This rank's part of the design, of shape ``homogenization.nb_pixels``
+        (host or device array).
+    attributes : dict, optional
+        Further global attributes, ``{name: value}`` with a string or a list
+        of numbers as value (e.g. the final objective).
+    """
+    h = homogenization
+    field = h.scalar_field("density")
+    field.p[...] = h.to_device(rho)
+    fio = muGrid.FileIONetCDF(filename, muGrid.FileIONetCDF.OpenMode.Overwrite,
+                              h.comm)
+    try:
+        fio.register_field_collection(h.fc, field_names=["density"])
+        # muGrid fixes the header with the first frame: all attributes first
+        fio.write_global_attribute(
+            "nb_grid_pts", [int(n) for n in h.nb_grid_pts])
+        fio.write_global_attribute(
+            "precision",
+            "single" if np.dtype(h.dtype) == np.float32 else "double")
+        fio.write_global_attribute(
+            "domain_lengths", [float(x) for x in h.domain_lengths])
+        for name, value in (attributes or {}).items():
+            fio.write_global_attribute(name, value)
+        fio.append_frame().write(["density"])
+    finally:
+        fio.close()
 
 
 def next_output_name(path):

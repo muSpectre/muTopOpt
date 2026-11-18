@@ -16,6 +16,32 @@ Style for this changelog (keep to it so entries stay uniform):
 Change log for muTopOpt
 =======================
 
+v1.6.0 (not yet released)
+-------------------------
+
+- ENH: Multigrid preconditioner for large high-contrast cells, rebuilt for every design:
+  13 CG iterations per load case at 128³ on a GPU instead of 128 with Green-Jacobi
+- ENH: The multigrid's coarse levels can be re-discretised instead of Galerkin: a setup without
+  probing and less memory (13 % at 256³), at 6–10 % more CG iterations in the 3D runs
+- ENH: CG can stop on an estimate of the energy-norm error, the error that enters the
+  homogenized stiffness, instead of the residual
+- ENH: Warm starts of the forward and adjoint solves between evaluations, kept on the
+  device, in single precision or in host memory
+- ENH: Energy objective that matches the stiffness entries an isotropic target constrains,
+  and an isotropic auxetic target
+- ENH: L-BFGS on fields with a Helmholtz smoother as initial inverse Hessian: no vector
+  leaves the GPU, and the curvature pairs can be kept in host memory
+- ENH: The first L-BFGS step can be bounded, which avoids overshooting steps and stalls
+  when an optimisation restarts from a converged design (off by default)
+- ENH: The nodal phase-field gradient term can use one quadrature point per voxel, which
+  reproduces the objective of the muFFTTO large-grid studies exactly
+- ENH: Grid continuation: a design moves to a finer grid by trilinear interpolation, which
+  represents a nodal design exactly, and can be written for the next run
+- PERF: About 100 bytes per voxel less device memory in an evaluation; with warm starts
+  and pairs in host memory a 3D run needs about 900 bytes per voxel on the GPU
+- ENH: Benchmark of the 3D auxetic problem of the large-grid studies, with an option for
+  every piece, grid continuation, a device-memory report, random Cahn–Hilliard starts and snapshots
+
 v1.5.0 (05Nov26)
 ----------------
 
