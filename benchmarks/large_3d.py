@@ -16,7 +16,9 @@ Problem (the reference setup of the muFFTTO study ``to3d_large.py``):
 * energy objective for an isotropic target with Poisson ratio −0.5 and
   shear modulus 0.3 · 0.15 E_solid (9 energies, 6 load cases);
 * phase-field regularization with weight 0.2, interface width ``η = 2h``
-  and the lumped double well.
+  and the lumped double well; the gradient term with one quadrature point
+  per voxel (``--pf-quadrature one-point``) is the study's, the default
+  ``full`` is the exact integral of the interpolant.
 
 Every option that makes the solve fast can be switched, to measure what it
 buys:
@@ -94,6 +96,9 @@ def main():
     parser.add_argument("--target-nu", type=float, default=-0.5)
     parser.add_argument("--target-scale", type=float, default=0.3)
     parser.add_argument("--pf-weight", type=float, default=0.2)
+    parser.add_argument("--pf-quadrature", default="full",
+                        choices=("full", "one-point"),
+                        help="quadrature of the phase-field gradient term")
     args = parser.parse_args()
 
     comm = muGrid.Communicator.world()
@@ -111,7 +116,8 @@ def main():
         preconditioner=args.preconditioner, cg_tol=args.cg_tol,
         cg_stop=args.cg_stop, multigrid_precision=args.multigrid_precision)
     regularization = NodalPhaseFieldRegularization(
-        homogenization, eta=2.0 / n, weight=args.pf_weight, dwell="lumped")
+        homogenization, eta=2.0 / n, weight=args.pf_weight, dwell="lumped",
+        gradient_quadrature=args.pf_quadrature.replace("-", "_"))
     cases = energy_load_cases(3, auxetic_target(
         3, E_solid, nu=args.target_nu, scale=args.target_scale))
     problem = StressTargetProblem(
@@ -145,7 +151,8 @@ def main():
         print(f"3D TO {n}^3 on {comm.size} rank(s), device {args.device}, "
               f"preconditioner {args.preconditioner}, CG stop "
               f"{args.cg_stop} at {args.cg_tol:g}, warm starts "
-              f"{args.warm_start}, optimizer {args.optimizer}", flush=True)
+              f"{args.warm_start}, optimizer {args.optimizer}, gradient term "
+              f"{args.pf_quadrature}", flush=True)
     options = dict(maxiter=args.maxiter, gtol=0.0, xtol=1e-3, maxcor=20)
     if args.optimizer == "helmholtz":
         rho, info = optimize_helmholtz_lbfgs(problem, rho0, **options)
